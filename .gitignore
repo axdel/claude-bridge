@@ -21,3 +21,6 @@ Thumbs.db
 # Workflow
 .worklog/
 .hotfix-in-progress
+CLAUDE.md
+MODULE_MAP.md
+.claude/
