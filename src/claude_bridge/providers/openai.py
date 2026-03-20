@@ -608,20 +608,46 @@ def translate_openai_sse_event(event: dict) -> list[dict]:
 # Concrete Provider implementation
 # ---------------------------------------------------------------------------
 
-_DEFAULT_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+_API_KEY_ENDPOINT = "https://api.openai.com/v1/responses"
 
 
 class OpenAIProvider:
-    """OpenAI Codex provider implementing the Provider protocol."""
+    """OpenAI provider implementing the Provider protocol.
+
+    Supports two auth modes:
+    - ``api_key``: uses an OpenAI API key (Bearer header to api.openai.com)
+    - ``codex_oauth``: uses Codex OAuth flow (Bearer header to chatgpt.com)
+    """
 
     name = "openai"
 
-    def __init__(self, endpoint: str = _DEFAULT_ENDPOINT) -> None:
-        self.endpoint = endpoint
+    def __init__(
+        self,
+        *,
+        auth_mode: str = "codex_oauth",
+        api_key: str | None = None,
+        auth_path: Path | None = None,
+    ) -> None:
+        self.auth_mode = auth_mode
+        self._api_key = api_key
+        self._auth_path = auth_path
+        if auth_mode == "api_key":
+            self.endpoint = _API_KEY_ENDPOINT
+        else:
+            self.endpoint = _CODEX_ENDPOINT
 
     async def authenticate(self) -> dict[str, str]:
         """Return Authorization header with a valid bearer token."""
-        token = await get_bearer_token()
+        if self.auth_mode == "api_key":
+            if not self._api_key:
+                msg = (
+                    "OPENAI_API_KEY environment variable is required for "
+                    "api_key auth mode but was not set or is empty."
+                )
+                raise ValueError(msg)
+            return {"Authorization": f"Bearer {self._api_key}"}
+        token = await get_bearer_token(self._auth_path)
         return {"Authorization": f"Bearer {token}"}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:

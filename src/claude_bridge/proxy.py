@@ -50,6 +50,7 @@ async def start_proxy(
     port: int = 9999,
     upstream_url: str | None = None,
     provider_name: str | None = None,
+    provider_kwargs: dict | None = None,
 ) -> asyncio.Server:
     """Start the proxy server and return the asyncio.Server handle."""
     upstream = upstream_url or os.environ.get("ANTHROPIC_REAL_URL", _DEFAULT_UPSTREAM)
@@ -60,7 +61,7 @@ async def start_proxy(
         if provider_cls is None:
             msg = f"Unknown provider '{provider_name}'. Available: {list(PROVIDERS)}"
             raise ValueError(msg)
-        provider = provider_cls()
+        provider = provider_cls(**(provider_kwargs or {}))
 
     router = Router()
     stats = BridgeStats()
