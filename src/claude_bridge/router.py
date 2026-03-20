@@ -112,12 +112,23 @@ class Router:
         """Check if a request can be served by the fallback.
 
         Returns (eligible, reason).
-        Rejects: requests with 'thinking' in the body, 'output_config' present.
+        Rejects: requests with 'thinking' in the body, 'output_config' present,
+        or active tool-use turns (assistant message contains tool_use blocks).
         """
         if request.get("thinking"):
             return False, "extended thinking not supported in fallback"
         if request.get("output_config"):
             return False, "output_config not supported in fallback"
+        # Block failover mid-tool-turn — the provider that issued the tool
+        # call must see the tool_result back, not a different provider.
+        for message in request.get("messages", []):
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        return False, "active tool-use turn — failover blocked"
         return True, ""
 
     @staticmethod

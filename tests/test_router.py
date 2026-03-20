@@ -118,6 +118,40 @@ def test_is_failover_eligible_rejects_output_config():
     assert "output_config" in reason
 
 
+def test_is_failover_eligible_rejects_tool_use_turn():
+    """Requests with tool_use in assistant message are not eligible (mid-turn)."""
+    eligible, reason = Router.is_failover_eligible(
+        {
+            "messages": [
+                {"role": "user", "content": "Read file.txt"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "Read",
+                            "input": {"path": "file.txt"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": "file contents",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    assert eligible is False
+    assert "tool-use" in reason
+
+
 def test_is_failover_eligible_accepts_normal_request():
     """Normal requests are eligible for failover."""
     eligible, reason = Router.is_failover_eligible(
