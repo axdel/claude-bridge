@@ -228,10 +228,42 @@ async def _process_request(
         stats.record_request()
 
     streaming = _is_streaming(body)
+    request_model = _extract_model(body)
 
+    await _route_request(
+        provider, upstream_url, headers, body, writer, router,
+        stats, streaming, request_model, request_start,
+    )
+
+
+def _extract_model(body: bytes) -> str:
+    """Extract the model name from a request body, or 'unknown'."""
+    try:
+        return json.loads(body).get("model", "unknown")
+    except (json.JSONDecodeError, ValueError):
+        return "unknown"
+
+
+async def _route_request(
+    provider: Provider | None,
+    upstream_url: str,
+    headers: dict[str, str],
+    body: bytes,
+    writer: asyncio.StreamWriter,
+    router: Router,
+    stats: BridgeStats | None,
+    streaming: bool,
+    request_model: str,
+    request_start: float,
+) -> None:
+    """Route a /v1/messages request to the appropriate backend."""
     if provider is not None:
         mode = "stream" if streaming else "sync"
-        logger.info("-> DIRECT %s (%s)", provider.name, mode)
+        logger.info(
+            "-> DIRECT %s (%s) model=%s", provider.name, mode, request_model
+        )
+        if stats:
+            stats.set_provider_info(provider.name, request_model)
         if streaming:
             await _stream_via_provider(provider, body, writer)
             _record_latency(stats, request_start)
@@ -240,11 +272,15 @@ async def _process_request(
             _write_response(writer, status_code, response_body)
             _record_sync_response(stats, request_start, status_code, response_body)
     elif streaming:
-        logger.info("-> passthrough (stream)")
+        logger.info("-> passthrough (stream) model=%s", request_model)
+        if stats:
+            stats.set_provider_info("anthropic", request_model)
         await _stream_passthrough(upstream_url, body, headers, writer)
         _record_latency(stats, request_start)
     else:
-        logger.info("-> auto-route (sync)")
+        logger.info("-> auto-route (sync) model=%s", request_model)
+        if stats:
+            stats.set_provider_info("anthropic", request_model)
         status_code, response_body = await _auto_route(
             upstream_url, headers, body, router
         )
