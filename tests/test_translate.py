@@ -634,7 +634,7 @@ class TestTranslationRobustness:
 # ---------------------------------------------------------------------------
 
 
-from claude_bridge.providers.openai import estimate_input_tokens
+from claude_bridge.proxy import estimate_input_tokens
 
 
 class TestEstimateInputTokens:

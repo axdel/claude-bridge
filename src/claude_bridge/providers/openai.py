@@ -113,43 +113,6 @@ async def refresh_access_token(
 
 
 # ---------------------------------------------------------------------------
-# Token estimation (pure function, no I/O)
-# ---------------------------------------------------------------------------
-
-# Approximate bytes-per-token ratio for mixed code/natural language traffic.
-# English text averages ~4 chars/token, but code, JSON, and tool schemas are
-# denser. bytes/3.5 is a pragmatic middle ground (per Codex consultation).
-_BYTES_PER_TOKEN = 3.5
-
-
-def estimate_input_tokens(request: dict) -> int:
-    """Estimate input token count by walking the Anthropic request structure.
-
-    Serializes system prompt, messages, and tool definitions to JSON, counts
-    UTF-8 bytes, and divides by 3.5. Returns 0 for empty/malformed requests.
-    """
-    total_bytes = 0
-
-    # System prompt
-    system = request.get("system")
-    if system is not None:
-        total_bytes += len(json.dumps(system).encode())
-
-    # Messages
-    for message in request.get("messages", []):
-        total_bytes += len(json.dumps(message).encode())
-
-    # Tool definitions
-    tools = request.get("tools")
-    if tools:
-        total_bytes += len(json.dumps(tools).encode())
-
-    if total_bytes == 0:
-        return 0
-    return int(total_bytes / _BYTES_PER_TOKEN + 0.5)  # round to nearest
-
-
-# ---------------------------------------------------------------------------
 # Anthropic <-> OpenAI translation (pure functions, no I/O)
 # ---------------------------------------------------------------------------
 

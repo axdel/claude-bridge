@@ -127,15 +127,37 @@ async def _parse_request(
     return method, path, headers, body
 
 
+# Approximate bytes-per-token ratio for mixed code/natural language traffic.
+_BYTES_PER_TOKEN = 3.5
+
+
+def estimate_input_tokens(request: dict) -> int:
+    """Estimate input token count by walking the Anthropic request structure.
+
+    Serializes system prompt, messages, and tool definitions to JSON, counts
+    UTF-8 bytes, and divides by 3.5. Returns 0 for empty/malformed requests.
+    Provider-agnostic — operates on Anthropic request format.
+    """
+    total_bytes = 0
+    system = request.get("system")
+    if system is not None:
+        total_bytes += len(json.dumps(system).encode())
+    for message in request.get("messages", []):
+        total_bytes += len(json.dumps(message).encode())
+    tools = request.get("tools")
+    if tools:
+        total_bytes += len(json.dumps(tools).encode())
+    if total_bytes == 0:
+        return 0
+    return int(total_bytes / _BYTES_PER_TOKEN + 0.5)
+
+
 def _estimate_tokens(body: bytes) -> int:
-    """Estimate input tokens from a count_tokens request body."""
+    """Estimate input tokens from raw request body bytes."""
     try:
-        request = json.loads(body)
+        return estimate_input_tokens(json.loads(body))
     except (json.JSONDecodeError, ValueError):
         return 0
-    from claude_bridge.providers.openai import estimate_input_tokens
-
-    return estimate_input_tokens(request)
 
 
 def _record_sync_response(
