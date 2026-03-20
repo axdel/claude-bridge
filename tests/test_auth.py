@@ -148,3 +148,96 @@ class TestRefreshLock:
         # Run 5 concurrent calls — all should return the same token
         results = await asyncio.gather(*[get_bearer_token(auth_file) for _ in range(5)])
         assert all(r == token for r in results)
+
+
+# --- OpenAIProvider auth modes ---
+
+
+from claude_bridge.providers.openai import OpenAIProvider
+
+
+class TestOpenAIProviderApiKeyAuth:
+    """API key auth mode uses OPENAI_API_KEY env var."""
+
+    def test_api_key_mode_sets_correct_endpoint(self):
+        provider = OpenAIProvider(auth_mode="api_key", api_key="sk-test-123")
+        assert provider.endpoint == "https://api.openai.com/v1/responses"
+
+    @pytest.mark.asyncio
+    async def test_api_key_mode_returns_bearer_header(self):
+        provider = OpenAIProvider(auth_mode="api_key", api_key="sk-test-123")
+        headers = await provider.authenticate()
+        assert headers == {"Authorization": "Bearer sk-test-123"}
+
+    @pytest.mark.asyncio
+    async def test_api_key_mode_missing_key_raises(self):
+        """API key mode with no key raises a clear error."""
+        provider = OpenAIProvider(auth_mode="api_key", api_key=None)
+        with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+            await provider.authenticate()
+
+
+class TestOpenAIProviderCodexOAuth:
+    """Codex OAuth mode uses existing Codex auth flow."""
+
+    def test_codex_oauth_mode_sets_correct_endpoint(self):
+        provider = OpenAIProvider(auth_mode="codex_oauth")
+        assert provider.endpoint == "https://chatgpt.com/backend-api/codex/responses"
+
+    @pytest.mark.asyncio
+    async def test_codex_oauth_mode_uses_bearer_token(self, tmp_path: Path):
+        """Codex OAuth mode delegates to get_bearer_token."""
+        future_exp = time.time() + 3600
+        token = _make_jwt({"exp": future_exp})
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": token,
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+
+        provider = OpenAIProvider(auth_mode="codex_oauth", auth_path=auth_file)
+        headers = await provider.authenticate()
+        assert headers == {"Authorization": f"Bearer {token}"}
+
+
+class TestOpenAIProviderDefaults:
+    """Default constructor behavior preserves backward compatibility."""
+
+    def test_default_auth_mode_is_api_key(self):
+        provider = OpenAIProvider(auth_mode="api_key", api_key="sk-test")
+        assert provider.auth_mode == "api_key"
+
+    def test_codex_oauth_mode_stored(self):
+        provider = OpenAIProvider(auth_mode="codex_oauth")
+        assert provider.auth_mode == "codex_oauth"
+
+
+class TestDetectAuthMode:
+    """Auth mode detection from environment in __main__.py."""
+
+    def test_api_key_present_selects_api_key_mode(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key-placeholder")
+        from claude_bridge.__main__ import _detect_auth_mode
+
+        mode, key = _detect_auth_mode()
+        assert mode == "api_key"
+        assert key == "test-key-placeholder"
+
+    def test_empty_api_key_selects_codex_oauth(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "")
+        from claude_bridge.__main__ import _detect_auth_mode
+
+        mode, key = _detect_auth_mode()
+        assert mode == "codex_oauth"
+        assert key is None
+
+    def test_missing_api_key_selects_codex_oauth(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        from claude_bridge.__main__ import _detect_auth_mode
+
+        mode, key = _detect_auth_mode()
+        assert mode == "codex_oauth"
+        assert key is None

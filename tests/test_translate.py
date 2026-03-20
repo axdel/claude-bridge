@@ -219,7 +219,8 @@ class TestAnthropicToOpenaiToolUse:
 class TestAnthropicToOpenaiStripping:
     """Unsupported features stripped with warnings."""
 
-    def test_thinking_stripped(self):
+    def test_thinking_passthrough_by_default(self):
+        """Thinking config emits passthrough warning (not stripped) in default mode."""
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -227,7 +228,25 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         _, warnings = anthropic_to_openai(request)
-        assert any("thinking" in w for w in warnings)
+        assert any("passthrough" in w.lower() for w in warnings)
+        # Should NOT say "Stripped"
+        assert not any(
+            "stripped" in w.lower() and "thinking" in w.lower() for w in warnings
+        )
+
+    def test_thinking_stripped_when_drop_mode(self, monkeypatch):
+        """Thinking config stripped when REASONING_MODE=drop."""
+        import claude_bridge.providers.openai as oai_mod
+
+        monkeypatch.setattr(oai_mod, "_REASONING_MODE", "drop")
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "thinking": {"type": "enabled", "budget_tokens": 5000},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        _, warnings = anthropic_to_openai(request)
+        assert any("drop" in w.lower() and "thinking" in w.lower() for w in warnings)
 
     def test_output_config_stripped(self):
         request = {
@@ -261,6 +280,79 @@ class TestAnthropicToOpenaiStripping:
         assert any(
             "cache_control" in w.lower() or "cache" in w.lower() for w in warnings
         )
+
+
+# ---------------------------------------------------------------------------
+# Thinking block passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestThinkingBlockPassthrough:
+    """Thinking content blocks preserved or dropped based on reasoning mode."""
+
+    def test_thinking_block_preserved_as_tagged_text(self):
+        """In passthrough mode, thinking blocks become [thinking]...[/thinking]."""
+        request = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Let me reason about this."},
+                        {"type": "text", "text": "Here is my answer."},
+                    ],
+                }
+            ],
+        }
+        result, _ = anthropic_to_openai(request)
+        assistant_items = [
+            i for i in result["input"] if i.get("role") == "assistant"
+        ]
+        assert len(assistant_items) == 1
+        content = assistant_items[0]["content"]
+        # First block should be the thinking text
+        assert "[thinking]" in content[0]["text"]
+        assert "Let me reason about this." in content[0]["text"]
+
+    def test_thinking_block_dropped_in_drop_mode(self, monkeypatch):
+        """In drop mode, thinking blocks become empty text."""
+        import claude_bridge.providers.openai as oai_mod
+
+        monkeypatch.setattr(oai_mod, "_REASONING_MODE", "drop")
+        request = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Secret reasoning."},
+                        {"type": "text", "text": "Answer."},
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request)
+        assistant_items = [
+            i for i in result["input"] if i.get("role") == "assistant"
+        ]
+        content = assistant_items[0]["content"]
+        # Thinking block becomes empty, not preserved
+        assert "Secret reasoning" not in str(content)
+        assert any("drop" in w.lower() for w in warnings)
+
+    def test_thinking_block_empty_text_field(self):
+        """Thinking block with empty text doesn't crash."""
+        request = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": ""}],
+                }
+            ],
+        }
+        result, _ = anthropic_to_openai(request)
+        assert result is not None  # No crash
 
 
 # ---------------------------------------------------------------------------

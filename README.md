@@ -53,13 +53,17 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 ## Features
 
 - **Zero dependencies** — stdlib-only Python, no `pip install`
+- **Standard API key auth** — set `OPENAI_API_KEY` for the official OpenAI Responses API
+- **Codex OAuth fallback** — no API key? Falls back to Codex OAuth automatically
+- **Reasoning passthrough** — thinking blocks preserved by default, not silently stripped
 - **Auto-failover** — circuit breaker routes to fallback on Anthropic 429/500/502/503
+- **Mid-turn failover guard** — blocks provider switch during active tool-use turns
 - **Direct mode** — skip Anthropic entirely, always use a specific provider
-- **Structured logging** — request IDs, log levels (`LOG_LEVEL=DEBUG` for SSE traces)
-- **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, uptime
+- **Structured logging** — request IDs, provider/model identity, log levels (`LOG_LEVEL=DEBUG`)
+- **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
 - **Multi-provider** — adding a provider = one file, zero proxy changes
-- **97 tests** — auth, translation, streaming, routing, stats, connection handling
+- **114 tests** — auth, translation, streaming, routing, stats, connection handling
 
 ## Prerequisites
 
@@ -214,6 +218,8 @@ curl -s localhost:9999/stats | python3 -m json.tool
 
 | Env Var | Default | Description |
 |---|---|---|
+| `OPENAI_API_KEY` | _(none)_ | OpenAI API key — uses standard Responses API when set |
+| `REASONING_MODE` | `passthrough` | `passthrough` preserves thinking blocks, `drop` strips them |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback provider chain |
 | `LLM_BRIDGE_PORT` | `9999` | Default proxy port |
@@ -267,10 +273,11 @@ src/claude_bridge/
 ## Known Limitations
 
 - Claude Code's startup banner always shows "Sonnet 4.6" regardless of actual model
-- `thinking` blocks are stripped (no equivalent in OpenAI Responses API)
+- `thinking` blocks are passed through as tagged text (no native OpenAI equivalent) — set `REASONING_MODE=drop` to strip
 - `output_config` and `cache_control` hints are stripped with a warning
 - Token estimation is approximate (~bytes/3.5), not exact tokenization
 - Streaming stats don't include token counts (only latency)
+- Failover is blocked during active tool-use turns (by design — prevents broken tool state)
 
 ## Running Tests
 
@@ -280,7 +287,7 @@ cd claude-bridge
 uv run pytest tests/ -v     # installs test deps on first run
 ```
 
-No external services — all 97 tests use mock HTTP servers.
+No external services — all 114 tests use mock HTTP servers.
 
 ## Comparison
 
@@ -293,7 +300,7 @@ No external services — all 97 tests use mock HTTP servers.
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 97 | Minimal | Some |
+| Tests | 114 | Minimal | Some |
 
 ## Terms of Service Considerations
 

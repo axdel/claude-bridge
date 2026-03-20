@@ -24,6 +24,8 @@ class TestBridgeStats:
         assert snap["latency_avg_ms"] == 0.0
         assert "started_at" in snap
         assert "uptime_seconds" in snap
+        assert snap["provider_name"] is None
+        assert snap["model"] is None
 
     def test_record_request_increments(self):
         stats = BridgeStats()
@@ -86,3 +88,16 @@ class TestBridgeStats:
             t.join()
 
         assert stats.snapshot()["requests_total"] == 4 * iterations
+
+    def test_provider_info_initially_none(self):
+        stats = BridgeStats()
+        snap = stats.snapshot()
+        assert snap["provider_name"] is None
+        assert snap["model"] is None
+
+    def test_set_provider_info(self):
+        stats = BridgeStats()
+        stats.set_provider_info("openai", "gpt-5.4")
+        snap = stats.snapshot()
+        assert snap["provider_name"] == "openai"
+        assert snap["model"] == "gpt-5.4"

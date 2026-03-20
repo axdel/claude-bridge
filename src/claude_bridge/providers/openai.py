@@ -160,7 +160,10 @@ MODEL_MAP: dict[str, str] = {
 }
 DEFAULT_MODEL = "gpt-5.4"
 
-_STRIPPED_KEYS = ("thinking", "output_config")
+_STRIPPED_KEYS = ("output_config",)
+
+# Reasoning mode: "passthrough" preserves thinking blocks, "drop" strips them.
+_REASONING_MODE = os.environ.get("REASONING_MODE", "passthrough").lower()
 
 
 def _to_openai_id(anthropic_id: str) -> str:
@@ -215,6 +218,17 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
                 "Stripped unsupported cache_control hint from content block"
             )
         return translated, warnings
+
+    if block_type == "thinking":
+        if _REASONING_MODE == "drop":
+            warnings.append("Stripped thinking block (reasoning_mode=drop)")
+            return {"type": "input_text", "text": ""}, warnings
+        # Passthrough: preserve as tagged text
+        thinking_text = block.get("thinking", "")
+        return {
+            "type": "input_text",
+            "text": f"[thinking]\n{thinking_text}\n[/thinking]",
+        }, warnings
 
     if block_type == "tool_use":
         # Anthropic uses toolu_xxx or call_xxx; OpenAI requires fc_xxx prefix
@@ -317,6 +331,13 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     for key in _STRIPPED_KEYS:
         if key in request:
             warnings.append(f"Stripped unsupported key '{key}' from request")
+
+    # Handle thinking config based on reasoning mode
+    if "thinking" in request:
+        if _REASONING_MODE == "drop":
+            warnings.append("Stripped 'thinking' config (reasoning_mode=drop)")
+        else:
+            warnings.append("Thinking config passed through (reasoning_mode=passthrough)")
 
     # Model mapping
     model = request.get("model", "")
@@ -608,20 +629,46 @@ def translate_openai_sse_event(event: dict) -> list[dict]:
 # Concrete Provider implementation
 # ---------------------------------------------------------------------------
 
-_DEFAULT_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+_API_KEY_ENDPOINT = "https://api.openai.com/v1/responses"
 
 
 class OpenAIProvider:
-    """OpenAI Codex provider implementing the Provider protocol."""
+    """OpenAI provider implementing the Provider protocol.
+
+    Supports two auth modes:
+    - ``api_key``: uses an OpenAI API key (Bearer header to api.openai.com)
+    - ``codex_oauth``: uses Codex OAuth flow (Bearer header to chatgpt.com)
+    """
 
     name = "openai"
 
-    def __init__(self, endpoint: str = _DEFAULT_ENDPOINT) -> None:
-        self.endpoint = endpoint
+    def __init__(
+        self,
+        *,
+        auth_mode: str = "codex_oauth",
+        api_key: str | None = None,
+        auth_path: Path | None = None,
+    ) -> None:
+        self.auth_mode = auth_mode
+        self._api_key = api_key
+        self._auth_path = auth_path
+        if auth_mode == "api_key":
+            self.endpoint = _API_KEY_ENDPOINT
+        else:
+            self.endpoint = _CODEX_ENDPOINT
 
     async def authenticate(self) -> dict[str, str]:
         """Return Authorization header with a valid bearer token."""
-        token = await get_bearer_token()
+        if self.auth_mode == "api_key":
+            if not self._api_key:
+                msg = (
+                    "OPENAI_API_KEY environment variable is required for "
+                    "api_key auth mode but was not set or is empty."
+                )
+                raise ValueError(msg)
+            return {"Authorization": f"Bearer {self._api_key}"}
+        token = await get_bearer_token(self._auth_path)
         return {"Authorization": f"Bearer {token}"}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:

@@ -30,6 +30,8 @@ class BridgeStats:
         self._tokens_in = 0
         self._tokens_out = 0
         self._latency_total_ms = 0.0
+        self._provider_name: str | None = None
+        self._model: str | None = None
 
     def record_request(self) -> None:
         """Increment the request counter."""
@@ -62,6 +64,12 @@ class BridgeStats:
         with self._lock:
             self._failovers += 1
 
+    def set_provider_info(self, provider_name: str, model: str) -> None:
+        """Set the active provider name and model (called on first provider request)."""
+        with self._lock:
+            self._provider_name = provider_name
+            self._model = model
+
     def snapshot(self) -> dict:
         """Return a JSON-serializable snapshot of all metrics."""
         with self._lock:
@@ -81,4 +89,6 @@ class BridgeStats:
                 ),
                 "started_at": self._started_at.isoformat(),
                 "uptime_seconds": round(time.monotonic() - self._started_mono, 1),
+                "provider_name": self._provider_name,
+                "model": self._model,
             }
