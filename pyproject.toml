@@ -1,0 +1,16 @@
+[project]
+name = "claude-bridge"
+version = "0.1.0"
+description = "Use your Claude Code setup with any LLM provider — transparent API translation proxy"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25",
+]

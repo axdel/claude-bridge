@@ -1,0 +1,664 @@
+"""OpenAI Codex provider — OAuth token management + Anthropic/OpenAI translation (stdlib only)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import urllib.parse
+import urllib.request
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+from claude_bridge.auth import is_token_expired
+from claude_bridge.provider import PROVIDERS
+from claude_bridge.stream import format_anthropic_sse, parse_sse_events
+
+_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_TOKEN_URL = "https://auth.openai.com/oauth/token"
+_DEFAULT_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+
+
+def read_codex_auth(path: Path | None = None) -> dict:
+    """Read and validate Codex auth.json.
+
+    Raises:
+        FileNotFoundError: If the auth file does not exist (hint: run ``codex login``).
+        ValueError: If ``auth_mode`` is not ``"chatgpt"``.
+    """
+    auth_path = path or _DEFAULT_AUTH_PATH
+    if not auth_path.exists():
+        msg = (
+            f"Codex auth file not found at {auth_path}. "
+            "Run `codex login` to authenticate first."
+        )
+        raise FileNotFoundError(msg)
+
+    data: dict = json.loads(auth_path.read_text())
+
+    if data.get("auth_mode") != "chatgpt":
+        msg = (
+            f"Unsupported auth_mode '{data.get('auth_mode')}' — "
+            "only 'chatgpt' auth_mode is supported."
+        )
+        raise ValueError(msg)
+
+    return data
+
+
+_refresh_lock = asyncio.Lock()
+
+
+async def get_bearer_token(auth_path: Path | None = None) -> str:
+    """Return a valid access token, refreshing if expired.
+
+    Uses an asyncio.Lock to prevent concurrent refresh stampede — multiple
+    callers with expired tokens share a single refresh operation.
+    """
+    async with _refresh_lock:
+        data = read_codex_auth(auth_path)
+        tokens = data.get("tokens", data)  # support both nested and flat structures
+        token = tokens["access_token"]
+
+        if not is_token_expired(token):
+            return token
+
+        new_token = await refresh_access_token(
+            tokens["refresh_token"], auth_path=auth_path
+        )
+        return new_token
+
+
+async def refresh_access_token(
+    refresh_token: str, auth_path: Path | None = None
+) -> str:
+    """Exchange a refresh token for a new access token.
+
+    POSTs to the OpenAI token endpoint, updates the local auth.json
+    atomically, and returns the new access_token.
+    """
+    resolved_path = auth_path or _DEFAULT_AUTH_PATH
+
+    def _do_refresh() -> str:
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": _CODEX_CLIENT_ID,
+            }
+        ).encode()
+        req = urllib.request.Request(_TOKEN_URL, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            token_data: dict = json.loads(resp.read())
+
+        new_access_token: str = token_data["access_token"]
+        new_refresh_token: str = token_data.get("refresh_token", refresh_token)
+
+        # Atomic write: tmp file + os.replace
+        current = (
+            json.loads(resolved_path.read_text()) if resolved_path.exists() else {}
+        )
+        current["access_token"] = new_access_token
+        current["refresh_token"] = new_refresh_token
+
+        tmp_path = resolved_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(current, indent=2))
+        os.replace(tmp_path, resolved_path)
+
+        return new_access_token
+
+    return await asyncio.to_thread(_do_refresh)
+
+
+# ---------------------------------------------------------------------------
+# Token estimation (pure function, no I/O)
+# ---------------------------------------------------------------------------
+
+# Approximate bytes-per-token ratio for mixed code/natural language traffic.
+# English text averages ~4 chars/token, but code, JSON, and tool schemas are
+# denser. bytes/3.5 is a pragmatic middle ground (per Codex consultation).
+_BYTES_PER_TOKEN = 3.5
+
+
+def estimate_input_tokens(request: dict) -> int:
+    """Estimate input token count by walking the Anthropic request structure.
+
+    Serializes system prompt, messages, and tool definitions to JSON, counts
+    UTF-8 bytes, and divides by 3.5. Returns 0 for empty/malformed requests.
+    """
+    total_bytes = 0
+
+    # System prompt
+    system = request.get("system")
+    if system is not None:
+        total_bytes += len(json.dumps(system).encode())
+
+    # Messages
+    for message in request.get("messages", []):
+        total_bytes += len(json.dumps(message).encode())
+
+    # Tool definitions
+    tools = request.get("tools")
+    if tools:
+        total_bytes += len(json.dumps(tools).encode())
+
+    if total_bytes == 0:
+        return 0
+    return int(total_bytes / _BYTES_PER_TOKEN + 0.5)  # round to nearest
+
+
+# ---------------------------------------------------------------------------
+# Anthropic <-> OpenAI translation (pure functions, no I/O)
+# ---------------------------------------------------------------------------
+
+MODEL_MAP: dict[str, str] = {
+    "claude-opus-4-6": "gpt-5.4",
+    "claude-sonnet-4-6": "gpt-5.4",
+    "claude-haiku-4-5-20251001": "gpt-5.4",
+}
+DEFAULT_MODEL = "gpt-5.4"
+
+_STRIPPED_KEYS = ("thinking", "output_config")
+
+
+def _to_openai_id(anthropic_id: str) -> str:
+    """Convert Anthropic tool ID to OpenAI Responses API format.
+
+    Anthropic uses ``toolu_xxx`` or ``call_xxx``; OpenAI Responses API requires ``fc_xxx``.
+    """
+    if not anthropic_id:
+        return anthropic_id
+    if anthropic_id.startswith("fc_"):
+        return anthropic_id
+    if anthropic_id.startswith("call_"):
+        return "fc_" + anthropic_id[5:]
+    if anthropic_id.startswith("toolu_"):
+        return "fc_" + anthropic_id[6:]
+    return "fc_" + anthropic_id
+
+
+def _to_anthropic_id(openai_id: str) -> str:
+    """Convert OpenAI Responses API tool ID back to Anthropic format.
+
+    OpenAI uses ``fc_xxx``; Anthropic expects ``call_xxx`` or ``toolu_xxx``.
+    """
+    if not openai_id:
+        return openai_id
+    if openai_id.startswith("fc_"):
+        return "call_" + openai_id[3:]
+    if openai_id.startswith("call_") or openai_id.startswith("toolu_"):
+        return openai_id
+    return "call_" + openai_id
+
+
+def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
+    """Translate a single Anthropic content block to OpenAI Responses API format.
+
+    Returns (translated_block, warnings). For tool_use / tool_result blocks,
+    the translated block has a special ``_toplevel`` key set to True, signaling
+    the caller to emit it as a top-level input item rather than nesting it
+    inside a message's content array.
+
+    OpenAI Responses API field names (from official docs + CLASP proxy):
+    - function_call: {type, id, call_id, name, arguments} — BOTH id and call_id required
+    - function_call_output: {type, call_id, output} — output is always a string, never null
+    """
+    warnings: list[str] = []
+    block_type = block.get("type")
+
+    if block_type == "text":
+        translated = {"type": "input_text", "text": block["text"]}
+        if "cache_control" in block:
+            warnings.append(
+                "Stripped unsupported cache_control hint from content block"
+            )
+        return translated, warnings
+
+    if block_type == "tool_use":
+        # Anthropic uses toolu_xxx or call_xxx; OpenAI requires fc_xxx prefix
+        fc_id = _to_openai_id(block["id"])
+        return {
+            "_toplevel": True,
+            "type": "function_call",
+            "id": fc_id,
+            "call_id": fc_id,
+            "name": block["name"],
+            "arguments": json.dumps(block["input"]),
+        }, warnings
+
+    if block_type == "tool_result":
+        content = block.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(
+                b.get("text", "") for b in content if b.get("type") == "text"
+            )
+        output = str(content) if content else ""
+        if block.get("is_error"):
+            output = f"[Error] {output}"
+        # tool_use_id from Anthropic needs fc_ prefix for OpenAI
+        fc_id = _to_openai_id(block["tool_use_id"])
+        return {
+            "_toplevel": True,
+            "type": "function_call_output",
+            "call_id": fc_id,
+            "output": output,
+        }, warnings
+
+    # Unknown block type — pass through as input_text with warning
+    warnings.append(
+        f"Unknown content block type '{block_type}', converted to input_text"
+    )
+    return {"type": "input_text", "text": str(block)}, warnings
+
+
+def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
+    """Translate one Anthropic message to a list of OpenAI Responses API input items.
+
+    Anthropic puts everything in messages with content blocks. The Responses API
+    uses a flat input array where:
+    - User text → {role: "user", content: [{type: "input_text", text: "..."}]}
+    - Assistant text → {role: "assistant", content: [{type: "output_text", text: "..."}]}
+    - Tool use (assistant) → top-level {type: "function_call", ...} items
+    - Tool result (user) → top-level {type: "function_call_output", ...} items
+    """
+    warnings: list[str] = []
+    role = message.get("role", "user")
+    content = message.get("content", [])
+
+    # String shorthand → single text block
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+
+    nested_content: list[dict] = []
+    toplevel_items: list[dict] = []
+
+    for block in content:
+        translated, block_warnings = _translate_content_block(block)
+        warnings.extend(block_warnings)
+
+        if translated.pop("_toplevel", False):
+            toplevel_items.append(translated)
+        else:
+            # For assistant messages, text blocks become output_text not input_text
+            if role == "assistant" and translated.get("type") == "input_text":
+                translated = {"type": "output_text", "text": translated["text"]}
+            nested_content.append(translated)
+
+    items: list[dict] = []
+
+    # Emit a regular message if there's any nested content
+    if nested_content:
+        items.append(
+            {
+                "role": role,
+                "content": nested_content,
+            }
+        )
+
+    # Emit top-level items (function_call, function_call_output)
+    items.extend(toplevel_items)
+
+    return items, warnings
+
+
+def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
+    """Translate an Anthropic Messages API request to an OpenAI Responses API request.
+
+    Returns ``(translated_request, warnings)`` where warnings lists any
+    features that were stripped because they have no OpenAI equivalent.
+
+    Pure function — no I/O.
+    """
+    warnings: list[str] = []
+
+    # Strip unsupported top-level keys
+    for key in _STRIPPED_KEYS:
+        if key in request:
+            warnings.append(f"Stripped unsupported key '{key}' from request")
+
+    # Model mapping
+    model = request.get("model", "")
+    translated_model = MODEL_MAP.get(model, DEFAULT_MODEL)
+
+    # Build result — Codex endpoint requires stream: true
+    result: dict = {
+        "model": translated_model,
+        "store": False,
+        "stream": True,
+    }
+
+    # System prompt → instructions (required by Codex endpoint)
+    system = request.get("system")
+    if system is not None:
+        if isinstance(system, str):
+            result["instructions"] = system
+        elif isinstance(system, list):
+            result["instructions"] = "\n".join(
+                block.get("text", "") for block in system
+            )
+    else:
+        result["instructions"] = "You are a helpful assistant."
+
+    # Note: Codex backend endpoint does not support max_output_tokens or temperature.
+    # These are silently dropped. The model uses its own defaults.
+
+    # Tools — Responses API uses flat structure (no function wrapper)
+    # strict: false because Anthropic tool schemas mark ALL params as required
+    # but Claude Code only provides values for truly needed params
+    if "tools" in request:
+        result["tools"] = [
+            {
+                "type": "function",
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {}),
+                "strict": False,
+            }
+            for tool in request["tools"]
+        ]
+
+    # Messages → input
+    input_items: list[dict] = []
+    for message in request.get("messages", []):
+        items, msg_warnings = _translate_message(message)
+        input_items.extend(items)
+        warnings.extend(msg_warnings)
+
+    result["input"] = input_items
+
+    return result, warnings
+
+
+def openai_to_anthropic(response: dict) -> dict:
+    """Translate an OpenAI Responses API response to an Anthropic Messages API response.
+
+    Pure function — no I/O.
+    """
+    # Map status → stop_reason
+    status = response.get("status", "completed")
+    output_items = response.get("output", [])
+    has_tool_calls = any(i.get("type") == "function_call" for i in output_items)
+    if has_tool_calls:
+        stop_reason = "tool_use"
+    elif status == "incomplete":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+
+    # Translate output items → content blocks
+    content: list[dict] = []
+    for item in response.get("output", []):
+        item_type = item.get("type")
+
+        if item_type == "message":
+            # Extract text from message content
+            for block in item.get("content", []):
+                if block.get("type") == "output_text":
+                    content.append({"type": "text", "text": block["text"]})
+
+        elif item_type == "function_call":
+            raw_args = item.get("arguments", "{}")
+            try:
+                parsed_args = json.loads(raw_args)
+            except (json.JSONDecodeError, ValueError):
+                parsed_args = {"_raw": raw_args}
+            # Convert fc_xxx back to call_xxx for Anthropic
+            oai_id = item.get("call_id") or item.get("id", "")
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": _to_anthropic_id(oai_id),
+                    "name": item["name"],
+                    "input": parsed_args,
+                }
+            )
+
+    # Map usage
+    oai_usage = response.get("usage") or {}
+    usage = {
+        "input_tokens": oai_usage.get("input_tokens", 0),
+        "output_tokens": oai_usage.get("output_tokens", 0),
+    }
+
+    return {
+        "id": f"msg_bridge_{response.get('id', 'unknown')}",
+        "type": "message",
+        "role": "assistant",
+        "model": response.get("model", ""),
+        "stop_reason": stop_reason,
+        "content": content,
+        "usage": usage,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SSE event translation: OpenAI Responses API → Anthropic Messages API
+# ---------------------------------------------------------------------------
+
+
+def _sse_response_created(data: dict) -> list[dict]:
+    """Translate response.created → message_start + ping."""
+    resp = data.get("response", {})
+    usage = resp.get("usage") or {}
+    return [
+        {
+            "event": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": f"msg_bridge_{resp.get('id', 'unknown')}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": resp.get("model", ""),
+                    "stop_reason": None,
+                    "usage": {
+                        "input_tokens": usage.get("input_tokens", 0),
+                        "output_tokens": 0,
+                    },
+                },
+            },
+        },
+        {"event": "ping", "data": {"type": "ping"}},
+    ]
+
+
+def _sse_output_item_added(data: dict) -> list[dict]:
+    """Translate response.output_item.added → content_block_start for function_call items."""
+    item = data.get("item", {})
+    output_index = data.get("output_index", 0)
+    if item.get("type") != "function_call":
+        return []
+    oai_id = item.get("call_id") or item.get("id", "")
+    anthropic_id = _to_anthropic_id(oai_id) if oai_id else f"call_bridge_{output_index}"
+    return [
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": output_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": anthropic_id,
+                    "name": item.get("name", ""),
+                    "input": {},
+                },
+            },
+        }
+    ]
+
+
+def _sse_response_completed(data: dict) -> list[dict]:
+    """Translate response.completed → message_delta + message_stop."""
+    resp = data.get("response", {})
+    usage = resp.get("usage") or {}
+    status = resp.get("status", "completed")
+    output = resp.get("output", [])
+    has_tool_calls = any(i.get("type") == "function_call" for i in output)
+    if has_tool_calls:
+        stop_reason = "tool_use"
+    elif status == "incomplete":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+    return [
+        {
+            "event": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason},
+                "usage": {"output_tokens": usage.get("output_tokens", 0)},
+            },
+        },
+        {"event": "message_stop", "data": {"type": "message_stop"}},
+    ]
+
+
+# Events that are informational — no Anthropic equivalent.
+_SKIPPED_SSE_EVENTS = frozenset(
+    {
+        "response.in_progress",
+        "response.queued",
+        "response.content_part.done",
+        "response.output_item.done",
+    }
+)
+
+
+def translate_openai_sse_event(event: dict) -> list[dict]:
+    """Translate one OpenAI Responses API SSE event to Anthropic SSE events.
+
+    Dispatches to sub-handlers by event type. Returns a list of ``{event, data}``
+    dicts (may be 0, 1, or 2 items). Pure function — no I/O.
+    """
+    event_type = event.get("event", "")
+    data = event.get("data", {})
+
+    if event_type == "response.created":
+        return _sse_response_created(data)
+
+    if event_type == "response.content_part.added":
+        return [
+            {
+                "event": "content_block_start",
+                "data": {
+                    "type": "content_block_start",
+                    "index": data.get("content_index", 0),
+                    "content_block": {"type": "text", "text": ""},
+                },
+            }
+        ]
+
+    if event_type == "response.output_text.delta":
+        return [
+            {
+                "event": "content_block_delta",
+                "data": {
+                    "type": "content_block_delta",
+                    "index": data.get("content_index", 0),
+                    "delta": {"type": "text_delta", "text": data.get("delta", "")},
+                },
+            }
+        ]
+
+    if event_type in (
+        "response.output_text.done",
+        "response.function_call_arguments.done",
+    ):
+        return [
+            {
+                "event": "content_block_stop",
+                "data": {
+                    "type": "content_block_stop",
+                    "index": data.get("output_index", data.get("content_index", 0)),
+                },
+            }
+        ]
+
+    if event_type == "response.output_item.added":
+        return _sse_output_item_added(data)
+
+    if event_type == "response.function_call_arguments.delta":
+        return [
+            {
+                "event": "content_block_delta",
+                "data": {
+                    "type": "content_block_delta",
+                    "index": data.get("output_index", 0),
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": data.get("delta", ""),
+                    },
+                },
+            }
+        ]
+
+    if event_type == "response.completed":
+        return _sse_response_completed(data)
+
+    if event_type in _SKIPPED_SSE_EVENTS:
+        return []
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Concrete Provider implementation
+# ---------------------------------------------------------------------------
+
+_DEFAULT_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+
+
+class OpenAIProvider:
+    """OpenAI Codex provider implementing the Provider protocol."""
+
+    name = "openai"
+
+    def __init__(self, endpoint: str = _DEFAULT_ENDPOINT) -> None:
+        self.endpoint = endpoint
+
+    async def authenticate(self) -> dict[str, str]:
+        """Return Authorization header with a valid bearer token."""
+        token = await get_bearer_token()
+        return {"Authorization": f"Bearer {token}"}
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        """Translate Anthropic Messages request to OpenAI Responses request."""
+        return anthropic_to_openai(anthropic_req)
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        """Translate OpenAI Responses response to Anthropic Messages response."""
+        return openai_to_anthropic(provider_resp)
+
+    async def translate_stream(
+        self, raw_chunks: AsyncIterator[bytes]
+    ) -> AsyncIterator[dict]:
+        """Translate raw provider byte chunks to Anthropic SSE events.
+
+        Receives raw HTTP response bytes, handles SSE parsing (CRLF
+        normalization, double-newline splitting) and event translation.
+        Yields ``{event, data}`` dicts in Anthropic format.
+        """
+        buffer = b""
+        async for chunk in raw_chunks:
+            buffer += chunk
+            # Normalize CRLF so the splitter works with both \r\n\r\n and \n\n
+            buffer = buffer.replace(b"\r\n", b"\n")
+            # Process complete SSE events (terminated by double newline)
+            while b"\n\n" in buffer:
+                event_end = buffer.index(b"\n\n") + 2
+                event_bytes = buffer[:event_end]
+                buffer = buffer[event_end:]
+                for parsed_event in parse_sse_events(event_bytes):
+                    for translated in translate_openai_sse_event(parsed_event):
+                        yield translated
+        # Process any remaining buffer
+        if buffer.strip():
+            for parsed_event in parse_sse_events(buffer):
+                for translated in translate_openai_sse_event(parsed_event):
+                    yield translated
+
+
+PROVIDERS["openai"] = OpenAIProvider

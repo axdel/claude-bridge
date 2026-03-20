@@ -1,0 +1,408 @@
+"""Tests for the Claude Bridge proxy server."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import socket
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
+import pytest
+
+from claude_bridge.provider import PROVIDERS
+from claude_bridge.proxy import start_proxy
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class _MockUpstreamHandler(BaseHTTPRequestHandler):
+    """Echoes back a canned Anthropic response."""
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length", 0))
+        _body = self.rfile.read(length)
+        resp = {
+            "id": "msg_test",
+            "type": "message",
+            "content": [{"type": "text", "text": "hello from upstream"}],
+            "model": "claude-sonnet-4-20250514",
+        }
+        payload = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+@pytest.fixture()
+def upstream_url():
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _MockUpstreamHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    server.shutdown()
+
+
+@pytest.fixture()
+async def proxy_url(upstream_url: str):
+    port = _find_free_port()
+    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    yield f"http://127.0.0.1:{port}"
+    server.close()
+    await server.wait_closed()
+
+
+def _http_post(url: str, body: dict, headers: dict | None = None) -> tuple[int, dict]:
+    """Stdlib HTTP POST helper — returns (status_code, json_body)."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def _http_get(url: str) -> int:
+    """Stdlib HTTP GET — returns status code only."""
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+@pytest.mark.asyncio
+async def test_passthrough_forwards_to_upstream(proxy_url: str):
+    """POST /v1/messages forwards to upstream and returns the response."""
+    request_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    status, data = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages",
+        request_body,
+        {"x-api-key": "test-key"},
+    )
+    assert status == 200
+    assert data["type"] == "message"
+    assert data["content"][0]["text"] == "hello from upstream"
+
+
+@pytest.mark.asyncio
+async def test_stats_endpoint_returns_metrics(proxy_url: str):
+    """GET /stats returns JSON with request metrics after a request."""
+    # Make a request first so stats are non-zero
+    request_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages",
+        request_body,
+        {"x-api-key": "test-key"},
+    )
+    # Check stats (POST works — endpoint accepts any method)
+    status, stats = await asyncio.to_thread(_http_post, f"{proxy_url}/stats", {})
+    assert status == 200
+    assert stats["requests_total"] >= 1
+    assert "started_at" in stats
+    assert "uptime_seconds" in stats
+    assert stats["tokens_in"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_wrong_path_returns_404(proxy_url: str):
+    """GET to an unknown path returns 404."""
+    status = await asyncio.to_thread(_http_get, f"{proxy_url}/v1/completions")
+    assert status == 404
+
+
+@pytest.mark.asyncio
+async def test_malformed_content_length_returns_400(upstream_url: str):
+    """Malformed Content-Length header returns 400 instead of crashing."""
+    port = _find_free_port()
+    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    try:
+        # Send a raw HTTP request with a bad Content-Length
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /v1/messages HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n"
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=2)
+        writer.close()
+        assert b"400" in response
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_upstream_unreachable_returns_502():
+    """When upstream is unreachable, proxy returns 502."""
+    port = _find_free_port()
+    dead_upstream = f"http://127.0.0.1:{_find_free_port()}"
+    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=dead_upstream)
+    try:
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{port}/v1/messages",
+            {"model": "test", "messages": []},
+        )
+        assert status == 502
+        assert "upstream unavailable" in data["error"]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+# ---------------------------------------------------------------------------
+# Failover + direct-mode tests
+# ---------------------------------------------------------------------------
+
+
+class _Mock500UpstreamHandler(BaseHTTPRequestHandler):
+    """Returns 500 for all requests (simulates Anthropic outage)."""
+
+    def do_POST(self):  # noqa: N802
+        payload = json.dumps({"error": "internal server error"}).encode()
+        self.send_response(500)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+class _MockOpenAIHandler(BaseHTTPRequestHandler):
+    """Returns a valid OpenAI Responses API response."""
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length", 0))
+        _body = self.rfile.read(length)
+        resp = {
+            "id": "resp_test123",
+            "status": "completed",
+            "model": "gpt-5.4",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "hello from openai fallback"}
+                    ],
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        payload = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+class _FakeOpenAIProvider:
+    """Test provider that talks to a local mock OpenAI server."""
+
+    name = "openai"
+
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    async def authenticate(self) -> dict[str, str]:
+        return {"Authorization": "Bearer fake-token"}
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        from claude_bridge.providers.openai import anthropic_to_openai
+
+        return anthropic_to_openai(anthropic_req)
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        from claude_bridge.providers.openai import openai_to_anthropic
+
+        return openai_to_anthropic(provider_resp)
+
+
+@pytest.fixture()
+def _openai_mock_url():
+    """Spin up a mock OpenAI endpoint and register a fake provider."""
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _MockOpenAIHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{port}"
+
+    # Register a fake provider class that points at the mock
+    class _TestProvider(_FakeOpenAIProvider):
+        def __init__(self):
+            super().__init__(endpoint=f"{url}/v1/responses")
+
+    old = PROVIDERS.get("openai")
+    PROVIDERS["openai"] = _TestProvider
+    # Clear the provider cache so _get_fallback_provider() picks up the mock
+    from claude_bridge.proxy import _provider_cache
+
+    _provider_cache.pop("openai", None)
+    yield url
+    _provider_cache.pop("openai", None)
+    if old is not None:
+        PROVIDERS["openai"] = old
+    else:
+        PROVIDERS.pop("openai", None)
+    server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failover_on_upstream_500(_openai_mock_url: str):
+    """When Anthropic returns 500, proxy fails over to the fallback provider."""
+    # Start a mock Anthropic that always returns 500
+    anthropic_port = _find_free_port()
+    anthropic_server = HTTPServer(
+        ("127.0.0.1", anthropic_port), _Mock500UpstreamHandler
+    )
+    anthropic_thread = Thread(target=anthropic_server.serve_forever, daemon=True)
+    anthropic_thread.start()
+    anthropic_url = f"http://127.0.0.1:{anthropic_port}"
+
+    proxy_port = _find_free_port()
+    server = await start_proxy(
+        host="127.0.0.1", port=proxy_port, upstream_url=anthropic_url
+    )
+    try:
+        request_body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        # First request: Anthropic fails with 500 — records failure #1,
+        # but circuit is still CLOSED (threshold=2), so returns 500
+        status1, _data1 = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            request_body,
+        )
+        assert status1 == 500
+
+        # Second request: Anthropic fails again — records failure #2,
+        # circuit trips to OPEN, should_use_fallback() returns True → failover
+        status2, data2 = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            request_body,
+        )
+        assert status2 == 200
+        assert data2["type"] == "message"
+        assert data2["content"][0]["text"] == "hello from openai fallback"
+        assert data2["id"].startswith("msg_bridge_")
+    finally:
+        server.close()
+        await server.wait_closed()
+        anthropic_server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_direct_mode_skips_anthropic(_openai_mock_url: str):
+    """With provider_name='openai', proxy never contacts Anthropic."""
+    proxy_port = _find_free_port()
+    # Use a dead upstream URL — if the proxy tries Anthropic, it will get 502
+    dead_upstream = f"http://127.0.0.1:{_find_free_port()}"
+    server = await start_proxy(
+        host="127.0.0.1",
+        port=proxy_port,
+        upstream_url=dead_upstream,
+        provider_name="openai",
+    )
+    try:
+        request_body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            request_body,
+        )
+        # Should get 200 from the OpenAI mock, translated back to Anthropic format
+        assert status == 200
+        assert data["type"] == "message"
+        assert data["content"][0]["text"] == "hello from openai fallback"
+        assert data["id"].startswith("msg_bridge_")
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+# ---------------------------------------------------------------------------
+# Provider cache + configurable fallback tests
+# ---------------------------------------------------------------------------
+
+
+def test_provider_cache_returns_same_instance():
+    """Cached provider instances are reused, not re-created."""
+    from claude_bridge.proxy import _get_cached_provider, _provider_cache
+
+    _provider_cache.clear()
+    p1 = _get_cached_provider("openai")
+    p2 = _get_cached_provider("openai")
+    assert p1 is p2
+    _provider_cache.clear()
+
+
+def test_provider_cache_unknown_returns_none():
+    """Unknown provider name returns None from cache."""
+    from claude_bridge.proxy import _get_cached_provider
+
+    assert _get_cached_provider("nonexistent") is None
+
+
+def test_fallback_chain_from_env(monkeypatch):
+    """LLM_BRIDGE_FALLBACK env var controls fallback order."""
+    from claude_bridge.proxy import _get_fallback_chain
+
+    monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "openai,xai")
+    chain = _get_fallback_chain()
+    assert chain == ["openai", "xai"]
+
+
+def test_fallback_chain_default(monkeypatch):
+    """Without env var, fallback defaults to ['openai']."""
+    from claude_bridge.proxy import _get_fallback_chain
+
+    monkeypatch.delenv("LLM_BRIDGE_FALLBACK", raising=False)
+    chain = _get_fallback_chain()
+    assert chain == ["openai"]
+
+
+def test_fallback_chain_empty_string(monkeypatch):
+    """Empty LLM_BRIDGE_FALLBACK means no fallback available."""
+    from claude_bridge.proxy import _get_fallback_chain
+
+    monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "")
+    chain = _get_fallback_chain()
+    assert chain == []
