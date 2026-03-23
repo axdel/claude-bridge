@@ -150,6 +150,57 @@ class TestGetBearerToken:
         result = await get_bearer_token(auth_file)
         assert result == token
 
+    @pytest.mark.asyncio
+    async def test_malformed_stored_token_raises_value_error(self, tmp_path: Path):
+        """Malformed access_token in auth.json raises ValueError from is_token_expired."""
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": "not-a-jwt",
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+        with pytest.raises(ValueError, match="Cannot check token expiry"):
+            await get_bearer_token(auth_file)
+
+    @pytest.mark.asyncio
+    async def test_expired_token_refresh_failure_raises(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """Expired token + refresh network error surfaces as ValueError."""
+        expired_token = _make_jwt({"exp": time.time() - 100})
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": expired_token,
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+
+        def _raise_timeout(*args, **kwargs):
+            raise TimeoutError("Connection timed out")
+
+        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        with pytest.raises(ValueError, match="Token refresh failed"):
+            await get_bearer_token(auth_file)
+
+    @pytest.mark.asyncio
+    async def test_token_without_exp_claim_raises(self, tmp_path: Path):
+        """Token with valid JWT structure but no exp claim raises ValueError."""
+        no_exp_token = _make_jwt({"sub": "user", "iat": 1700000000})
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": no_exp_token,
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+        with pytest.raises(ValueError, match="Cannot check token expiry"):
+            await get_bearer_token(auth_file)
+
 
 class TestRefreshLock:
     """Auth refresh lock prevents concurrent stampede."""
