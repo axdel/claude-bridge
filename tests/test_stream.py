@@ -227,3 +227,220 @@ class TestOpenAIToAnthropicSSETranslation:
         }
         results = translate_openai_sse_event(event)
         assert results[0]["data"]["delta"]["stop_reason"] == "max_tokens"
+
+
+# ---------------------------------------------------------------------------
+# translate_stream integration tests
+# ---------------------------------------------------------------------------
+
+
+async def _chunks_from(byte_list: list[bytes]):
+    """Async generator yielding bytes from a list (simulates HTTP chunks)."""
+    for chunk in byte_list:
+        yield chunk
+
+
+def _make_sse_event(event_type: str, data: dict) -> bytes:
+    """Build raw SSE bytes for one event."""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+class TestTranslateStream:
+    """Integration tests for OpenAIProvider.translate_stream()."""
+
+    @pytest.mark.asyncio
+    async def test_single_chunk_with_multiple_events(self):
+        """Multiple SSE events in one chunk are all translated."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+
+        created_event = _make_sse_event(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_1",
+                    "model": "gpt-5.4",
+                    "status": "in_progress",
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                },
+            },
+        )
+        text_delta = _make_sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "Hello",
+            },
+        )
+
+        chunks = [created_event + text_delta]
+        events = []
+        async for event in provider.translate_stream(_chunks_from(chunks)):
+            events.append(event)
+
+        # response.created → message_start + ping, text.delta → content_block_delta
+        assert len(events) == 3
+        assert events[0]["event"] == "message_start"
+        assert events[1]["event"] == "ping"
+        assert events[2]["event"] == "content_block_delta"
+        assert events[2]["data"]["delta"]["text"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_event_split_across_chunks(self):
+        """An SSE event split across two byte chunks is correctly buffered."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+
+        full_event = _make_sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "world",
+            },
+        )
+
+        # Split the event in the middle
+        mid = len(full_event) // 2
+        chunk1 = full_event[:mid]
+        chunk2 = full_event[mid:]
+
+        events = []
+        async for event in provider.translate_stream(_chunks_from([chunk1, chunk2])):
+            events.append(event)
+
+        assert len(events) == 1
+        assert events[0]["event"] == "content_block_delta"
+        assert events[0]["data"]["delta"]["text"] == "world"
+
+    @pytest.mark.asyncio
+    async def test_crlf_events_handled(self):
+        """CRLF line endings in SSE are normalized and parsed correctly."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+
+        event_bytes = (
+            b"event: response.output_text.delta\r\n"
+            b'data: {"type":"response.output_text.delta",'
+            b'"output_index":0,"content_index":0,"delta":"hi"}\r\n\r\n'
+        )
+
+        events = []
+        async for event in provider.translate_stream(_chunks_from([event_bytes])):
+            events.append(event)
+
+        assert len(events) == 1
+        assert events[0]["data"]["delta"]["text"] == "hi"
+
+    @pytest.mark.asyncio
+    async def test_skipped_events_produce_no_output(self):
+        """Events with no Anthropic equivalent are silently skipped."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+
+        # response.output_item.added for a non-function_call item produces no output
+        event_bytes = _make_sse_event(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "content": []},
+            },
+        )
+
+        events = []
+        async for event in provider.translate_stream(_chunks_from([event_bytes])):
+            events.append(event)
+
+        assert len(events) == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_chunks_skipped(self):
+        """Empty byte chunks don't produce events or errors."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+
+        text_event = _make_sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "ok",
+            },
+        )
+
+        events = []
+        async for event in provider.translate_stream(
+            _chunks_from([b"", text_event, b""])
+        ):
+            events.append(event)
+
+        assert len(events) == 1
+        assert events[0]["data"]["delta"]["text"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# _extract_completed_response tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCompletedResponse:
+    """Tests for proxy._extract_completed_response() SSE parser."""
+
+    def test_finds_response_completed(self):
+        from claude_bridge.proxy import _extract_completed_response
+
+        sse = (
+            b'event: response.created\ndata: {"type":"response.created","response":{"id":"r1"}}\n\n'
+            b'event: response.completed\ndata: {"type":"response.completed",'
+            b'"response":{"id":"r1","status":"completed","output":[]}}\n\n'
+        )
+        result = _extract_completed_response(sse)
+        assert result is not None
+        assert result["id"] == "r1"
+        assert result["status"] == "completed"
+
+    def test_returns_none_when_no_completed(self):
+        from claude_bridge.proxy import _extract_completed_response
+
+        sse = b'event: response.created\ndata: {"type":"response.created","response":{"id":"r1"}}\n\n'
+        result = _extract_completed_response(sse)
+        assert result is None
+
+    def test_handles_malformed_json_lines(self):
+        from claude_bridge.proxy import _extract_completed_response
+
+        sse = (
+            b"data: not-json\n\n"
+            b'data: {"type":"response.completed","response":{"id":"r2"}}\n\n'
+        )
+        result = _extract_completed_response(sse)
+        assert result is not None
+        assert result["id"] == "r2"
+
+
+# ---------------------------------------------------------------------------
+# SSE format round-trip test
+# ---------------------------------------------------------------------------
+
+
+class TestSSEFormatRoundTrip:
+    """Verify format_anthropic_sse output can be parsed back."""
+
+    def test_format_then_parse_roundtrip(self):
+        data = {"type": "content_block_delta", "index": 0, "delta": {"text": "hello"}}
+        wire_bytes = format_anthropic_sse("content_block_delta", data)
+        parsed = parse_sse_events(wire_bytes)
+        assert len(parsed) == 1
+        assert parsed[0]["event"] == "content_block_delta"
+        assert parsed[0]["data"]["delta"]["text"] == "hello"

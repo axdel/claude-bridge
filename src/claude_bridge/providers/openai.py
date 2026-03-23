@@ -12,7 +12,7 @@ from pathlib import Path
 
 from claude_bridge.auth import is_token_expired
 from claude_bridge.provider import PROVIDERS
-from claude_bridge.stream import format_anthropic_sse, parse_sse_events
+from claude_bridge.stream import parse_sse_events
 
 _CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 _TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -208,9 +208,19 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
     if block_type == "tool_result":
         content = block.get("content", "")
         if isinstance(content, list):
-            content = "\n".join(
-                b.get("text", "") for b in content if b.get("type") == "text"
-            )
+            parts = []
+            for b in content:
+                if b.get("type") == "text":
+                    parts.append(b.get("text", ""))
+                elif b.get("type") == "image":
+                    source = b.get("source", {})
+                    if source.get("type") == "base64":
+                        media = source.get("media_type", "application/octet-stream")
+                        data = source.get("data", "")
+                        parts.append(f"[image: data:{media};base64,{data}]")
+                    elif source.get("type") == "url":
+                        parts.append(f"[image: {source.get('url', '')}]")
+            content = "\n".join(parts)
         output = str(content) if content else ""
         if block.get("is_error"):
             output = f"[Error] {output}"
@@ -300,7 +310,9 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
         if _REASONING_MODE == "drop":
             warnings.append("Stripped 'thinking' config (reasoning_mode=drop)")
         else:
-            warnings.append("Thinking config passed through (reasoning_mode=passthrough)")
+            warnings.append(
+                "Thinking config passed through (reasoning_mode=passthrough)"
+            )
 
     # Model mapping
     model = request.get("model", "")

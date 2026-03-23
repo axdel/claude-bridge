@@ -2,6 +2,20 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-03-23
+
+### P0 Reliability Hardening + P2 Production Improvements ([PR #2](https://github.com/axdel/claude-bridge/pull/2))
+Configurable timeouts, body size limits, translation validation, rate limit header forwarding, image block preservation, and 23 new tests (114→137)
+
+- [`a73bde5`](https://github.com/axdel/claude-bridge/commit/a73bde5) Add streaming integration tests and SSE round-trip coverage
+- [`d9c6da4`](https://github.com/axdel/claude-bridge/commit/d9c6da4) Add coverage for /v1/messages/count_tokens endpoint
+- [`acfeead`](https://github.com/axdel/claude-bridge/commit/acfeead) Preserve image blocks in tool_result content translation
+- [`feddc55`](https://github.com/axdel/claude-bridge/commit/feddc55) Forward rate limit headers from upstream to client
+- [`67966b0`](https://github.com/axdel/claude-bridge/commit/67966b0) Validate translate_request() return type before use
+- [`be58e35`](https://github.com/axdel/claude-bridge/commit/be58e35) Request body size limit via MAX_REQUEST_BODY env var
+- [`6d441dd`](https://github.com/axdel/claude-bridge/commit/6d441dd) Configurable upstream timeouts via UPSTREAM_TIMEOUT env var
+Tasks: 7/7 | P0: 5/5 | P2: 2/2
+
 ## 2026-03-20
 
 ### v0.2.0 — API key auth, reasoning passthrough, failover guard, session identity ([PR #1](https://github.com/axdel/claude-bridge/pull/1))

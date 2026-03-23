@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from claude_bridge.providers.openai import (
     DEFAULT_MODEL,
@@ -12,6 +11,7 @@ from claude_bridge.providers.openai import (
     anthropic_to_openai,
     openai_to_anthropic,
 )
+from claude_bridge.proxy import estimate_input_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -305,9 +305,7 @@ class TestThinkingBlockPassthrough:
             ],
         }
         result, _ = anthropic_to_openai(request)
-        assistant_items = [
-            i for i in result["input"] if i.get("role") == "assistant"
-        ]
+        assistant_items = [i for i in result["input"] if i.get("role") == "assistant"]
         assert len(assistant_items) == 1
         content = assistant_items[0]["content"]
         # First block should be the thinking text
@@ -332,9 +330,7 @@ class TestThinkingBlockPassthrough:
             ],
         }
         result, warnings = anthropic_to_openai(request)
-        assistant_items = [
-            i for i in result["input"] if i.get("role") == "assistant"
-        ]
+        assistant_items = [i for i in result["input"] if i.get("role") == "assistant"]
         content = assistant_items[0]["content"]
         # Thinking block becomes empty, not preserved
         assert "Secret reasoning" not in str(content)
@@ -586,6 +582,72 @@ class TestTranslationRobustness:
         assert len(fco) == 1
         assert fco[0]["output"] == "Part 1\nPart 2"
 
+    def test_tool_result_with_image_content_preserves_data(self):
+        """tool_result with mixed text+image content preserves image as data URL."""
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {"type": "text", "text": "Screenshot captured"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBORw0KGgo=",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        result, _ = anthropic_to_openai(request)
+        fco = [i for i in result["input"] if i.get("type") == "function_call_output"]
+        assert len(fco) == 1
+        output = fco[0]["output"]
+        assert "Screenshot captured" in output
+        assert "data:image/png;base64,iVBORw0KGgo=" in output
+
+    def test_tool_result_with_url_image_preserves_url(self):
+        """tool_result with URL image source preserves the URL."""
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_url_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "url",
+                                        "url": "https://example.com/img.png",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        result, _ = anthropic_to_openai(request)
+        fco = [i for i in result["input"] if i.get("type") == "function_call_output"]
+        assert len(fco) == 1
+        assert "https://example.com/img.png" in fco[0]["output"]
+
     def test_unknown_content_block_type_converted_with_warning(self):
         """Unknown block type falls back to input_text with a warning."""
         request = {
@@ -632,9 +694,6 @@ class TestTranslationRobustness:
 # ---------------------------------------------------------------------------
 # estimate_input_tokens
 # ---------------------------------------------------------------------------
-
-
-from claude_bridge.proxy import estimate_input_tokens
 
 
 class TestEstimateInputTokens:

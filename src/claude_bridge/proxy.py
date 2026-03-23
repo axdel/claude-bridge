@@ -23,6 +23,23 @@ from claude_bridge.stream import format_anthropic_sse
 logger = get_logger("proxy")
 
 _DEFAULT_UPSTREAM = "https://api.anthropic.com"
+_MAX_REQUEST_BODY = int(os.environ.get("MAX_REQUEST_BODY", 10_485_760))
+
+
+def _get_timeout(default: int) -> int:
+    """Return upstream timeout in seconds from UPSTREAM_TIMEOUT env var, or *default*."""
+    raw = os.environ.get("UPSTREAM_TIMEOUT")
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        logger.warning("Invalid UPSTREAM_TIMEOUT=%r, using default %ds", raw, default)
+        return default
+    if value <= 0:
+        return default
+    return value
+
 
 # Headers to forward from the client to the upstream API.
 _FORWARD_HEADERS = ("x-api-key", "content-type", "anthropic-version")
@@ -31,6 +48,22 @@ _FORWARD_HEADERS = ("x-api-key", "content-type", "anthropic-version")
 _FAILOVER_STATUSES = {429, 500, 502, 503}
 
 # SSE events too noisy for DEBUG — normal stream lifecycle, not interesting.
+_RATELIMIT_HEADER_PREFIXES = ("x-ratelimit-", "anthropic-ratelimit-")
+_RATELIMIT_EXACT_HEADERS = ("retry-after",)
+
+
+def _extract_ratelimit_headers(headers) -> list[tuple[str, str]]:
+    """Extract rate limit headers from an HTTP response headers object."""
+    result = []
+    for key, value in headers.items():
+        lower_key = key.lower()
+        if any(lower_key.startswith(p) for p in _RATELIMIT_HEADER_PREFIXES):
+            result.append((lower_key, value))
+        elif lower_key in _RATELIMIT_EXACT_HEADERS:
+            result.append((lower_key, value))
+    return result
+
+
 _QUIET_SSE_EVENTS = frozenset(
     {
         "content_block_delta",
@@ -95,6 +128,10 @@ def _make_handler(
     return _handle_connection
 
 
+class _RequestTooLarge(Exception):
+    """Raised when Content-Length exceeds MAX_REQUEST_BODY."""
+
+
 async def _parse_request(
     reader: asyncio.StreamReader,
 ) -> tuple[str, str, dict[str, str], bytes] | None:
@@ -123,6 +160,8 @@ async def _parse_request(
         content_length = int(headers.get("content-length", "0"))
     except (ValueError, TypeError):
         return None  # Malformed Content-Length — caller sends 400
+    if content_length > _MAX_REQUEST_BODY:
+        raise _RequestTooLarge
     body = await reader.readexactly(content_length) if content_length else b""
     return method, path, headers, body
 
@@ -216,7 +255,20 @@ async def _process_request(
     request_id_var.set(secrets.token_hex(4))
     request_start = _time.monotonic()
 
-    parsed = await _parse_request(reader)
+    try:
+        parsed = await _parse_request(reader)
+    except _RequestTooLarge:
+        error_body = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "request_too_large",
+                    "message": f"Request body exceeds maximum size ({_MAX_REQUEST_BODY} bytes)",
+                },
+            }
+        ).encode()
+        _write_response(writer, 413, error_body)
+        return
     if parsed is None:
         _write_response(writer, 400, b'{"error": "malformed request"}')
         return
@@ -253,8 +305,16 @@ async def _process_request(
     request_model = _extract_model(body)
 
     await _route_request(
-        provider, upstream_url, headers, body, writer, router,
-        stats, streaming, request_model, request_start,
+        provider,
+        upstream_url,
+        headers,
+        body,
+        writer,
+        router,
+        stats,
+        streaming,
+        request_model,
+        request_start,
     )
 
 
@@ -281,9 +341,7 @@ async def _route_request(
     """Route a /v1/messages request to the appropriate backend."""
     if provider is not None:
         mode = "stream" if streaming else "sync"
-        logger.info(
-            "-> DIRECT %s (%s) model=%s", provider.name, mode, request_model
-        )
+        logger.info("-> DIRECT %s (%s) model=%s", provider.name, mode, request_model)
         if stats:
             stats.set_provider_info(provider.name, request_model)
         if streaming:
@@ -303,10 +361,10 @@ async def _route_request(
         logger.info("-> auto-route (sync) model=%s", request_model)
         if stats:
             stats.set_provider_info("anthropic", request_model)
-        status_code, response_body = await _auto_route(
+        status_code, response_body, rl_headers = await _auto_route(
             upstream_url, headers, body, router
         )
-        _write_response(writer, status_code, response_body)
+        _write_response(writer, status_code, response_body, rl_headers)
         _record_sync_response(stats, request_start, status_code, response_body)
 
 
@@ -330,30 +388,30 @@ async def _try_failover(router: Router, body: bytes) -> tuple[int, bytes] | None
 
 async def _auto_route(
     upstream_url: str, headers: dict[str, str], body: bytes, router: Router
-) -> tuple[int, bytes]:
+) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Auto mode: try Anthropic, failover on error."""
     # If circuit breaker is OPEN, try fallback first
     if router.should_use_fallback():
         result = await _try_failover(router, body)
         if result is not None:
-            return result
+            return result[0], result[1], []
 
     # Try Anthropic upstream
-    status_code, response_body = await asyncio.to_thread(
+    status_code, response_body, rl_headers = await asyncio.to_thread(
         _forward_request, upstream_url, body, headers
     )
 
     if status_code not in _FAILOVER_STATUSES:
         await router.record_success()
-        return status_code, response_body
+        return status_code, response_body, rl_headers
 
     # Anthropic failed — record and try failover
     await router.record_failure()
     result = await _try_failover(router, body)
     if result is not None:
-        return result
+        return result[0], result[1], []
 
-    return status_code, response_body
+    return status_code, response_body, rl_headers
 
 
 _provider_cache: dict[str, Provider] = {}
@@ -399,6 +457,22 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     """
     request_dict = json.loads(body)
     translated, warnings = provider.translate_request(request_dict)
+    if not isinstance(translated, dict):
+        logger.warning(
+            "Provider %s translate_request returned %s, expected dict",
+            provider.name,
+            type(translated).__name__,
+        )
+        error = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "Provider translation failed",
+                },
+            }
+        ).encode()
+        return 502, error
     for w in warnings:
         logger.warning("Translation: %s", w)
 
@@ -412,7 +486,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         for key, value in auth_headers.items():
             req.add_header(key, value)
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:
                 full_body = resp.read()
                 return resp.status, full_body
         except urllib.error.HTTPError as exc:
@@ -457,7 +531,7 @@ def _extract_completed_response(raw_sse: bytes) -> dict | None:
 
 def _forward_request(
     upstream_url: str, body: bytes, client_headers: dict[str, str]
-) -> tuple[int, bytes]:
+) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Synchronous HTTP POST to the upstream — called from asyncio.to_thread."""
     url = f"{upstream_url}/v1/messages"
     req = urllib.request.Request(url, data=body, method="POST")
@@ -467,14 +541,14 @@ def _forward_request(
             req.add_header(key, client_headers[key])
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.status, resp.read()
+        with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:
+            return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as exc:
-        # Upstream returned an error status — forward it
-        return exc.code, exc.read()
+        rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
+        return exc.code, exc.read(), rl_headers
     except (urllib.error.URLError, TimeoutError, OSError):
         error = json.dumps({"error": "upstream unavailable"}).encode()
-        return 502, error
+        return 502, error, []
 
 
 class _ClientDisconnected(Exception):
@@ -513,7 +587,7 @@ async def _stream_passthrough(
         for key in _FORWARD_HEADERS:
             if key in client_headers:
                 req.add_header(key, client_headers[key])
-        return urllib.request.urlopen(req, timeout=120)  # noqa: S310
+        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310
 
     try:
         resp = await asyncio.to_thread(_open_stream)
@@ -545,6 +619,26 @@ async def _stream_via_provider(
     """Translate request, stream from provider, translate SSE events back to Anthropic format."""
     request_dict = json.loads(body)
     translated, warnings = provider.translate_request(request_dict)
+    if not isinstance(translated, dict):
+        logger.warning(
+            "Provider %s translate_request returned %s, expected dict",
+            provider.name,
+            type(translated).__name__,
+        )
+        _write_response(
+            writer,
+            502,
+            json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Provider translation failed",
+                    },
+                }
+            ).encode(),
+        )
+        return
     for w in warnings:
         logger.warning("Translation: %s", w)
 
@@ -559,7 +653,7 @@ async def _stream_via_provider(
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
-        return urllib.request.urlopen(req, timeout=120)  # noqa: S310
+        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310
 
     logger.debug(
         "Sending to provider: model=%s items=%d",
@@ -607,13 +701,26 @@ async def _stream_via_provider(
         logger.debug("Client disconnected during provider stream")
 
 
-def _write_response(writer: asyncio.StreamWriter, status: int, body: bytes) -> None:
+def _write_response(
+    writer: asyncio.StreamWriter,
+    status: int,
+    body: bytes,
+    extra_headers: list[tuple[str, str]] | None = None,
+) -> None:
     """Write a minimal HTTP/1.1 response."""
-    reasons = {200: "OK", 400: "Bad Request", 404: "Not Found", 502: "Bad Gateway"}
+    reasons = {
+        200: "OK",
+        400: "Bad Request",
+        404: "Not Found",
+        413: "Payload Too Large",
+        502: "Bad Gateway",
+    }
     reason = reasons.get(status, "Error")
     writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
     writer.write(b"Content-Type: application/json\r\n")
     writer.write(f"Content-Length: {len(body)}\r\n".encode())
+    for key, value in extra_headers or []:
+        writer.write(f"{key}: {value}\r\n".encode())
     writer.write(b"Connection: close\r\n")
     writer.write(b"\r\n")
     writer.write(body)

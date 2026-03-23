@@ -406,3 +406,306 @@ def test_fallback_chain_empty_string(monkeypatch):
     monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "")
     chain = _get_fallback_chain()
     assert chain == []
+
+
+# ---------------------------------------------------------------------------
+# Configurable timeout tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_timeout_returns_default_when_unset(monkeypatch):
+    """Without UPSTREAM_TIMEOUT env var, _get_timeout returns the provided default."""
+    from claude_bridge.proxy import _get_timeout
+
+    monkeypatch.delenv("UPSTREAM_TIMEOUT", raising=False)
+    assert _get_timeout(60) == 60
+    assert _get_timeout(120) == 120
+
+
+def test_get_timeout_reads_env_var(monkeypatch):
+    """UPSTREAM_TIMEOUT overrides the default for all callsites."""
+    from claude_bridge.proxy import _get_timeout
+
+    monkeypatch.setenv("UPSTREAM_TIMEOUT", "30")
+    assert _get_timeout(60) == 30
+    assert _get_timeout(120) == 30
+
+
+def test_get_timeout_ignores_invalid_env_var(monkeypatch):
+    """Non-numeric UPSTREAM_TIMEOUT falls back to default."""
+    from claude_bridge.proxy import _get_timeout
+
+    monkeypatch.setenv("UPSTREAM_TIMEOUT", "not-a-number")
+    assert _get_timeout(120) == 120
+
+
+def test_get_timeout_ignores_zero_and_negative(monkeypatch):
+    """Zero or negative UPSTREAM_TIMEOUT falls back to default."""
+    from claude_bridge.proxy import _get_timeout
+
+    monkeypatch.setenv("UPSTREAM_TIMEOUT", "0")
+    assert _get_timeout(120) == 120
+
+    monkeypatch.setenv("UPSTREAM_TIMEOUT", "-5")
+    assert _get_timeout(60) == 60
+
+
+# ---------------------------------------------------------------------------
+# Request body size limit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_oversized_body_returns_413(upstream_url: str, monkeypatch):
+    """Request with Content-Length exceeding MAX_REQUEST_BODY returns 413."""
+    import claude_bridge.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "_MAX_REQUEST_BODY", 100)
+
+    port = _find_free_port()
+    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 200\r\n\r\n")
+        await writer.drain()
+        # Read until EOF — server sends Connection: close
+        response = await asyncio.wait_for(reader.read(-1), timeout=2)
+        writer.close()
+        assert b"413" in response
+        assert b"request_too_large" in response
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+# ---------------------------------------------------------------------------
+# translate_request() validation tests
+# ---------------------------------------------------------------------------
+
+
+class _BrokenProvider:
+    """Provider whose translate_request returns None (simulates a bug)."""
+
+    name = "broken"
+    endpoint = "http://127.0.0.1:1/unused"
+
+    async def authenticate(self) -> dict[str, str]:
+        return {}
+
+    def translate_request(self, anthropic_req: dict) -> tuple[None, list[str]]:
+        return None, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_translate_request_returns_none_gives_502():
+    """Provider returning None from translate_request produces 502, not crash."""
+    port = _find_free_port()
+    provider = _BrokenProvider()
+    server = await start_proxy(
+        host="127.0.0.1", port=port, upstream_url="http://127.0.0.1:1"
+    )
+    # We need to patch the handler's provider directly
+    server.close()
+    await server.wait_closed()
+
+    from claude_bridge.proxy import _make_handler
+
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats())
+    server = await asyncio.start_server(handler, "127.0.0.1", port)
+    try:
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{port}/v1/messages",
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert status == 502
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "api_error"
+        assert "translation failed" in data["error"]["message"].lower()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+# ---------------------------------------------------------------------------
+# Rate limit header forwarding tests
+# ---------------------------------------------------------------------------
+
+
+class _RateLimitUpstreamHandler(BaseHTTPRequestHandler):
+    """Returns rate limit headers alongside a normal response."""
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length", 0))
+        _body = self.rfile.read(length)
+        resp = {
+            "id": "msg_test",
+            "type": "message",
+            "content": [{"type": "text", "text": "hello"}],
+            "model": "claude-sonnet-4-20250514",
+        }
+        payload = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("anthropic-ratelimit-requests-limit", "1000")
+        self.send_header("anthropic-ratelimit-requests-remaining", "999")
+        self.send_header("retry-after", "30")
+        self.send_header("x-ratelimit-limit-tokens", "50000")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_headers_forwarded():
+    """Rate limit headers from upstream are forwarded to the client."""
+    # Start upstream with rate limit headers
+    upstream_port = _find_free_port()
+    upstream_server = HTTPServer(
+        ("127.0.0.1", upstream_port), _RateLimitUpstreamHandler
+    )
+    upstream_thread = Thread(target=upstream_server.serve_forever, daemon=True)
+    upstream_thread.start()
+    upstream_url = f"http://127.0.0.1:{upstream_port}"
+
+    proxy_port = _find_free_port()
+    server = await start_proxy(
+        host="127.0.0.1", port=proxy_port, upstream_url=upstream_url
+    )
+    try:
+
+        def _check_headers():
+            data = json.dumps(
+                {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+            ).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_port}/v1/messages",
+                data=data,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return {k.lower(): v for k, v in resp.getheaders()}
+
+        headers_dict = await asyncio.to_thread(_check_headers)
+        assert "anthropic-ratelimit-requests-limit" in headers_dict
+        assert headers_dict["anthropic-ratelimit-requests-limit"] == "1000"
+        assert "retry-after" in headers_dict
+        assert "x-ratelimit-limit-tokens" in headers_dict
+    finally:
+        server.close()
+        await server.wait_closed()
+        upstream_server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# count_tokens endpoint tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_returns_estimate(proxy_url: str):
+    """POST /v1/messages/count_tokens returns a token count estimate."""
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "Hello, world!"}],
+    }
+    status, data = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages/count_tokens",
+        request_body,
+    )
+    assert status == 200
+    assert "input_tokens" in data
+    assert data["input_tokens"] > 0
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_empty_messages(proxy_url: str):
+    """count_tokens with empty messages list returns 0 (no content to count)."""
+    request_body = {"model": "claude-sonnet-4-6", "messages": []}
+    status, data = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages/count_tokens",
+        request_body,
+    )
+    assert status == 200
+    assert data["input_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_with_tools(proxy_url: str):
+    """count_tokens includes tool definitions in the estimate."""
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "Get the current weather",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    # With tools, estimate should be higher than without
+    status_with, data_with = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages/count_tokens",
+        request_body,
+    )
+    status_without, data_without = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages/count_tokens",
+        {"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert status_with == 200
+    assert data_with["input_tokens"] > data_without["input_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_malformed_body(proxy_url: str):
+    """count_tokens with non-JSON body returns 0 tokens (graceful fallback)."""
+    # Send raw bytes that aren't valid JSON via raw connection
+    port = int(proxy_url.rsplit(":", 1)[1])
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        b"POST /v1/messages/count_tokens HTTP/1.1\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 11\r\n"
+        b"\r\n"
+        b"not-a-json!"
+    )
+    await writer.drain()
+    response = await asyncio.wait_for(reader.read(-1), timeout=2)
+    writer.close()
+    assert b"200" in response
+    assert b'"input_tokens": 0' in response
+
+
+@pytest.mark.asyncio
+async def test_normal_body_passes_size_check(proxy_url: str):
+    """Request within MAX_REQUEST_BODY proceeds normally."""
+    request_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    status, data = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages",
+        request_body,
+        {"x-api-key": "test-key"},
+    )
+    assert status == 200
