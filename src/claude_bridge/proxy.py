@@ -393,13 +393,15 @@ async def _route_request(
         if stats:
             stats.set_provider_info("anthropic", request_model)
         status_code, response_body, rl_headers = await _auto_route(
-            upstream_url, headers, body, router
+            upstream_url, headers, body, router, stats
         )
         _write_response(writer, status_code, response_body, rl_headers)
         _record_sync_response(stats, request_start, status_code, response_body)
 
 
-async def _try_failover(router: Router, body: bytes) -> tuple[int, bytes] | None:
+async def _try_failover(
+    router: Router, body: bytes, stats: BridgeStats | None = None
+) -> tuple[int, bytes] | None:
     """Attempt failover to the registered provider. Returns None if not possible."""
     fallback = _get_fallback_provider()
     if fallback is None:
@@ -414,16 +416,23 @@ async def _try_failover(router: Router, body: bytes) -> tuple[int, bytes] | None
     if not router.should_use_fallback():
         return None
 
-    return await _forward_via_provider(fallback, body)
+    result = await _forward_via_provider(fallback, body)
+    if stats:
+        stats.record_failover()
+    return result
 
 
 async def _auto_route(
-    upstream_url: str, headers: dict[str, str], body: bytes, router: Router
+    upstream_url: str,
+    headers: dict[str, str],
+    body: bytes,
+    router: Router,
+    stats: BridgeStats | None = None,
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Auto mode: try Anthropic, failover on error."""
     # If circuit breaker is OPEN, try fallback first
     if router.should_use_fallback():
-        result = await _try_failover(router, body)
+        result = await _try_failover(router, body, stats)
         if result is not None:
             return result[0], result[1], []
 
@@ -438,7 +447,7 @@ async def _auto_route(
 
     # Anthropic failed — record and try failover
     await router.record_failure()
-    result = await _try_failover(router, body)
+    result = await _try_failover(router, body, stats)
     if result is not None:
         return result[0], result[1], []
 

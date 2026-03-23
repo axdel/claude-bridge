@@ -54,11 +54,6 @@ class BridgeStats:
             if status_code >= 500:
                 self._errors_total += 1
 
-    def record_error(self) -> None:
-        """Record a connection-level error (no HTTP response received)."""
-        with self._lock:
-            self._errors_total += 1
-
     def record_failover(self) -> None:
         """Record a successful failover to a fallback provider."""
         with self._lock:

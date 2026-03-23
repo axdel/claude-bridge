@@ -44,12 +44,6 @@ class TestBridgeStats:
         assert snap["latency_total_ms"] == 150.0
         assert snap["latency_avg_ms"] == 150.0
 
-    def test_record_error_increments(self):
-        stats = BridgeStats()
-        stats.record_error()
-        stats.record_error()
-        assert stats.snapshot()["errors_total"] == 2
-
     def test_record_failover_increments(self):
         stats = BridgeStats()
         stats.record_failover()
