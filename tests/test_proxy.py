@@ -607,6 +607,93 @@ async def test_rate_limit_headers_forwarded():
         upstream_server.shutdown()
 
 
+# ---------------------------------------------------------------------------
+# count_tokens endpoint tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_returns_estimate(proxy_url: str):
+    """POST /v1/messages/count_tokens returns a token count estimate."""
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "Hello, world!"}],
+    }
+    status, data = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages/count_tokens",
+        request_body,
+    )
+    assert status == 200
+    assert "input_tokens" in data
+    assert data["input_tokens"] > 0
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_empty_messages(proxy_url: str):
+    """count_tokens with empty messages list returns 0 (no content to count)."""
+    request_body = {"model": "claude-sonnet-4-6", "messages": []}
+    status, data = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages/count_tokens",
+        request_body,
+    )
+    assert status == 200
+    assert data["input_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_with_tools(proxy_url: str):
+    """count_tokens includes tool definitions in the estimate."""
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "Get the current weather",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    # With tools, estimate should be higher than without
+    status_with, data_with = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages/count_tokens",
+        request_body,
+    )
+    status_without, data_without = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages/count_tokens",
+        {"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert status_with == 200
+    assert data_with["input_tokens"] > data_without["input_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_malformed_body(proxy_url: str):
+    """count_tokens with non-JSON body returns 0 tokens (graceful fallback)."""
+    # Send raw bytes that aren't valid JSON via raw connection
+    port = int(proxy_url.rsplit(":", 1)[1])
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        b"POST /v1/messages/count_tokens HTTP/1.1\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 11\r\n"
+        b"\r\n"
+        b"not-a-json!"
+    )
+    await writer.drain()
+    response = await asyncio.wait_for(reader.read(-1), timeout=2)
+    writer.close()
+    assert b"200" in response
+    assert b'"input_tokens": 0' in response
+
+
 @pytest.mark.asyncio
 async def test_normal_body_passes_size_check(proxy_url: str):
     """Request within MAX_REQUEST_BODY proceeds normally."""
