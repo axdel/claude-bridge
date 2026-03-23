@@ -208,9 +208,19 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
     if block_type == "tool_result":
         content = block.get("content", "")
         if isinstance(content, list):
-            content = "\n".join(
-                b.get("text", "") for b in content if b.get("type") == "text"
-            )
+            parts = []
+            for b in content:
+                if b.get("type") == "text":
+                    parts.append(b.get("text", ""))
+                elif b.get("type") == "image":
+                    source = b.get("source", {})
+                    if source.get("type") == "base64":
+                        media = source.get("media_type", "application/octet-stream")
+                        data = source.get("data", "")
+                        parts.append(f"[image: data:{media};base64,{data}]")
+                    elif source.get("type") == "url":
+                        parts.append(f"[image: {source.get('url', '')}]")
+            content = "\n".join(parts)
         output = str(content) if content else ""
         if block.get("is_error"):
             output = f"[Error] {output}"
