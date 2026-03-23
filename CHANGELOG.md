@@ -4,6 +4,17 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-03-23
 
+### v0.3.0 — Auth Hardening + Test Coverage ([PR #3](https://github.com/axdel/claude-bridge/pull/3))
+Harden auth error paths (JWT decode, OAuth refresh), add streaming and token refresh failure tests, bump to v0.3.0 (137→150 tests)
+
+- [`3e88852`](https://github.com/axdel/claude-bridge/commit/3e88852) Bump version to 0.3.0 and update README test counts
+- [`b1991d6`](https://github.com/axdel/claude-bridge/commit/b1991d6) Add end-to-end token refresh failure coverage
+- [`7508a2f`](https://github.com/axdel/claude-bridge/commit/7508a2f) Add streaming error path coverage for provider and passthrough
+- [`35b4b96`](https://github.com/axdel/claude-bridge/commit/35b4b96) Harden OAuth token refresh error handling
+- [`ca6a20a`](https://github.com/axdel/claude-bridge/commit/ca6a20a) Harden JWT decode and token expiry error handling
+Tasks: 5/5 | P1: 2/2 | P3: 3/3
+
+
 ### P0 Reliability Hardening + P2 Production Improvements ([PR #2](https://github.com/axdel/claude-bridge/pull/2))
 Configurable timeouts, body size limits, translation validation, rate limit header forwarding, image block preservation, and 23 new tests (114→137)
 
