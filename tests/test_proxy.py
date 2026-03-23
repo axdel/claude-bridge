@@ -406,3 +406,45 @@ def test_fallback_chain_empty_string(monkeypatch):
     monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "")
     chain = _get_fallback_chain()
     assert chain == []
+
+
+# ---------------------------------------------------------------------------
+# Configurable timeout tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_timeout_returns_default_when_unset(monkeypatch):
+    """Without UPSTREAM_TIMEOUT env var, _get_timeout returns the provided default."""
+    from claude_bridge.proxy import _get_timeout
+
+    monkeypatch.delenv("UPSTREAM_TIMEOUT", raising=False)
+    assert _get_timeout(60) == 60
+    assert _get_timeout(120) == 120
+
+
+def test_get_timeout_reads_env_var(monkeypatch):
+    """UPSTREAM_TIMEOUT overrides the default for all callsites."""
+    from claude_bridge.proxy import _get_timeout
+
+    monkeypatch.setenv("UPSTREAM_TIMEOUT", "30")
+    assert _get_timeout(60) == 30
+    assert _get_timeout(120) == 30
+
+
+def test_get_timeout_ignores_invalid_env_var(monkeypatch):
+    """Non-numeric UPSTREAM_TIMEOUT falls back to default."""
+    from claude_bridge.proxy import _get_timeout
+
+    monkeypatch.setenv("UPSTREAM_TIMEOUT", "not-a-number")
+    assert _get_timeout(120) == 120
+
+
+def test_get_timeout_ignores_zero_and_negative(monkeypatch):
+    """Zero or negative UPSTREAM_TIMEOUT falls back to default."""
+    from claude_bridge.proxy import _get_timeout
+
+    monkeypatch.setenv("UPSTREAM_TIMEOUT", "0")
+    assert _get_timeout(120) == 120
+
+    monkeypatch.setenv("UPSTREAM_TIMEOUT", "-5")
+    assert _get_timeout(60) == 60

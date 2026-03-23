@@ -24,6 +24,21 @@ logger = get_logger("proxy")
 
 _DEFAULT_UPSTREAM = "https://api.anthropic.com"
 
+
+def _get_timeout(default: int) -> int:
+    """Return upstream timeout in seconds from UPSTREAM_TIMEOUT env var, or *default*."""
+    raw = os.environ.get("UPSTREAM_TIMEOUT")
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        logger.warning("Invalid UPSTREAM_TIMEOUT=%r, using default %ds", raw, default)
+        return default
+    if value <= 0:
+        return default
+    return value
+
 # Headers to forward from the client to the upstream API.
 _FORWARD_HEADERS = ("x-api-key", "content-type", "anthropic-version")
 
@@ -412,7 +427,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         for key, value in auth_headers.items():
             req.add_header(key, value)
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:
                 full_body = resp.read()
                 return resp.status, full_body
         except urllib.error.HTTPError as exc:
@@ -467,7 +482,7 @@ def _forward_request(
             req.add_header(key, client_headers[key])
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         # Upstream returned an error status — forward it
@@ -513,7 +528,7 @@ async def _stream_passthrough(
         for key in _FORWARD_HEADERS:
             if key in client_headers:
                 req.add_header(key, client_headers[key])
-        return urllib.request.urlopen(req, timeout=120)  # noqa: S310
+        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310
 
     try:
         resp = await asyncio.to_thread(_open_stream)
@@ -559,7 +574,7 @@ async def _stream_via_provider(
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
-        return urllib.request.urlopen(req, timeout=120)  # noqa: S310
+        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310
 
     logger.debug(
         "Sending to provider: model=%s items=%d",
