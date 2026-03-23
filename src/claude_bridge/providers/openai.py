@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator
@@ -90,10 +91,23 @@ async def refresh_access_token(
         req = urllib.request.Request(_TOKEN_URL, data=body, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            token_data: dict = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                token_data: dict = json.loads(resp.read())
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            raise ValueError(f"Token refresh failed: {exc}") from exc
 
-        new_access_token: str = token_data["access_token"]
+        try:
+            new_access_token: str = token_data["access_token"]
+        except KeyError as exc:
+            raise ValueError(
+                "Token refresh failed: response missing 'access_token'"
+            ) from exc
         new_refresh_token: str = token_data.get("refresh_token", refresh_token)
 
         # Atomic write: tmp file + os.replace

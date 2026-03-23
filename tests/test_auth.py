@@ -11,6 +11,12 @@ from pathlib import Path
 import pytest
 
 from claude_bridge.auth import decode_jwt_exp, is_token_expired
+from claude_bridge.providers.openai import (
+    OpenAIProvider,
+    get_bearer_token,
+    read_codex_auth,
+    refresh_access_token,
+)
 
 
 def _make_jwt(payload: dict) -> str:
@@ -37,8 +43,27 @@ class TestDecodeJwtExp:
 
     def test_raises_on_missing_exp(self):
         token = _make_jwt({"sub": "user"})
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="missing 'exp' claim"):
             decode_jwt_exp(token)
+
+    def test_raises_on_malformed_token_no_dots(self):
+        with pytest.raises(ValueError, match="missing payload segment"):
+            decode_jwt_exp("not-a-jwt")
+
+    def test_raises_on_bad_base64_payload(self, monkeypatch):
+        import binascii
+
+        def _bad_decode(s):
+            raise binascii.Error("Invalid base64")
+
+        monkeypatch.setattr(base64, "urlsafe_b64decode", _bad_decode)
+        with pytest.raises(ValueError, match="not valid base64"):
+            decode_jwt_exp("header.payload.signature")
+
+    def test_raises_on_non_json_payload(self):
+        payload = base64.urlsafe_b64encode(b"not json at all").rstrip(b"=").decode()
+        with pytest.raises(ValueError, match="not valid JSON"):
+            decode_jwt_exp(f"header.{payload}.signature")
 
 
 # --- is_token_expired ---
@@ -67,11 +92,12 @@ class TestIsTokenExpired:
         token = _make_jwt({"exp": near_future})
         assert is_token_expired(token, margin_seconds=0) is False
 
+    def test_malformed_token_raises_with_context(self):
+        with pytest.raises(ValueError, match="Cannot check token expiry"):
+            is_token_expired("not-a-jwt")
+
 
 # --- read_codex_auth ---
-
-
-from claude_bridge.providers.openai import read_codex_auth
 
 
 class TestReadCodexAuth:
@@ -107,9 +133,6 @@ class TestReadCodexAuth:
 # --- get_bearer_token ---
 
 
-from claude_bridge.providers.openai import get_bearer_token
-
-
 class TestGetBearerToken:
     @pytest.mark.asyncio
     async def test_returns_valid_token_without_refresh(self, tmp_path: Path):
@@ -126,6 +149,57 @@ class TestGetBearerToken:
         auth_file.write_text(json.dumps(auth_data))
         result = await get_bearer_token(auth_file)
         assert result == token
+
+    @pytest.mark.asyncio
+    async def test_malformed_stored_token_raises_value_error(self, tmp_path: Path):
+        """Malformed access_token in auth.json raises ValueError from is_token_expired."""
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": "not-a-jwt",
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+        with pytest.raises(ValueError, match="Cannot check token expiry"):
+            await get_bearer_token(auth_file)
+
+    @pytest.mark.asyncio
+    async def test_expired_token_refresh_failure_raises(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """Expired token + refresh network error surfaces as ValueError."""
+        expired_token = _make_jwt({"exp": time.time() - 100})
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": expired_token,
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+
+        def _raise_timeout(*args, **kwargs):
+            raise TimeoutError("Connection timed out")
+
+        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        with pytest.raises(ValueError, match="Token refresh failed"):
+            await get_bearer_token(auth_file)
+
+    @pytest.mark.asyncio
+    async def test_token_without_exp_claim_raises(self, tmp_path: Path):
+        """Token with valid JWT structure but no exp claim raises ValueError."""
+        no_exp_token = _make_jwt({"sub": "user", "iat": 1700000000})
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": no_exp_token,
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+        with pytest.raises(ValueError, match="Cannot check token expiry"):
+            await get_bearer_token(auth_file)
 
 
 class TestRefreshLock:
@@ -150,10 +224,69 @@ class TestRefreshLock:
         assert all(r == token for r in results)
 
 
+# --- refresh_access_token error handling ---
+
+
+class TestRefreshAccessTokenErrors:
+    """Token refresh raises ValueError on network and response errors."""
+
+    @pytest.mark.asyncio
+    async def test_http_error_raises_value_error(self, monkeypatch, tmp_path: Path):
+        import http.client
+        import urllib.error
+
+        def _raise_http_error(*args, **kwargs):
+            raise urllib.error.HTTPError(
+                "https://auth.openai.com/oauth/token",
+                401,
+                "Unauthorized",
+                http.client.HTTPMessage(),
+                None,
+            )
+
+        monkeypatch.setattr("urllib.request.urlopen", _raise_http_error)
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text("{}")
+        with pytest.raises(ValueError, match="Token refresh failed"):
+            await refresh_access_token("fake-refresh-token", auth_path=auth_file)
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_raises_value_error(self, monkeypatch, tmp_path: Path):
+        def _raise_timeout(*args, **kwargs):
+            raise TimeoutError("Connection timed out")
+
+        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text("{}")
+        with pytest.raises(ValueError, match="Token refresh failed"):
+            await refresh_access_token("fake-refresh-token", auth_path=auth_file)
+
+    @pytest.mark.asyncio
+    async def test_missing_access_token_raises_value_error(
+        self, monkeypatch, tmp_path: Path
+    ):
+
+        class _FakeResp:
+            def __init__(self):
+                self._data = json.dumps({"refresh_token": "new-ref"}).encode()
+
+            def read(self):
+                return self._data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: _FakeResp())
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text("{}")
+        with pytest.raises(ValueError, match="missing 'access_token'"):
+            await refresh_access_token("fake-refresh-token", auth_path=auth_file)
+
+
 # --- OpenAIProvider auth modes ---
-
-
-from claude_bridge.providers.openai import OpenAIProvider
 
 
 class TestOpenAIProviderApiKeyAuth:
