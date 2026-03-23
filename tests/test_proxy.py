@@ -478,6 +478,61 @@ async def test_oversized_body_returns_413(upstream_url: str, monkeypatch):
         await server.wait_closed()
 
 
+# ---------------------------------------------------------------------------
+# translate_request() validation tests
+# ---------------------------------------------------------------------------
+
+
+class _BrokenProvider:
+    """Provider whose translate_request returns None (simulates a bug)."""
+
+    name = "broken"
+    endpoint = "http://127.0.0.1:1/unused"
+
+    async def authenticate(self) -> dict[str, str]:
+        return {}
+
+    def translate_request(self, anthropic_req: dict) -> tuple[None, list[str]]:
+        return None, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_translate_request_returns_none_gives_502():
+    """Provider returning None from translate_request produces 502, not crash."""
+    port = _find_free_port()
+    provider = _BrokenProvider()
+    server = await start_proxy(
+        host="127.0.0.1", port=port, upstream_url="http://127.0.0.1:1"
+    )
+    # We need to patch the handler's provider directly
+    server.close()
+    await server.wait_closed()
+
+    from claude_bridge.proxy import _make_handler
+
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats())
+    server = await asyncio.start_server(handler, "127.0.0.1", port)
+    try:
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{port}/v1/messages",
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert status == 502
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "api_error"
+        assert "translation failed" in data["error"]["message"].lower()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_normal_body_passes_size_check(proxy_url: str):
     """Request within MAX_REQUEST_BODY proceeds normally."""

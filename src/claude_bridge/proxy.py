@@ -441,6 +441,22 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     """
     request_dict = json.loads(body)
     translated, warnings = provider.translate_request(request_dict)
+    if not isinstance(translated, dict):
+        logger.warning(
+            "Provider %s translate_request returned %s, expected dict",
+            provider.name,
+            type(translated).__name__,
+        )
+        error = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "Provider translation failed",
+                },
+            }
+        ).encode()
+        return 502, error
     for w in warnings:
         logger.warning("Translation: %s", w)
 
@@ -587,6 +603,26 @@ async def _stream_via_provider(
     """Translate request, stream from provider, translate SSE events back to Anthropic format."""
     request_dict = json.loads(body)
     translated, warnings = provider.translate_request(request_dict)
+    if not isinstance(translated, dict):
+        logger.warning(
+            "Provider %s translate_request returned %s, expected dict",
+            provider.name,
+            type(translated).__name__,
+        )
+        _write_response(
+            writer,
+            502,
+            json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Provider translation failed",
+                    },
+                }
+            ).encode(),
+        )
+        return
     for w in warnings:
         logger.warning("Translation: %s", w)
 
