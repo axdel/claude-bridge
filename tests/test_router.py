@@ -102,18 +102,14 @@ async def test_half_open_concurrent_callers_use_fallback():
 
 def test_is_failover_eligible_rejects_thinking():
     """Requests with 'thinking' are not eligible for failover."""
-    eligible, reason = Router.is_failover_eligible(
-        {"thinking": {"budget_tokens": 1024}}
-    )
+    eligible, reason = Router.is_failover_eligible({"thinking": {"budget_tokens": 1024}})
     assert eligible is False
     assert "thinking" in reason
 
 
 def test_is_failover_eligible_rejects_output_config():
     """Requests with 'output_config' are not eligible for failover."""
-    eligible, reason = Router.is_failover_eligible(
-        {"output_config": {"format": "json"}}
-    )
+    eligible, reason = Router.is_failover_eligible({"output_config": {"format": "json"}})
     assert eligible is False
     assert "output_config" in reason
 

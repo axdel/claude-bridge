@@ -26,9 +26,7 @@ from typing import TextIO
 
 _NAMESPACE = "claude_bridge"
 
-request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "request_id", default=""
-)
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="")
 
 
 class _BridgeFormatter(logging.Formatter):
@@ -39,9 +37,7 @@ class _BridgeFormatter(logging.Formatter):
         module = record.name.removeprefix(f"{_NAMESPACE}.")
         req_id = request_id_var.get("")
         req_part = f" req={req_id}" if req_id else ""
-        return (
-            f"{record.levelname:<5} [BRIDGE:{module}]{req_part} {record.getMessage()}"
-        )
+        return f"{record.levelname:<5} [BRIDGE:{module}]{req_part} {record.getMessage()}"
 
 
 def configure_logging(

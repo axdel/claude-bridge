@@ -8,10 +8,30 @@ requires-python = ">=3.12"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "--cov=claude_bridge --cov-report=term-missing --cov-fail-under=85"
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.25",
     "pytest-cov>=6.0",
+    "ruff>=0.9",
+    "basedpyright>=1.29",
 ]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "S", "UP", "B", "C4", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S108", "S310"]
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+pythonPlatform = "All"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"

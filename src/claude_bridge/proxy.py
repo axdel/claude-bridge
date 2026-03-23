@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import secrets
+import time as _time
 import urllib.error
 import urllib.request
 
@@ -41,6 +42,37 @@ def _get_timeout(default: int) -> int:
     return value
 
 
+_TRANSIENT_ERRORS = (urllib.error.URLError, TimeoutError, OSError)
+
+
+def _retry_request(
+    fn,
+    *,
+    retries: int = 1,
+    backoff: float = 0.5,
+) -> tuple[int, bytes]:
+    """Call *fn* and retry on transient errors. Returns ``(status, body)``.
+
+    *fn* must return ``(status, body)`` on success or raise an exception.
+    HTTPError is not retried (server responded, just with an error status).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1 + retries):
+        try:
+            return fn()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+        except _TRANSIENT_ERRORS as exc:
+            last_exc = exc
+            if attempt < retries:
+                logger.warning(
+                    "Transient error (attempt %d/%d): %s", attempt + 1, retries + 1, exc
+                )
+                _time.sleep(backoff * (2**attempt))
+    logger.error("All %d attempts failed: %s", retries + 1, last_exc)
+    return 502, json.dumps({"error": "upstream unavailable"}).encode()
+
+
 # Headers to forward from the client to the upstream API.
 _FORWARD_HEADERS = ("x-api-key", "content-type", "anthropic-version")
 
@@ -57,9 +89,8 @@ def _extract_ratelimit_headers(headers) -> list[tuple[str, str]]:
     result = []
     for key, value in headers.items():
         lower_key = key.lower()
-        if any(lower_key.startswith(p) for p in _RATELIMIT_HEADER_PREFIXES):
-            result.append((lower_key, value))
-        elif lower_key in _RATELIMIT_EXACT_HEADERS:
+        is_ratelimit = any(lower_key.startswith(p) for p in _RATELIMIT_HEADER_PREFIXES)
+        if is_ratelimit or lower_key in _RATELIMIT_EXACT_HEADERS:
             result.append((lower_key, value))
     return result
 
@@ -115,9 +146,7 @@ def _make_handler(
         writer: asyncio.StreamWriter,
     ) -> None:
         try:
-            await _process_request(
-                reader, writer, upstream_url, router, provider, stats
-            )
+            await _process_request(reader, writer, upstream_url, router, provider, stats)
         finally:
             try:
                 writer.close()
@@ -141,7 +170,7 @@ async def _parse_request(
         return None
 
     parts = request_line.decode("utf-8", errors="replace").strip().split()
-    if len(parts) < 3:  # noqa: PLR2004
+    if len(parts) < 3:
         return None
 
     method, path = parts[0], parts[1]
@@ -208,7 +237,6 @@ def _record_sync_response(
     """Extract usage from a sync response and record stats."""
     if stats is None:
         return
-    import time as _time
 
     latency_ms = (_time.monotonic() - request_start) * 1000
     tokens_in = tokens_out = 0
@@ -226,7 +254,6 @@ def _record_latency(stats: BridgeStats | None, request_start: float) -> None:
     """Record latency only (for streaming responses where tokens aren't easily available)."""
     if stats is None:
         return
-    import time as _time
 
     latency_ms = (_time.monotonic() - request_start) * 1000
     stats.record_response(200, latency_ms, 0, 0)
@@ -249,7 +276,6 @@ async def _process_request(
     stats: BridgeStats | None = None,
 ) -> None:
     """Parse one HTTP request and proxy or reject it."""
-    import time as _time
 
     # Assign a short request ID for log correlation
     request_id_var.set(secrets.token_hex(4))
@@ -278,6 +304,11 @@ async def _process_request(
 
     # Strip query string for path matching (e.g. /v1/messages?beta=true → /v1/messages)
     base_path = path.split("?")[0]
+
+    # Health check endpoint
+    if base_path == "/health":
+        _write_response(writer, 200, json.dumps({"status": "ok"}).encode())
+        return
 
     # Stats endpoint (accepts any method — POST from curl/test helpers is fine)
     if base_path == "/stats":
@@ -362,13 +393,15 @@ async def _route_request(
         if stats:
             stats.set_provider_info("anthropic", request_model)
         status_code, response_body, rl_headers = await _auto_route(
-            upstream_url, headers, body, router
+            upstream_url, headers, body, router, stats
         )
         _write_response(writer, status_code, response_body, rl_headers)
         _record_sync_response(stats, request_start, status_code, response_body)
 
 
-async def _try_failover(router: Router, body: bytes) -> tuple[int, bytes] | None:
+async def _try_failover(
+    router: Router, body: bytes, stats: BridgeStats | None = None
+) -> tuple[int, bytes] | None:
     """Attempt failover to the registered provider. Returns None if not possible."""
     fallback = _get_fallback_provider()
     if fallback is None:
@@ -383,16 +416,23 @@ async def _try_failover(router: Router, body: bytes) -> tuple[int, bytes] | None
     if not router.should_use_fallback():
         return None
 
-    return await _forward_via_provider(fallback, body)
+    result = await _forward_via_provider(fallback, body)
+    if stats:
+        stats.record_failover()
+    return result
 
 
 async def _auto_route(
-    upstream_url: str, headers: dict[str, str], body: bytes, router: Router
+    upstream_url: str,
+    headers: dict[str, str],
+    body: bytes,
+    router: Router,
+    stats: BridgeStats | None = None,
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Auto mode: try Anthropic, failover on error."""
     # If circuit breaker is OPEN, try fallback first
     if router.should_use_fallback():
-        result = await _try_failover(router, body)
+        result = await _try_failover(router, body, stats)
         if result is not None:
             return result[0], result[1], []
 
@@ -407,7 +447,7 @@ async def _auto_route(
 
     # Anthropic failed — record and try failover
     await router.record_failure()
-    result = await _try_failover(router, body)
+    result = await _try_failover(router, body, stats)
     if result is not None:
         return result[0], result[1], []
 
@@ -479,23 +519,18 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     auth_headers = await provider.authenticate()
 
     # Open a streaming connection and collect the full response
-    def _collect_response():
+    def _do_provider_request():
         data = json.dumps(translated).encode()
-        req = urllib.request.Request(provider.endpoint, data=data, method="POST")
+        req = urllib.request.Request(  # noqa: S310
+            provider.endpoint, data=data, method="POST"
+        )
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
-        try:
-            with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:
-                full_body = resp.read()
-                return resp.status, full_body
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error("Provider connection error: %s", exc)
-            return 502, json.dumps({"error": "provider unavailable"}).encode()
+        with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:  # noqa: S310
+            return resp.status, resp.read()
 
-    status_code, raw_response = await asyncio.to_thread(_collect_response)
+    status_code, raw_response = await asyncio.to_thread(_retry_request, _do_provider_request)
     logger.info("Provider response: %d (%dB)", status_code, len(raw_response))
     if status_code != 200:
         logger.error("Provider error: %s", raw_response[:500])
@@ -508,9 +543,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         try:
             response_dict = json.loads(raw_response)
         except (json.JSONDecodeError, ValueError):
-            return 502, json.dumps(
-                {"error": "could not parse provider response"}
-            ).encode()
+            return 502, json.dumps({"error": "could not parse provider response"}).encode()
 
     anthropic_response = provider.translate_response(response_dict)
     return 200, json.dumps(anthropic_response).encode()
@@ -534,21 +567,27 @@ def _forward_request(
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Synchronous HTTP POST to the upstream — called from asyncio.to_thread."""
     url = f"{upstream_url}/v1/messages"
-    req = urllib.request.Request(url, data=body, method="POST")
+    req = urllib.request.Request(url, data=body, method="POST")  # noqa: S310
 
     for key in _FORWARD_HEADERS:
         if key in client_headers:
             req.add_header(key, client_headers[key])
 
-    try:
-        with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:
-            return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
-    except urllib.error.HTTPError as exc:
-        rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
-        return exc.code, exc.read(), rl_headers
-    except (urllib.error.URLError, TimeoutError, OSError):
-        error = json.dumps({"error": "upstream unavailable"}).encode()
-        return 502, error, []
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:  # noqa: S310
+                return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
+        except urllib.error.HTTPError as exc:
+            rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
+            return exc.code, exc.read(), rl_headers
+        except _TRANSIENT_ERRORS as exc:
+            last_exc = exc
+            if attempt == 0:
+                logger.warning("Upstream transient error, retrying: %s", exc)
+                _time.sleep(0.5)
+    logger.error("Upstream unavailable after retry: %s", last_exc)
+    return 502, json.dumps({"error": "upstream unavailable"}).encode(), []
 
 
 class _ClientDisconnected(Exception):
@@ -583,7 +622,7 @@ async def _stream_passthrough(
 
     def _open_stream():
         url = f"{upstream_url}/v1/messages"
-        req = urllib.request.Request(url, data=body, method="POST")
+        req = urllib.request.Request(url, data=body, method="POST")  # noqa: S310
         for key in _FORWARD_HEADERS:
             if key in client_headers:
                 req.add_header(key, client_headers[key])
@@ -592,9 +631,7 @@ async def _stream_passthrough(
     try:
         resp = await asyncio.to_thread(_open_stream)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
-        _write_response(
-            writer, 502, json.dumps({"error": "upstream unavailable"}).encode()
-        )
+        _write_response(writer, 502, json.dumps({"error": "upstream unavailable"}).encode())
         return
 
     _write_sse_headers(writer)
@@ -649,7 +686,9 @@ async def _stream_via_provider(
 
     def _open_stream():
         data = json.dumps(translated).encode()
-        req = urllib.request.Request(provider.endpoint, data=data, method="POST")
+        req = urllib.request.Request(  # noqa: S310
+            provider.endpoint, data=data, method="POST"
+        )
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
@@ -670,9 +709,7 @@ async def _stream_via_provider(
         return
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.error("Provider connection error: %s", exc)
-        _write_response(
-            writer, 502, json.dumps({"error": "provider unavailable"}).encode()
-        )
+        _write_response(writer, 502, json.dumps({"error": "provider unavailable"}).encode())
         return
 
     _write_sse_headers(writer)
@@ -690,9 +727,7 @@ async def _stream_via_provider(
 
     try:
         async for anthropic_event in provider.translate_stream(_raw_chunks()):
-            sse_bytes = format_anthropic_sse(
-                anthropic_event["event"], anthropic_event["data"]
-            )
+            sse_bytes = format_anthropic_sse(anthropic_event["event"], anthropic_event["data"])
             event_name = anthropic_event["event"]
             if event_name not in _QUIET_SSE_EVENTS:
                 logger.debug("SSE -> %s", event_name)

@@ -30,9 +30,7 @@ class XAIProvider:
         """Translate xAI response back to Anthropic format."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
 
-    async def translate_stream(
-        self, raw_chunks: AsyncIterator[bytes]
-    ) -> AsyncIterator[dict]:
+    def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw xAI byte chunks to Anthropic-format SSE events."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
 

@@ -21,9 +21,7 @@ from claude_bridge.providers.openai import (
 
 def _make_jwt(payload: dict) -> str:
     """Build a fake JWT with the given payload (no crypto verification needed)."""
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256"}).encode()).rstrip(
-        b"="
-    )
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256"}).encode()).rstrip(b"=")
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=")
     signature = base64.urlsafe_b64encode(b"fakesig").rstrip(b"=")
     return f"{header.decode()}.{body.decode()}.{signature.decode()}"
@@ -165,9 +163,7 @@ class TestGetBearerToken:
             await get_bearer_token(auth_file)
 
     @pytest.mark.asyncio
-    async def test_expired_token_refresh_failure_raises(
-        self, monkeypatch, tmp_path: Path
-    ):
+    async def test_expired_token_refresh_failure_raises(self, monkeypatch, tmp_path: Path):
         """Expired token + refresh network error surfaces as ValueError."""
         expired_token = _make_jwt({"exp": time.time() - 100})
         auth_data = {
@@ -262,9 +258,7 @@ class TestRefreshAccessTokenErrors:
             await refresh_access_token("fake-refresh-token", auth_path=auth_file)
 
     @pytest.mark.asyncio
-    async def test_missing_access_token_raises_value_error(
-        self, monkeypatch, tmp_path: Path
-    ):
+    async def test_missing_access_token_raises_value_error(self, monkeypatch, tmp_path: Path):
 
         class _FakeResp:
             def __init__(self):

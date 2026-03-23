@@ -8,7 +8,6 @@ import pytest
 
 from claude_bridge.stream import format_anthropic_sse, parse_sse_events
 
-
 # ---------------------------------------------------------------------------
 # parse_sse_events
 # ---------------------------------------------------------------------------
@@ -380,9 +379,7 @@ class TestTranslateStream:
         )
 
         events = []
-        async for event in provider.translate_stream(
-            _chunks_from([b"", text_event, b""])
-        ):
+        async for event in provider.translate_stream(_chunks_from([b"", text_event, b""])):
             events.append(event)
 
         assert len(events) == 1
@@ -401,8 +398,10 @@ class TestExtractCompletedResponse:
         from claude_bridge.proxy import _extract_completed_response
 
         sse = (
-            b'event: response.created\ndata: {"type":"response.created","response":{"id":"r1"}}\n\n'
-            b'event: response.completed\ndata: {"type":"response.completed",'
+            b"event: response.created\n"
+            b'data: {"type":"response.created","response":{"id":"r1"}}\n\n'
+            b"event: response.completed\n"
+            b'data: {"type":"response.completed",'
             b'"response":{"id":"r1","status":"completed","output":[]}}\n\n'
         )
         result = _extract_completed_response(sse)
@@ -413,17 +412,17 @@ class TestExtractCompletedResponse:
     def test_returns_none_when_no_completed(self):
         from claude_bridge.proxy import _extract_completed_response
 
-        sse = b'event: response.created\ndata: {"type":"response.created","response":{"id":"r1"}}\n\n'
+        sse = (
+            b"event: response.created\n"
+            b'data: {"type":"response.created","response":{"id":"r1"}}\n\n'
+        )
         result = _extract_completed_response(sse)
         assert result is None
 
     def test_handles_malformed_json_lines(self):
         from claude_bridge.proxy import _extract_completed_response
 
-        sse = (
-            b"data: not-json\n\n"
-            b'data: {"type":"response.completed","response":{"id":"r2"}}\n\n'
-        )
+        sse = b'data: not-json\n\ndata: {"type":"response.completed","response":{"id":"r2"}}\n\n'
         result = _extract_completed_response(sse)
         assert result is not None
         assert result["id"] == "r2"

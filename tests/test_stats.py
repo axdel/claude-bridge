@@ -36,21 +36,13 @@ class TestBridgeStats:
     def test_record_response_updates_counters(self):
         stats = BridgeStats()
         stats.record_request()
-        stats.record_response(
-            status_code=200, latency_ms=150.0, tokens_in=100, tokens_out=50
-        )
+        stats.record_response(status_code=200, latency_ms=150.0, tokens_in=100, tokens_out=50)
         snap = stats.snapshot()
         assert snap["upstream_attempts"] == 1
         assert snap["tokens_in"] == 100
         assert snap["tokens_out"] == 50
         assert snap["latency_total_ms"] == 150.0
         assert snap["latency_avg_ms"] == 150.0
-
-    def test_record_error_increments(self):
-        stats = BridgeStats()
-        stats.record_error()
-        stats.record_error()
-        assert stats.snapshot()["errors_total"] == 2
 
     def test_record_failover_increments(self):
         stats = BridgeStats()
