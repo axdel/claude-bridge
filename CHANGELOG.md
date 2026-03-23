@@ -4,7 +4,7 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-03-23
 
-### Audit Remediation — Developer Tooling + Reliability Fixes ([PR #5](https://github.com/axdel/claude-bridge/pull/5))
+### v0.4.0 — Developer Tooling + Reliability Fixes ([PR #5](https://github.com/axdel/claude-bridge/pull/5))
 Add ruff, basedpyright, pre-commit hooks, retry/backoff, /health endpoint, dead code cleanup, coverage enforcement (153→156 tests, 87% coverage)
 
 - [`62e71a2`](https://github.com/axdel/claude-bridge/commit/62e71a2) Add pytest-cov coverage enforcement at 85% threshold
