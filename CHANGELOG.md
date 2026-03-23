@@ -31,6 +31,7 @@ Tasks: 7/7 | P0: 5/5 | P2: 2/2
 ### Hotfixes
 - [`387b550`](https://github.com/axdel/claude-bridge/commit/387b550) Update README — test count 114→137, add UPSTREAM_TIMEOUT/MAX_REQUEST_BODY env vars, document streaming rate limit limitation
 - [`28699b4`](https://github.com/axdel/claude-bridge/commit/28699b4) Expand stream exception handler to catch unexpected errors, add pytest-cov to dev deps
+- [`a480021`](https://github.com/axdel/claude-bridge/commit/a480021) Show bridge version in claude-codex launcher banner
 
 ## 2026-03-20
 
