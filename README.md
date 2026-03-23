@@ -63,7 +63,7 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
 - **Multi-provider** — adding a provider = one file, zero proxy changes
-- **114 tests** — auth, translation, streaming, routing, stats, connection handling
+- **137 tests** — auth, translation, streaming, routing, stats, connection handling
 
 ## Prerequisites
 
@@ -221,6 +221,8 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — uses standard Responses API when set |
 | `REASONING_MODE` | `passthrough` | `passthrough` preserves thinking blocks, `drop` strips them |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `UPSTREAM_TIMEOUT` | `60`/`120` | Upstream request timeout in seconds (60s sync, 120s streaming) |
+| `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10MB) |
 | `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback provider chain |
 | `LLM_BRIDGE_PORT` | `9999` | Default proxy port |
 | `ANTHROPIC_REAL_URL` | `https://api.anthropic.com` | Real Anthropic endpoint (passthrough) |
@@ -278,6 +280,7 @@ src/claude_bridge/
 - Token estimation is approximate (~bytes/3.5), not exact tokenization
 - Streaming stats don't include token counts (only latency)
 - Failover is blocked during active tool-use turns (by design — prevents broken tool state)
+- Rate limit headers (`x-ratelimit-*`, `retry-after`) forwarded on sync responses only — streaming responses cannot include HTTP headers after SSE begins
 
 ## Running Tests
 
@@ -287,7 +290,7 @@ cd claude-bridge
 uv run pytest tests/ -v     # installs test deps on first run
 ```
 
-No external services — all 114 tests use mock HTTP servers.
+No external services — all 137 tests use mock HTTP servers.
 
 ## Comparison
 
