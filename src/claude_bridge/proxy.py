@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import secrets
+import time as _time
 import urllib.error
 import urllib.request
 
@@ -39,6 +40,37 @@ def _get_timeout(default: int) -> int:
     if value <= 0:
         return default
     return value
+
+
+_TRANSIENT_ERRORS = (urllib.error.URLError, TimeoutError, OSError)
+
+
+def _retry_request(
+    fn,
+    *,
+    retries: int = 1,
+    backoff: float = 0.5,
+) -> tuple[int, bytes]:
+    """Call *fn* and retry on transient errors. Returns ``(status, body)``.
+
+    *fn* must return ``(status, body)`` on success or raise an exception.
+    HTTPError is not retried (server responded, just with an error status).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1 + retries):
+        try:
+            return fn()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+        except _TRANSIENT_ERRORS as exc:
+            last_exc = exc
+            if attempt < retries:
+                logger.warning(
+                    "Transient error (attempt %d/%d): %s", attempt + 1, retries + 1, exc
+                )
+                _time.sleep(backoff * (2**attempt))
+    logger.error("All %d attempts failed: %s", retries + 1, last_exc)
+    return 502, json.dumps({"error": "upstream unavailable"}).encode()
 
 
 # Headers to forward from the client to the upstream API.
@@ -205,7 +237,6 @@ def _record_sync_response(
     """Extract usage from a sync response and record stats."""
     if stats is None:
         return
-    import time as _time
 
     latency_ms = (_time.monotonic() - request_start) * 1000
     tokens_in = tokens_out = 0
@@ -223,7 +254,6 @@ def _record_latency(stats: BridgeStats | None, request_start: float) -> None:
     """Record latency only (for streaming responses where tokens aren't easily available)."""
     if stats is None:
         return
-    import time as _time
 
     latency_ms = (_time.monotonic() - request_start) * 1000
     stats.record_response(200, latency_ms, 0, 0)
@@ -246,7 +276,6 @@ async def _process_request(
     stats: BridgeStats | None = None,
 ) -> None:
     """Parse one HTTP request and proxy or reject it."""
-    import time as _time
 
     # Assign a short request ID for log correlation
     request_id_var.set(secrets.token_hex(4))
@@ -476,7 +505,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     auth_headers = await provider.authenticate()
 
     # Open a streaming connection and collect the full response
-    def _collect_response():
+    def _do_provider_request():
         data = json.dumps(translated).encode()
         req = urllib.request.Request(  # noqa: S310
             provider.endpoint, data=data, method="POST"
@@ -484,17 +513,10 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
-        try:
-            with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:  # noqa: S310
-                full_body = resp.read()
-                return resp.status, full_body
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error("Provider connection error: %s", exc)
-            return 502, json.dumps({"error": "provider unavailable"}).encode()
+        with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:  # noqa: S310
+            return resp.status, resp.read()
 
-    status_code, raw_response = await asyncio.to_thread(_collect_response)
+    status_code, raw_response = await asyncio.to_thread(_retry_request, _do_provider_request)
     logger.info("Provider response: %d (%dB)", status_code, len(raw_response))
     if status_code != 200:
         logger.error("Provider error: %s", raw_response[:500])
@@ -537,15 +559,21 @@ def _forward_request(
         if key in client_headers:
             req.add_header(key, client_headers[key])
 
-    try:
-        with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:  # noqa: S310
-            return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
-    except urllib.error.HTTPError as exc:
-        rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
-        return exc.code, exc.read(), rl_headers
-    except (urllib.error.URLError, TimeoutError, OSError):
-        error = json.dumps({"error": "upstream unavailable"}).encode()
-        return 502, error, []
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:  # noqa: S310
+                return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
+        except urllib.error.HTTPError as exc:
+            rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
+            return exc.code, exc.read(), rl_headers
+        except _TRANSIENT_ERRORS as exc:
+            last_exc = exc
+            if attempt == 0:
+                logger.warning("Upstream transient error, retrying: %s", exc)
+                _time.sleep(0.5)
+    logger.error("Upstream unavailable after retry: %s", last_exc)
+    return 502, json.dumps({"error": "upstream unavailable"}).encode(), []
 
 
 class _ClientDisconnected(Exception):

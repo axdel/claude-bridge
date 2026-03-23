@@ -841,3 +841,64 @@ async def test_stream_passthrough_upstream_unavailable_returns_502():
     finally:
         proxy_server.close()
         await proxy_server.wait_closed()
+
+
+# --- Retry logic tests ---
+
+
+def test_retry_request_retries_on_transient_error():
+    """_retry_request retries once on URLError, then succeeds."""
+    import urllib.error
+
+    from claude_bridge.proxy import _retry_request
+
+    call_count = 0
+
+    def flaky_fn():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise urllib.error.URLError("Connection reset")
+        return 200, b"ok"
+
+    status, body = _retry_request(flaky_fn, retries=1, backoff=0.0)
+    assert status == 200
+    assert body == b"ok"
+    assert call_count == 2
+
+
+def test_retry_request_gives_up_after_max_retries():
+    """_retry_request returns error after exhausting retries."""
+    import urllib.error
+
+    from claude_bridge.proxy import _retry_request
+
+    def always_fails():
+        raise urllib.error.URLError("Connection refused")
+
+    status, _body = _retry_request(always_fails, retries=1, backoff=0.0)
+    assert status == 502
+
+
+def test_retry_request_no_retry_on_http_error():
+    """_retry_request does not retry on HTTPError (non-transient)."""
+    import urllib.error
+
+    from claude_bridge.proxy import _retry_request
+
+    call_count = 0
+
+    def http_error():
+        nonlocal call_count
+        call_count += 1
+        raise urllib.error.HTTPError(
+            "http://test",
+            400,
+            "Bad Request",
+            {},
+            None,  # type: ignore[arg-type]
+        )
+
+    status, _body = _retry_request(http_error, retries=1, backoff=0.0)
+    assert status == 400
+    assert call_count == 1
