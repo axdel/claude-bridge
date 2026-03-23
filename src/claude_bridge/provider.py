@@ -24,6 +24,7 @@ class Provider(Protocol):
     """Protocol that every LLM provider adapter must implement."""
 
     name: str
+    endpoint: str
 
     async def authenticate(self) -> dict[str, str]:
         """Return headers required to authenticate with this provider."""
@@ -40,7 +41,7 @@ class Provider(Protocol):
         """Translate a provider response back to Anthropic format."""
         ...
 
-    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+    def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate a stream of raw byte chunks to Anthropic-format SSE events.
 
         The proxy feeds raw HTTP response bytes; the provider owns SSE parsing
