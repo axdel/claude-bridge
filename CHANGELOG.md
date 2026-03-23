@@ -16,6 +16,10 @@ Configurable timeouts, body size limits, translation validation, rate limit head
 - [`6d441dd`](https://github.com/axdel/claude-bridge/commit/6d441dd) Configurable upstream timeouts via UPSTREAM_TIMEOUT env var
 Tasks: 7/7 | P0: 5/5 | P2: 2/2
 
+
+### Hotfixes
+- [`387b550`](https://github.com/axdel/claude-bridge/commit/387b550) Update README — test count 114→137, add UPSTREAM_TIMEOUT/MAX_REQUEST_BODY env vars, document streaming rate limit limitation
+
 ## 2026-03-20
 
 ### v0.2.0 — API key auth, reasoning passthrough, failover guard, session identity ([PR #1](https://github.com/axdel/claude-bridge/pull/1))
