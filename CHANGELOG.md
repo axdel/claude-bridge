@@ -4,6 +4,13 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-03-23
 
+### Consistent cache_control hint handling ([PR #4](https://github.com/axdel/claude-bridge/pull/4))
+Strip cache_control hints consistently from content blocks, system blocks, and tool definitions with a single summary warning per request
+
+- [`57285fa`](https://github.com/axdel/claude-bridge/commit/57285fa) Consistent cache_control handling across all request locations
+Tasks: 1/1
+
+
 ### v0.3.0 — Auth Hardening + Test Coverage ([PR #3](https://github.com/axdel/claude-bridge/pull/3))
 Harden auth error paths (JWT decode, OAuth refresh), add streaming and token refresh failure tests, bump to v0.3.0 (137→150 tests)
 

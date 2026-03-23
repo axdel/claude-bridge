@@ -259,7 +259,7 @@ class TestAnthropicToOpenaiStripping:
         assert "output_config" not in result
         assert any("output_config" in w for w in warnings)
 
-    def test_cache_control_stripped(self):
+    def test_cache_control_stripped_from_content_block(self):
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -276,10 +276,54 @@ class TestAnthropicToOpenaiStripping:
                 }
             ],
         }
+        result, warnings = anthropic_to_openai(request)
+        assert any("cache_control" in w.lower() for w in warnings)
+        content = result["input"][0]["content"][0]
+        assert "cache_control" not in content
+
+    def test_cache_control_stripped_from_system_blocks(self):
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are helpful.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
         _, warnings = anthropic_to_openai(request)
-        assert any(
-            "cache_control" in w.lower() or "cache" in w.lower() for w in warnings
-        )
+        assert any("cache_control" in w.lower() for w in warnings)
+
+    def test_cache_control_stripped_from_tool_definitions(self):
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, warnings = anthropic_to_openai(request)
+        assert any("cache_control" in w.lower() for w in warnings)
+        tool = result["tools"][0]
+        assert "cache_control" not in tool
+
+    def test_no_cache_control_no_warning(self):
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        _, warnings = anthropic_to_openai(request)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
 
 # ---------------------------------------------------------------------------
