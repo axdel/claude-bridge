@@ -190,10 +190,6 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
 
     if block_type == "text":
         translated = {"type": "input_text", "text": block["text"]}
-        if "cache_control" in block:
-            warnings.append(
-                "Stripped unsupported cache_control hint from content block"
-            )
         return translated, warnings
 
     if block_type == "thinking":
@@ -304,6 +300,20 @@ def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
     return items, warnings
 
 
+def _has_cache_control(request: dict) -> bool:
+    """Return True if any part of the request contains cache_control hints."""
+    system = request.get("system")
+    if isinstance(system, list) and any("cache_control" in b for b in system):
+        return True
+    if any("cache_control" in t for t in request.get("tools", [])):
+        return True
+    for msg in request.get("messages", []):
+        content = msg.get("content", [])
+        if isinstance(content, list) and any("cache_control" in b for b in content):
+            return True
+    return False
+
+
 def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     """Translate an Anthropic Messages API request to an OpenAI Responses API request.
 
@@ -377,6 +387,11 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
         warnings.extend(msg_warnings)
 
     result["input"] = input_items
+
+    if _has_cache_control(request):
+        warnings.append(
+            "Stripped cache_control hints (no provider equivalent — caching is automatic)"
+        )
 
     return result, warnings
 
