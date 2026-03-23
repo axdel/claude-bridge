@@ -57,13 +57,15 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 - **Codex OAuth fallback** — no API key? Falls back to Codex OAuth automatically
 - **Reasoning passthrough** — thinking blocks preserved by default, not silently stripped
 - **Auto-failover** — circuit breaker routes to fallback on Anthropic 429/500/502/503
+- **Retry with backoff** — transient HTTP errors retried once with 0.5s exponential backoff
 - **Mid-turn failover guard** — blocks provider switch during active tool-use turns
 - **Direct mode** — skip Anthropic entirely, always use a specific provider
+- **Health check** — `/health` endpoint for liveness probes and process managers
 - **Structured logging** — request IDs, provider/model identity, log levels (`LOG_LEVEL=DEBUG`)
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
 - **Multi-provider** — adding a provider = one file, zero proxy changes
-- **156 tests** — auth, translation, streaming, routing, stats, connection handling
+- **156 tests** — 87% coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -210,7 +212,9 @@ curl -s localhost:9999/stats | python3 -m json.tool
     "latency_total_ms": 62340.5,
     "latency_avg_ms": 1484.3,
     "started_at": "2026-03-20T10:00:00+00:00",
-    "uptime_seconds": 3600.0
+    "uptime_seconds": 3600.0,
+    "provider_name": "openai",
+    "model": "gpt-5.4"
 }
 ```
 
@@ -231,7 +235,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
 
 ```
 src/claude_bridge/
-├── proxy.py          # HTTP server, routing, streaming, /stats
+├── proxy.py          # HTTP server, routing, streaming, /stats, /health, retry
 ├── provider.py       # Provider protocol (abstract interface)
 ├── router.py         # Circuit breaker (CLOSED/OPEN/HALF_OPEN)
 ├── stats.py          # Thread-safe metrics counters
@@ -281,16 +285,17 @@ src/claude_bridge/
 - Streaming stats don't include token counts (only latency)
 - Failover is blocked during active tool-use turns (by design — prevents broken tool state)
 - Rate limit headers (`x-ratelimit-*`, `retry-after`) forwarded on sync responses only — streaming responses cannot include HTTP headers after SSE begins
+- Retry applies to sync HTTP calls only — streaming connections are not retried (SSE state replay is too complex)
 
 ## Running Tests
 
 ```bash
 pip install uv              # if you don't have uv
 cd claude-bridge
-uv run pytest tests/ -v     # installs test deps on first run
+uv run pytest tests/ -v     # installs test deps on first run, shows coverage
 ```
 
-No external services — all 156 tests use mock HTTP servers.
+No external services — all 156 tests use mock HTTP servers. Coverage is enforced at 85% (currently 87%).
 
 ## Comparison
 
