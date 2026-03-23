@@ -699,6 +699,8 @@ async def _stream_via_provider(
             await _safe_write(writer, sse_bytes)
     except _ClientDisconnected:
         logger.debug("Client disconnected during provider stream")
+    except Exception:
+        logger.exception("Unexpected error during provider stream")
 
 
 def _write_response(
