@@ -305,6 +305,11 @@ async def _process_request(
     # Strip query string for path matching (e.g. /v1/messages?beta=true → /v1/messages)
     base_path = path.split("?")[0]
 
+    # Health check endpoint
+    if base_path == "/health":
+        _write_response(writer, 200, json.dumps({"status": "ok"}).encode())
+        return
+
     # Stats endpoint (accepts any method — POST from curl/test helpers is fine)
     if base_path == "/stats":
         snap = stats.snapshot() if stats else {}

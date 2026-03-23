@@ -107,6 +107,18 @@ async def test_passthrough_forwards_to_upstream(proxy_url: str):
 
 
 @pytest.mark.asyncio
+async def test_health_endpoint_returns_ok(proxy_url: str):
+    """/health returns 200 with status ok."""
+    status, data = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/health",
+        {},
+    )
+    assert status == 200
+    assert data == {"status": "ok"}
+
+
+@pytest.mark.asyncio
 async def test_stats_endpoint_returns_metrics(proxy_url: str):
     """GET /stats returns JSON with request metrics after a request."""
     # Make a request first so stats are non-zero
