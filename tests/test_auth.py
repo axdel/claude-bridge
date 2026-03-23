@@ -11,6 +11,11 @@ from pathlib import Path
 import pytest
 
 from claude_bridge.auth import decode_jwt_exp, is_token_expired
+from claude_bridge.providers.openai import (
+    OpenAIProvider,
+    get_bearer_token,
+    read_codex_auth,
+)
 
 
 def _make_jwt(payload: dict) -> str:
@@ -37,8 +42,27 @@ class TestDecodeJwtExp:
 
     def test_raises_on_missing_exp(self):
         token = _make_jwt({"sub": "user"})
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="missing 'exp' claim"):
             decode_jwt_exp(token)
+
+    def test_raises_on_malformed_token_no_dots(self):
+        with pytest.raises(ValueError, match="missing payload segment"):
+            decode_jwt_exp("not-a-jwt")
+
+    def test_raises_on_bad_base64_payload(self, monkeypatch):
+        import binascii
+
+        def _bad_decode(s):
+            raise binascii.Error("Invalid base64")
+
+        monkeypatch.setattr(base64, "urlsafe_b64decode", _bad_decode)
+        with pytest.raises(ValueError, match="not valid base64"):
+            decode_jwt_exp("header.payload.signature")
+
+    def test_raises_on_non_json_payload(self):
+        payload = base64.urlsafe_b64encode(b"not json at all").rstrip(b"=").decode()
+        with pytest.raises(ValueError, match="not valid JSON"):
+            decode_jwt_exp(f"header.{payload}.signature")
 
 
 # --- is_token_expired ---
@@ -67,11 +91,12 @@ class TestIsTokenExpired:
         token = _make_jwt({"exp": near_future})
         assert is_token_expired(token, margin_seconds=0) is False
 
+    def test_malformed_token_raises_with_context(self):
+        with pytest.raises(ValueError, match="Cannot check token expiry"):
+            is_token_expired("not-a-jwt")
+
 
 # --- read_codex_auth ---
-
-
-from claude_bridge.providers.openai import read_codex_auth
 
 
 class TestReadCodexAuth:
@@ -105,9 +130,6 @@ class TestReadCodexAuth:
 
 
 # --- get_bearer_token ---
-
-
-from claude_bridge.providers.openai import get_bearer_token
 
 
 class TestGetBearerToken:
@@ -151,9 +173,6 @@ class TestRefreshLock:
 
 
 # --- OpenAIProvider auth modes ---
-
-
-from claude_bridge.providers.openai import OpenAIProvider
 
 
 class TestOpenAIProviderApiKeyAuth:
