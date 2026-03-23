@@ -247,6 +247,13 @@ class _FakeOpenAIProvider:
 
         return openai_to_anthropic(provider_resp)
 
+    async def translate_stream(self, raw_chunks):
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+        async for event in provider.translate_stream(raw_chunks):
+            yield event
+
 
 @pytest.fixture()
 def _openai_mock_url():
@@ -709,3 +716,142 @@ async def test_normal_body_passes_size_check(proxy_url: str):
         {"x-api-key": "test-key"},
     )
     assert status == 200
+
+
+# --- Streaming error path tests ---
+
+
+class _Mock500StreamHandler(BaseHTTPRequestHandler):
+    """Returns 500 for streaming requests."""
+
+    def do_POST(self):  # noqa: N802
+        payload = json.dumps({"error": "server error"}).encode()
+        self.send_response(500)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+def _register_provider_at(url: str):
+    """Register a fake provider pointing at the given URL and return cleanup fn."""
+    from claude_bridge.proxy import _provider_cache
+
+    class _ErrorProvider(_FakeOpenAIProvider):
+        def __init__(self):
+            super().__init__(endpoint=f"{url}/v1/responses")
+
+    old = PROVIDERS.get("openai")
+    PROVIDERS["openai"] = _ErrorProvider
+    _provider_cache.pop("openai", None)
+
+    def _cleanup():
+        _provider_cache.pop("openai", None)
+        if old is not None:
+            PROVIDERS["openai"] = old
+        else:
+            PROVIDERS.pop("openai", None)
+
+    return _cleanup
+
+
+@pytest.mark.asyncio
+async def test_stream_via_provider_http_error_returns_error():
+    """Provider returning HTTP 500 during streaming sends error to client."""
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _Mock500StreamHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    cleanup = _register_provider_at(f"http://127.0.0.1:{port}")
+    try:
+        proxy_port = _find_free_port()
+        proxy_server = await start_proxy(
+            host="127.0.0.1",
+            port=proxy_port,
+            upstream_url="http://127.0.0.1:1",  # unused — direct mode
+            provider_name="openai",
+        )
+        try:
+            request_body = {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            status, data = await asyncio.to_thread(
+                _http_post,
+                f"http://127.0.0.1:{proxy_port}/v1/messages",
+                request_body,
+            )
+            assert status == 500
+        finally:
+            proxy_server.close()
+            await proxy_server.wait_closed()
+    finally:
+        cleanup()
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stream_via_provider_connection_refused_returns_502():
+    """Provider unreachable during streaming returns 502."""
+    dead_port = _find_free_port()  # nothing listening
+    cleanup = _register_provider_at(f"http://127.0.0.1:{dead_port}")
+    try:
+        proxy_port = _find_free_port()
+        proxy_server = await start_proxy(
+            host="127.0.0.1",
+            port=proxy_port,
+            upstream_url="http://127.0.0.1:1",
+            provider_name="openai",
+        )
+        try:
+            request_body = {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            status, data = await asyncio.to_thread(
+                _http_post,
+                f"http://127.0.0.1:{proxy_port}/v1/messages",
+                request_body,
+            )
+            assert status == 502
+        finally:
+            proxy_server.close()
+            await proxy_server.wait_closed()
+    finally:
+        cleanup()
+
+
+@pytest.mark.asyncio
+async def test_stream_passthrough_upstream_unavailable_returns_502():
+    """Upstream unreachable during streaming passthrough returns 502."""
+    dead_port = _find_free_port()
+    proxy_port = _find_free_port()
+    proxy_server = await start_proxy(
+        host="127.0.0.1",
+        port=proxy_port,
+        upstream_url=f"http://127.0.0.1:{dead_port}",
+    )
+    try:
+        request_body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            request_body,
+            {"x-api-key": "test-key"},
+        )
+        assert status == 502
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
