@@ -4,6 +4,19 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-03-23
 
+### Audit Remediation — Developer Tooling + Reliability Fixes ([PR #5](https://github.com/axdel/claude-bridge/pull/5))
+Add ruff, basedpyright, pre-commit hooks, retry/backoff, /health endpoint, dead code cleanup, coverage enforcement (153→156 tests, 87% coverage)
+
+- [`62e71a2`](https://github.com/axdel/claude-bridge/commit/62e71a2) Add pytest-cov coverage enforcement at 85% threshold
+- [`e1b7245`](https://github.com/axdel/claude-bridge/commit/e1b7245) Wire record_failover into failover path, remove dead record_error
+- [`c79ed4b`](https://github.com/axdel/claude-bridge/commit/c79ed4b) Add /health endpoint for liveness probes
+- [`0a897a5`](https://github.com/axdel/claude-bridge/commit/0a897a5) Add retry with backoff on sync HTTP calls
+- [`2db3b3f`](https://github.com/axdel/claude-bridge/commit/2db3b3f) Add pre-commit hooks for gitleaks and ruff
+- [`6d16143`](https://github.com/axdel/claude-bridge/commit/6d16143) Add basedpyright type checking with standard mode
+- [`473ccd8`](https://github.com/axdel/claude-bridge/commit/473ccd8) Add ruff linting and formatting with initial codebase cleanup
+Tasks: 7/7
+
+
 ### Consistent cache_control hint handling ([PR #4](https://github.com/axdel/claude-bridge/pull/4))
 Strip cache_control hints consistently from content blocks, system blocks, and tool definitions with a single summary warning per request
 
