@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from claude_bridge.providers.openai import (
     DEFAULT_MODEL,
@@ -12,6 +11,7 @@ from claude_bridge.providers.openai import (
     anthropic_to_openai,
     openai_to_anthropic,
 )
+from claude_bridge.proxy import estimate_input_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -305,9 +305,7 @@ class TestThinkingBlockPassthrough:
             ],
         }
         result, _ = anthropic_to_openai(request)
-        assistant_items = [
-            i for i in result["input"] if i.get("role") == "assistant"
-        ]
+        assistant_items = [i for i in result["input"] if i.get("role") == "assistant"]
         assert len(assistant_items) == 1
         content = assistant_items[0]["content"]
         # First block should be the thinking text
@@ -332,9 +330,7 @@ class TestThinkingBlockPassthrough:
             ],
         }
         result, warnings = anthropic_to_openai(request)
-        assistant_items = [
-            i for i in result["input"] if i.get("role") == "assistant"
-        ]
+        assistant_items = [i for i in result["input"] if i.get("role") == "assistant"]
         content = assistant_items[0]["content"]
         # Thinking block becomes empty, not preserved
         assert "Secret reasoning" not in str(content)
@@ -632,9 +628,6 @@ class TestTranslationRobustness:
 # ---------------------------------------------------------------------------
 # estimate_input_tokens
 # ---------------------------------------------------------------------------
-
-
-from claude_bridge.proxy import estimate_input_tokens
 
 
 class TestEstimateInputTokens:

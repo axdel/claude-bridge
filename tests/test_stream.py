@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from claude_bridge.stream import format_anthropic_sse, parse_sse_events
 

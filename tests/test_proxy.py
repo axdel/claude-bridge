@@ -448,3 +448,48 @@ def test_get_timeout_ignores_zero_and_negative(monkeypatch):
 
     monkeypatch.setenv("UPSTREAM_TIMEOUT", "-5")
     assert _get_timeout(60) == 60
+
+
+# ---------------------------------------------------------------------------
+# Request body size limit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_oversized_body_returns_413(upstream_url: str, monkeypatch):
+    """Request with Content-Length exceeding MAX_REQUEST_BODY returns 413."""
+    import claude_bridge.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "_MAX_REQUEST_BODY", 100)
+
+    port = _find_free_port()
+    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 200\r\n\r\n")
+        await writer.drain()
+        # Read until EOF — server sends Connection: close
+        response = await asyncio.wait_for(reader.read(-1), timeout=2)
+        writer.close()
+        assert b"413" in response
+        assert b"request_too_large" in response
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_normal_body_passes_size_check(proxy_url: str):
+    """Request within MAX_REQUEST_BODY proceeds normally."""
+    request_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    status, data = await asyncio.to_thread(
+        _http_post,
+        f"{proxy_url}/v1/messages",
+        request_body,
+        {"x-api-key": "test-key"},
+    )
+    assert status == 200

@@ -23,6 +23,7 @@ from claude_bridge.stream import format_anthropic_sse
 logger = get_logger("proxy")
 
 _DEFAULT_UPSTREAM = "https://api.anthropic.com"
+_MAX_REQUEST_BODY = int(os.environ.get("MAX_REQUEST_BODY", 10_485_760))
 
 
 def _get_timeout(default: int) -> int:
@@ -38,6 +39,7 @@ def _get_timeout(default: int) -> int:
     if value <= 0:
         return default
     return value
+
 
 # Headers to forward from the client to the upstream API.
 _FORWARD_HEADERS = ("x-api-key", "content-type", "anthropic-version")
@@ -110,6 +112,10 @@ def _make_handler(
     return _handle_connection
 
 
+class _RequestTooLarge(Exception):
+    """Raised when Content-Length exceeds MAX_REQUEST_BODY."""
+
+
 async def _parse_request(
     reader: asyncio.StreamReader,
 ) -> tuple[str, str, dict[str, str], bytes] | None:
@@ -138,6 +144,8 @@ async def _parse_request(
         content_length = int(headers.get("content-length", "0"))
     except (ValueError, TypeError):
         return None  # Malformed Content-Length — caller sends 400
+    if content_length > _MAX_REQUEST_BODY:
+        raise _RequestTooLarge
     body = await reader.readexactly(content_length) if content_length else b""
     return method, path, headers, body
 
@@ -231,7 +239,20 @@ async def _process_request(
     request_id_var.set(secrets.token_hex(4))
     request_start = _time.monotonic()
 
-    parsed = await _parse_request(reader)
+    try:
+        parsed = await _parse_request(reader)
+    except _RequestTooLarge:
+        error_body = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "request_too_large",
+                    "message": f"Request body exceeds maximum size ({_MAX_REQUEST_BODY} bytes)",
+                },
+            }
+        ).encode()
+        _write_response(writer, 413, error_body)
+        return
     if parsed is None:
         _write_response(writer, 400, b'{"error": "malformed request"}')
         return
@@ -268,8 +289,16 @@ async def _process_request(
     request_model = _extract_model(body)
 
     await _route_request(
-        provider, upstream_url, headers, body, writer, router,
-        stats, streaming, request_model, request_start,
+        provider,
+        upstream_url,
+        headers,
+        body,
+        writer,
+        router,
+        stats,
+        streaming,
+        request_model,
+        request_start,
     )
 
 
@@ -296,9 +325,7 @@ async def _route_request(
     """Route a /v1/messages request to the appropriate backend."""
     if provider is not None:
         mode = "stream" if streaming else "sync"
-        logger.info(
-            "-> DIRECT %s (%s) model=%s", provider.name, mode, request_model
-        )
+        logger.info("-> DIRECT %s (%s) model=%s", provider.name, mode, request_model)
         if stats:
             stats.set_provider_info(provider.name, request_model)
         if streaming:
@@ -624,7 +651,13 @@ async def _stream_via_provider(
 
 def _write_response(writer: asyncio.StreamWriter, status: int, body: bytes) -> None:
     """Write a minimal HTTP/1.1 response."""
-    reasons = {200: "OK", 400: "Bad Request", 404: "Not Found", 502: "Bad Gateway"}
+    reasons = {
+        200: "OK",
+        400: "Bad Request",
+        404: "Not Found",
+        413: "Payload Too Large",
+        502: "Bad Gateway",
+    }
     reason = reasons.get(status, "Error")
     writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
     writer.write(b"Content-Type: application/json\r\n")

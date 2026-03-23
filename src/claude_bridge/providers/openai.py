@@ -12,7 +12,7 @@ from pathlib import Path
 
 from claude_bridge.auth import is_token_expired
 from claude_bridge.provider import PROVIDERS
-from claude_bridge.stream import format_anthropic_sse, parse_sse_events
+from claude_bridge.stream import parse_sse_events
 
 _CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 _TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -300,7 +300,9 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
         if _REASONING_MODE == "drop":
             warnings.append("Stripped 'thinking' config (reasoning_mode=drop)")
         else:
-            warnings.append("Thinking config passed through (reasoning_mode=passthrough)")
+            warnings.append(
+                "Thinking config passed through (reasoning_mode=passthrough)"
+            )
 
     # Model mapping
     model = request.get("model", "")
