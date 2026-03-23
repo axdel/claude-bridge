@@ -533,6 +533,80 @@ async def test_translate_request_returns_none_gives_502():
         await server.wait_closed()
 
 
+# ---------------------------------------------------------------------------
+# Rate limit header forwarding tests
+# ---------------------------------------------------------------------------
+
+
+class _RateLimitUpstreamHandler(BaseHTTPRequestHandler):
+    """Returns rate limit headers alongside a normal response."""
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length", 0))
+        _body = self.rfile.read(length)
+        resp = {
+            "id": "msg_test",
+            "type": "message",
+            "content": [{"type": "text", "text": "hello"}],
+            "model": "claude-sonnet-4-20250514",
+        }
+        payload = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("anthropic-ratelimit-requests-limit", "1000")
+        self.send_header("anthropic-ratelimit-requests-remaining", "999")
+        self.send_header("retry-after", "30")
+        self.send_header("x-ratelimit-limit-tokens", "50000")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_headers_forwarded():
+    """Rate limit headers from upstream are forwarded to the client."""
+    # Start upstream with rate limit headers
+    upstream_port = _find_free_port()
+    upstream_server = HTTPServer(
+        ("127.0.0.1", upstream_port), _RateLimitUpstreamHandler
+    )
+    upstream_thread = Thread(target=upstream_server.serve_forever, daemon=True)
+    upstream_thread.start()
+    upstream_url = f"http://127.0.0.1:{upstream_port}"
+
+    proxy_port = _find_free_port()
+    server = await start_proxy(
+        host="127.0.0.1", port=proxy_port, upstream_url=upstream_url
+    )
+    try:
+
+        def _check_headers():
+            data = json.dumps(
+                {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+            ).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_port}/v1/messages",
+                data=data,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return {k.lower(): v for k, v in resp.getheaders()}
+
+        headers_dict = await asyncio.to_thread(_check_headers)
+        assert "anthropic-ratelimit-requests-limit" in headers_dict
+        assert headers_dict["anthropic-ratelimit-requests-limit"] == "1000"
+        assert "retry-after" in headers_dict
+        assert "x-ratelimit-limit-tokens" in headers_dict
+    finally:
+        server.close()
+        await server.wait_closed()
+        upstream_server.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_normal_body_passes_size_check(proxy_url: str):
     """Request within MAX_REQUEST_BODY proceeds normally."""

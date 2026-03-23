@@ -48,6 +48,22 @@ _FORWARD_HEADERS = ("x-api-key", "content-type", "anthropic-version")
 _FAILOVER_STATUSES = {429, 500, 502, 503}
 
 # SSE events too noisy for DEBUG — normal stream lifecycle, not interesting.
+_RATELIMIT_HEADER_PREFIXES = ("x-ratelimit-", "anthropic-ratelimit-")
+_RATELIMIT_EXACT_HEADERS = ("retry-after",)
+
+
+def _extract_ratelimit_headers(headers) -> list[tuple[str, str]]:
+    """Extract rate limit headers from an HTTP response headers object."""
+    result = []
+    for key, value in headers.items():
+        lower_key = key.lower()
+        if any(lower_key.startswith(p) for p in _RATELIMIT_HEADER_PREFIXES):
+            result.append((lower_key, value))
+        elif lower_key in _RATELIMIT_EXACT_HEADERS:
+            result.append((lower_key, value))
+    return result
+
+
 _QUIET_SSE_EVENTS = frozenset(
     {
         "content_block_delta",
@@ -345,10 +361,10 @@ async def _route_request(
         logger.info("-> auto-route (sync) model=%s", request_model)
         if stats:
             stats.set_provider_info("anthropic", request_model)
-        status_code, response_body = await _auto_route(
+        status_code, response_body, rl_headers = await _auto_route(
             upstream_url, headers, body, router
         )
-        _write_response(writer, status_code, response_body)
+        _write_response(writer, status_code, response_body, rl_headers)
         _record_sync_response(stats, request_start, status_code, response_body)
 
 
@@ -372,30 +388,30 @@ async def _try_failover(router: Router, body: bytes) -> tuple[int, bytes] | None
 
 async def _auto_route(
     upstream_url: str, headers: dict[str, str], body: bytes, router: Router
-) -> tuple[int, bytes]:
+) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Auto mode: try Anthropic, failover on error."""
     # If circuit breaker is OPEN, try fallback first
     if router.should_use_fallback():
         result = await _try_failover(router, body)
         if result is not None:
-            return result
+            return result[0], result[1], []
 
     # Try Anthropic upstream
-    status_code, response_body = await asyncio.to_thread(
+    status_code, response_body, rl_headers = await asyncio.to_thread(
         _forward_request, upstream_url, body, headers
     )
 
     if status_code not in _FAILOVER_STATUSES:
         await router.record_success()
-        return status_code, response_body
+        return status_code, response_body, rl_headers
 
     # Anthropic failed — record and try failover
     await router.record_failure()
     result = await _try_failover(router, body)
     if result is not None:
-        return result
+        return result[0], result[1], []
 
-    return status_code, response_body
+    return status_code, response_body, rl_headers
 
 
 _provider_cache: dict[str, Provider] = {}
@@ -515,7 +531,7 @@ def _extract_completed_response(raw_sse: bytes) -> dict | None:
 
 def _forward_request(
     upstream_url: str, body: bytes, client_headers: dict[str, str]
-) -> tuple[int, bytes]:
+) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Synchronous HTTP POST to the upstream — called from asyncio.to_thread."""
     url = f"{upstream_url}/v1/messages"
     req = urllib.request.Request(url, data=body, method="POST")
@@ -526,13 +542,13 @@ def _forward_request(
 
     try:
         with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:
-            return resp.status, resp.read()
+            return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as exc:
-        # Upstream returned an error status — forward it
-        return exc.code, exc.read()
+        rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
+        return exc.code, exc.read(), rl_headers
     except (urllib.error.URLError, TimeoutError, OSError):
         error = json.dumps({"error": "upstream unavailable"}).encode()
-        return 502, error
+        return 502, error, []
 
 
 class _ClientDisconnected(Exception):
@@ -685,7 +701,12 @@ async def _stream_via_provider(
         logger.debug("Client disconnected during provider stream")
 
 
-def _write_response(writer: asyncio.StreamWriter, status: int, body: bytes) -> None:
+def _write_response(
+    writer: asyncio.StreamWriter,
+    status: int,
+    body: bytes,
+    extra_headers: list[tuple[str, str]] | None = None,
+) -> None:
     """Write a minimal HTTP/1.1 response."""
     reasons = {
         200: "OK",
@@ -698,6 +719,8 @@ def _write_response(writer: asyncio.StreamWriter, status: int, body: bytes) -> N
     writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
     writer.write(b"Content-Type: application/json\r\n")
     writer.write(f"Content-Length: {len(body)}\r\n".encode())
+    for key, value in extra_headers or []:
+        writer.write(f"{key}: {value}\r\n".encode())
     writer.write(b"Connection: close\r\n")
     writer.write(b"\r\n")
     writer.write(body)
