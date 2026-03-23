@@ -36,9 +36,7 @@ class TestBridgeStats:
     def test_record_response_updates_counters(self):
         stats = BridgeStats()
         stats.record_request()
-        stats.record_response(
-            status_code=200, latency_ms=150.0, tokens_in=100, tokens_out=50
-        )
+        stats.record_response(status_code=200, latency_ms=150.0, tokens_in=100, tokens_out=50)
         snap = stats.snapshot()
         assert snap["upstream_attempts"] == 1
         assert snap["tokens_in"] == 100

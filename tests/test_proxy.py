@@ -8,6 +8,7 @@ import socket
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
+
 import pytest
 
 from claude_bridge.provider import PROVIDERS
@@ -23,7 +24,7 @@ def _find_free_port() -> int:
 class _MockUpstreamHandler(BaseHTTPRequestHandler):
     """Echoes back a canned Anthropic response."""
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         _body = self.rfile.read(length)
         resp = {
@@ -39,7 +40,7 @@ class _MockUpstreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format, *args):  # noqa: A002
+    def log_message(self, format, *args):
         pass
 
 
@@ -144,9 +145,7 @@ async def test_malformed_content_length_returns_400(upstream_url: str):
     try:
         # Send a raw HTTP request with a bad Content-Length
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(
-            b"POST /v1/messages HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n"
-        )
+        writer.write(b"POST /v1/messages HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n")
         await writer.drain()
         response = await asyncio.wait_for(reader.read(4096), timeout=2)
         writer.close()
@@ -183,7 +182,7 @@ async def test_upstream_unreachable_returns_502():
 class _Mock500UpstreamHandler(BaseHTTPRequestHandler):
     """Returns 500 for all requests (simulates Anthropic outage)."""
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         payload = json.dumps({"error": "internal server error"}).encode()
         self.send_response(500)
         self.send_header("Content-Type", "application/json")
@@ -191,14 +190,14 @@ class _Mock500UpstreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format, *args):  # noqa: A002
+    def log_message(self, format, *args):
         pass
 
 
 class _MockOpenAIHandler(BaseHTTPRequestHandler):
     """Returns a valid OpenAI Responses API response."""
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         _body = self.rfile.read(length)
         resp = {
@@ -208,9 +207,7 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
             "output": [
                 {
                     "type": "message",
-                    "content": [
-                        {"type": "output_text", "text": "hello from openai fallback"}
-                    ],
+                    "content": [{"type": "output_text", "text": "hello from openai fallback"}],
                 }
             ],
             "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -222,7 +219,7 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format, *args):  # noqa: A002
+    def log_message(self, format, *args):
         pass
 
 
@@ -289,17 +286,13 @@ async def test_failover_on_upstream_500(_openai_mock_url: str):
     """When Anthropic returns 500, proxy fails over to the fallback provider."""
     # Start a mock Anthropic that always returns 500
     anthropic_port = _find_free_port()
-    anthropic_server = HTTPServer(
-        ("127.0.0.1", anthropic_port), _Mock500UpstreamHandler
-    )
+    anthropic_server = HTTPServer(("127.0.0.1", anthropic_port), _Mock500UpstreamHandler)
     anthropic_thread = Thread(target=anthropic_server.serve_forever, daemon=True)
     anthropic_thread.start()
     anthropic_url = f"http://127.0.0.1:{anthropic_port}"
 
     proxy_port = _find_free_port()
-    server = await start_proxy(
-        host="127.0.0.1", port=proxy_port, upstream_url=anthropic_url
-    )
+    server = await start_proxy(host="127.0.0.1", port=proxy_port, upstream_url=anthropic_url)
     try:
         request_body = {
             "model": "claude-sonnet-4-6",
@@ -511,15 +504,12 @@ async def test_translate_request_returns_none_gives_502():
     """Provider returning None from translate_request produces 502, not crash."""
     port = _find_free_port()
     provider = _BrokenProvider()
-    server = await start_proxy(
-        host="127.0.0.1", port=port, upstream_url="http://127.0.0.1:1"
-    )
+    server = await start_proxy(host="127.0.0.1", port=port, upstream_url="http://127.0.0.1:1")
     # We need to patch the handler's provider directly
     server.close()
     await server.wait_closed()
 
     from claude_bridge.proxy import _make_handler
-
     from claude_bridge.router import Router
     from claude_bridge.stats import BridgeStats
 
@@ -548,7 +538,7 @@ async def test_translate_request_returns_none_gives_502():
 class _RateLimitUpstreamHandler(BaseHTTPRequestHandler):
     """Returns rate limit headers alongside a normal response."""
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         _body = self.rfile.read(length)
         resp = {
@@ -568,7 +558,7 @@ class _RateLimitUpstreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format, *args):  # noqa: A002
+    def log_message(self, format, *args):
         pass
 
 
@@ -577,17 +567,13 @@ async def test_rate_limit_headers_forwarded():
     """Rate limit headers from upstream are forwarded to the client."""
     # Start upstream with rate limit headers
     upstream_port = _find_free_port()
-    upstream_server = HTTPServer(
-        ("127.0.0.1", upstream_port), _RateLimitUpstreamHandler
-    )
+    upstream_server = HTTPServer(("127.0.0.1", upstream_port), _RateLimitUpstreamHandler)
     upstream_thread = Thread(target=upstream_server.serve_forever, daemon=True)
     upstream_thread.start()
     upstream_url = f"http://127.0.0.1:{upstream_port}"
 
     proxy_port = _find_free_port()
-    server = await start_proxy(
-        host="127.0.0.1", port=proxy_port, upstream_url=upstream_url
-    )
+    server = await start_proxy(host="127.0.0.1", port=proxy_port, upstream_url=upstream_url)
     try:
 
         def _check_headers():
@@ -672,7 +658,7 @@ async def test_count_tokens_with_tools(proxy_url: str):
         f"{proxy_url}/v1/messages/count_tokens",
         request_body,
     )
-    status_without, data_without = await asyncio.to_thread(
+    _status_without, data_without = await asyncio.to_thread(
         _http_post,
         f"{proxy_url}/v1/messages/count_tokens",
         {"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]},
@@ -709,7 +695,7 @@ async def test_normal_body_passes_size_check(proxy_url: str):
         "max_tokens": 100,
         "messages": [{"role": "user", "content": "hi"}],
     }
-    status, data = await asyncio.to_thread(
+    status, _data = await asyncio.to_thread(
         _http_post,
         f"{proxy_url}/v1/messages",
         request_body,
@@ -724,7 +710,7 @@ async def test_normal_body_passes_size_check(proxy_url: str):
 class _Mock500StreamHandler(BaseHTTPRequestHandler):
     """Returns 500 for streaming requests."""
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         payload = json.dumps({"error": "server error"}).encode()
         self.send_response(500)
         self.send_header("Content-Type", "application/json")
@@ -732,7 +718,7 @@ class _Mock500StreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format, *args):  # noqa: A002
+    def log_message(self, format, *args):
         pass
 
 
@@ -781,7 +767,7 @@ async def test_stream_via_provider_http_error_returns_error():
                 "stream": True,
                 "messages": [{"role": "user", "content": "hi"}],
             }
-            status, data = await asyncio.to_thread(
+            status, _data = await asyncio.to_thread(
                 _http_post,
                 f"http://127.0.0.1:{proxy_port}/v1/messages",
                 request_body,
@@ -815,7 +801,7 @@ async def test_stream_via_provider_connection_refused_returns_502():
                 "stream": True,
                 "messages": [{"role": "user", "content": "hi"}],
             }
-            status, data = await asyncio.to_thread(
+            status, _data = await asyncio.to_thread(
                 _http_post,
                 f"http://127.0.0.1:{proxy_port}/v1/messages",
                 request_body,
@@ -845,7 +831,7 @@ async def test_stream_passthrough_upstream_unavailable_returns_502():
             "stream": True,
             "messages": [{"role": "user", "content": "hi"}],
         }
-        status, data = await asyncio.to_thread(
+        status, _data = await asyncio.to_thread(
             _http_post,
             f"http://127.0.0.1:{proxy_port}/v1/messages",
             request_body,

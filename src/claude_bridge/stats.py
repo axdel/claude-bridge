@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 class BridgeStats:
@@ -21,7 +21,7 @@ class BridgeStats:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._started_at = datetime.now(timezone.utc)
+        self._started_at = datetime.now(UTC)
         self._started_mono = time.monotonic()
         self._requests_total = 0
         self._errors_total = 0
@@ -84,9 +84,7 @@ class BridgeStats:
                 "tokens_in": self._tokens_in,
                 "tokens_out": self._tokens_out,
                 "latency_total_ms": latency_total,
-                "latency_avg_ms": (
-                    round(latency_total / attempts, 1) if attempts else 0.0
-                ),
+                "latency_avg_ms": (round(latency_total / attempts, 1) if attempts else 0.0),
                 "started_at": self._started_at.isoformat(),
                 "uptime_seconds": round(time.monotonic() - self._started_mono, 1),
                 "provider_name": self._provider_name,

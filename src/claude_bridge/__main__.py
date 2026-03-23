@@ -6,12 +6,11 @@ import argparse
 import asyncio
 import os
 
+# Import providers so they register themselves in the PROVIDERS dict.
+import claude_bridge.providers.openai
+import claude_bridge.providers.xai  # noqa: F401
 from claude_bridge.log import configure_logging, get_logger
 from claude_bridge.proxy import start_proxy
-
-# Import providers so they register themselves in the PROVIDERS dict.
-import claude_bridge.providers.openai  # noqa: F401
-import claude_bridge.providers.xai  # noqa: F401
 
 logger = get_logger("main")
 
@@ -65,9 +64,7 @@ def main() -> None:
     if auth_mode == "api_key":
         logger.info("Auth mode: api_key (OPENAI_API_KEY detected)")
     else:
-        logger.info(
-            "Auth mode: codex_oauth (no OPENAI_API_KEY — falling back to Codex OAuth)"
-        )
+        logger.info("Auth mode: codex_oauth (no OPENAI_API_KEY — falling back to Codex OAuth)")
 
     asyncio.run(
         _run(

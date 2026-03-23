@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 
-
 from claude_bridge.providers.openai import (
     DEFAULT_MODEL,
     MODEL_MAP,
@@ -12,7 +11,6 @@ from claude_bridge.providers.openai import (
     openai_to_anthropic,
 )
 from claude_bridge.proxy import estimate_input_tokens
-
 
 # ---------------------------------------------------------------------------
 # anthropic_to_openai — text-only requests
@@ -26,9 +24,7 @@ class TestAnthropicToOpenaiTextOnly:
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 1024,
-            "messages": [
-                {"role": "user", "content": [{"type": "text", "text": "Hello"}]}
-            ],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
         }
         result, warnings = anthropic_to_openai(request)
 
@@ -49,7 +45,7 @@ class TestAnthropicToOpenaiTextOnly:
             "max_tokens": 512,
             "messages": [{"role": "user", "content": "Hello shorthand"}],
         }
-        result, warnings = anthropic_to_openai(request)
+        result, _warnings = anthropic_to_openai(request)
 
         assert result["input"][0]["content"][0] == {
             "type": "input_text",
@@ -151,7 +147,7 @@ class TestAnthropicToOpenaiTools:
 
 
 class TestAnthropicToOpenaiToolUse:
-    """Tool use in messages: assistant tool_use -> function_call, tool_result -> function_call_output."""
+    """Tool use: assistant tool_use -> function_call, tool_result -> function_call_output."""
 
     def test_tool_use_block_to_function_call(self):
         request = {
@@ -201,11 +197,7 @@ class TestAnthropicToOpenaiToolUse:
         }
         result, _ = anthropic_to_openai(request)
 
-        fco = [
-            item
-            for item in result["input"]
-            if item.get("type") == "function_call_output"
-        ]
+        fco = [item for item in result["input"] if item.get("type") == "function_call_output"]
         assert len(fco) == 1
         assert fco[0]["call_id"] == "fc_abc"  # toolu_ prefix → fc_ for OpenAI
         assert fco[0]["output"] == "File edited successfully"
@@ -230,9 +222,7 @@ class TestAnthropicToOpenaiStripping:
         _, warnings = anthropic_to_openai(request)
         assert any("passthrough" in w.lower() for w in warnings)
         # Should NOT say "Stripped"
-        assert not any(
-            "stripped" in w.lower() and "thinking" in w.lower() for w in warnings
-        )
+        assert not any("stripped" in w.lower() and "thinking" in w.lower() for w in warnings)
 
     def test_thinking_stripped_when_drop_mode(self, monkeypatch):
         """Thinking config stripped when REASONING_MODE=drop."""

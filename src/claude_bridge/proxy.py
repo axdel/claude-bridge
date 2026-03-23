@@ -57,9 +57,8 @@ def _extract_ratelimit_headers(headers) -> list[tuple[str, str]]:
     result = []
     for key, value in headers.items():
         lower_key = key.lower()
-        if any(lower_key.startswith(p) for p in _RATELIMIT_HEADER_PREFIXES):
-            result.append((lower_key, value))
-        elif lower_key in _RATELIMIT_EXACT_HEADERS:
+        is_ratelimit = any(lower_key.startswith(p) for p in _RATELIMIT_HEADER_PREFIXES)
+        if is_ratelimit or lower_key in _RATELIMIT_EXACT_HEADERS:
             result.append((lower_key, value))
     return result
 
@@ -115,9 +114,7 @@ def _make_handler(
         writer: asyncio.StreamWriter,
     ) -> None:
         try:
-            await _process_request(
-                reader, writer, upstream_url, router, provider, stats
-            )
+            await _process_request(reader, writer, upstream_url, router, provider, stats)
         finally:
             try:
                 writer.close()
@@ -141,7 +138,7 @@ async def _parse_request(
         return None
 
     parts = request_line.decode("utf-8", errors="replace").strip().split()
-    if len(parts) < 3:  # noqa: PLR2004
+    if len(parts) < 3:
         return None
 
     method, path = parts[0], parts[1]
@@ -481,12 +478,14 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     # Open a streaming connection and collect the full response
     def _collect_response():
         data = json.dumps(translated).encode()
-        req = urllib.request.Request(provider.endpoint, data=data, method="POST")
+        req = urllib.request.Request(  # noqa: S310
+            provider.endpoint, data=data, method="POST"
+        )
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
         try:
-            with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:
+            with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:  # noqa: S310
                 full_body = resp.read()
                 return resp.status, full_body
         except urllib.error.HTTPError as exc:
@@ -508,9 +507,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         try:
             response_dict = json.loads(raw_response)
         except (json.JSONDecodeError, ValueError):
-            return 502, json.dumps(
-                {"error": "could not parse provider response"}
-            ).encode()
+            return 502, json.dumps({"error": "could not parse provider response"}).encode()
 
     anthropic_response = provider.translate_response(response_dict)
     return 200, json.dumps(anthropic_response).encode()
@@ -534,14 +531,14 @@ def _forward_request(
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Synchronous HTTP POST to the upstream — called from asyncio.to_thread."""
     url = f"{upstream_url}/v1/messages"
-    req = urllib.request.Request(url, data=body, method="POST")
+    req = urllib.request.Request(url, data=body, method="POST")  # noqa: S310
 
     for key in _FORWARD_HEADERS:
         if key in client_headers:
             req.add_header(key, client_headers[key])
 
     try:
-        with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:
+        with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:  # noqa: S310
             return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as exc:
         rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
@@ -583,7 +580,7 @@ async def _stream_passthrough(
 
     def _open_stream():
         url = f"{upstream_url}/v1/messages"
-        req = urllib.request.Request(url, data=body, method="POST")
+        req = urllib.request.Request(url, data=body, method="POST")  # noqa: S310
         for key in _FORWARD_HEADERS:
             if key in client_headers:
                 req.add_header(key, client_headers[key])
@@ -592,9 +589,7 @@ async def _stream_passthrough(
     try:
         resp = await asyncio.to_thread(_open_stream)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
-        _write_response(
-            writer, 502, json.dumps({"error": "upstream unavailable"}).encode()
-        )
+        _write_response(writer, 502, json.dumps({"error": "upstream unavailable"}).encode())
         return
 
     _write_sse_headers(writer)
@@ -649,7 +644,9 @@ async def _stream_via_provider(
 
     def _open_stream():
         data = json.dumps(translated).encode()
-        req = urllib.request.Request(provider.endpoint, data=data, method="POST")
+        req = urllib.request.Request(  # noqa: S310
+            provider.endpoint, data=data, method="POST"
+        )
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
@@ -670,9 +667,7 @@ async def _stream_via_provider(
         return
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.error("Provider connection error: %s", exc)
-        _write_response(
-            writer, 502, json.dumps({"error": "provider unavailable"}).encode()
-        )
+        _write_response(writer, 502, json.dumps({"error": "provider unavailable"}).encode())
         return
 
     _write_sse_headers(writer)
@@ -690,9 +685,7 @@ async def _stream_via_provider(
 
     try:
         async for anthropic_event in provider.translate_stream(_raw_chunks()):
-            sse_bytes = format_anthropic_sse(
-                anthropic_event["event"], anthropic_event["data"]
-            )
+            sse_bytes = format_anthropic_sse(anthropic_event["event"], anthropic_event["data"])
             event_name = anthropic_event["event"]
             if event_name not in _QUIET_SSE_EVENTS:
                 logger.debug("SSE -> %s", event_name)

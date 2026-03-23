@@ -16,7 +16,7 @@ from claude_bridge.provider import PROVIDERS
 from claude_bridge.stream import parse_sse_events
 
 _CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-_TOKEN_URL = "https://auth.openai.com/oauth/token"
+_TOKEN_URL = "https://auth.openai.com/oauth/token"  # noqa: S105
 _DEFAULT_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 
 
@@ -29,10 +29,7 @@ def read_codex_auth(path: Path | None = None) -> dict:
     """
     auth_path = path or _DEFAULT_AUTH_PATH
     if not auth_path.exists():
-        msg = (
-            f"Codex auth file not found at {auth_path}. "
-            "Run `codex login` to authenticate first."
-        )
+        msg = f"Codex auth file not found at {auth_path}. Run `codex login` to authenticate first."
         raise FileNotFoundError(msg)
 
     data: dict = json.loads(auth_path.read_text())
@@ -64,15 +61,11 @@ async def get_bearer_token(auth_path: Path | None = None) -> str:
         if not is_token_expired(token):
             return token
 
-        new_token = await refresh_access_token(
-            tokens["refresh_token"], auth_path=auth_path
-        )
+        new_token = await refresh_access_token(tokens["refresh_token"], auth_path=auth_path)
         return new_token
 
 
-async def refresh_access_token(
-    refresh_token: str, auth_path: Path | None = None
-) -> str:
+async def refresh_access_token(refresh_token: str, auth_path: Path | None = None) -> str:
     """Exchange a refresh token for a new access token.
 
     POSTs to the OpenAI token endpoint, updates the local auth.json
@@ -88,11 +81,11 @@ async def refresh_access_token(
                 "client_id": _CODEX_CLIENT_ID,
             }
         ).encode()
-        req = urllib.request.Request(_TOKEN_URL, data=body, method="POST")
+        req = urllib.request.Request(_TOKEN_URL, data=body, method="POST")  # noqa: S310
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
                 token_data: dict = json.loads(resp.read())
         except (
             urllib.error.HTTPError,
@@ -105,15 +98,11 @@ async def refresh_access_token(
         try:
             new_access_token: str = token_data["access_token"]
         except KeyError as exc:
-            raise ValueError(
-                "Token refresh failed: response missing 'access_token'"
-            ) from exc
+            raise ValueError("Token refresh failed: response missing 'access_token'") from exc
         new_refresh_token: str = token_data.get("refresh_token", refresh_token)
 
         # Atomic write: tmp file + os.replace
-        current = (
-            json.loads(resolved_path.read_text()) if resolved_path.exists() else {}
-        )
+        current = json.loads(resolved_path.read_text()) if resolved_path.exists() else {}
         current["access_token"] = new_access_token
         current["refresh_token"] = new_refresh_token
 
@@ -244,9 +233,7 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
         }, warnings
 
     # Unknown block type — pass through as input_text with warning
-    warnings.append(
-        f"Unknown content block type '{block_type}', converted to input_text"
-    )
+    warnings.append(f"Unknown content block type '{block_type}', converted to input_text")
     return {"type": "input_text", "text": str(block)}, warnings
 
 
@@ -334,9 +321,7 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
         if _REASONING_MODE == "drop":
             warnings.append("Stripped 'thinking' config (reasoning_mode=drop)")
         else:
-            warnings.append(
-                "Thinking config passed through (reasoning_mode=passthrough)"
-            )
+            warnings.append("Thinking config passed through (reasoning_mode=passthrough)")
 
     # Model mapping
     model = request.get("model", "")
@@ -355,9 +340,7 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
         if isinstance(system, str):
             result["instructions"] = system
         elif isinstance(system, list):
-            result["instructions"] = "\n".join(
-                block.get("text", "") for block in system
-            )
+            result["instructions"] = "\n".join(block.get("text", "") for block in system)
     else:
         result["instructions"] = "You are a helpful assistant."
 
@@ -683,9 +666,7 @@ class OpenAIProvider:
         """Translate OpenAI Responses response to Anthropic Messages response."""
         return openai_to_anthropic(provider_resp)
 
-    async def translate_stream(
-        self, raw_chunks: AsyncIterator[bytes]
-    ) -> AsyncIterator[dict]:
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw provider byte chunks to Anthropic SSE events.
 
         Receives raw HTTP response bytes, handles SSE parsing (CRLF

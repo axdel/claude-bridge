@@ -40,9 +40,7 @@ class Provider(Protocol):
         """Translate a provider response back to Anthropic format."""
         ...
 
-    async def translate_stream(
-        self, raw_chunks: AsyncIterator[bytes]
-    ) -> AsyncIterator[dict]:
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate a stream of raw byte chunks to Anthropic-format SSE events.
 
         The proxy feeds raw HTTP response bytes; the provider owns SSE parsing
