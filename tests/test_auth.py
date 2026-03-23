@@ -15,6 +15,7 @@ from claude_bridge.providers.openai import (
     OpenAIProvider,
     get_bearer_token,
     read_codex_auth,
+    refresh_access_token,
 )
 
 
@@ -170,6 +171,68 @@ class TestRefreshLock:
         # Run 5 concurrent calls — all should return the same token
         results = await asyncio.gather(*[get_bearer_token(auth_file) for _ in range(5)])
         assert all(r == token for r in results)
+
+
+# --- refresh_access_token error handling ---
+
+
+class TestRefreshAccessTokenErrors:
+    """Token refresh raises ValueError on network and response errors."""
+
+    @pytest.mark.asyncio
+    async def test_http_error_raises_value_error(self, monkeypatch, tmp_path: Path):
+        import http.client
+        import urllib.error
+
+        def _raise_http_error(*args, **kwargs):
+            raise urllib.error.HTTPError(
+                "https://auth.openai.com/oauth/token",
+                401,
+                "Unauthorized",
+                http.client.HTTPMessage(),
+                None,
+            )
+
+        monkeypatch.setattr("urllib.request.urlopen", _raise_http_error)
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text("{}")
+        with pytest.raises(ValueError, match="Token refresh failed"):
+            await refresh_access_token("fake-refresh-token", auth_path=auth_file)
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_raises_value_error(self, monkeypatch, tmp_path: Path):
+        def _raise_timeout(*args, **kwargs):
+            raise TimeoutError("Connection timed out")
+
+        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text("{}")
+        with pytest.raises(ValueError, match="Token refresh failed"):
+            await refresh_access_token("fake-refresh-token", auth_path=auth_file)
+
+    @pytest.mark.asyncio
+    async def test_missing_access_token_raises_value_error(
+        self, monkeypatch, tmp_path: Path
+    ):
+
+        class _FakeResp:
+            def __init__(self):
+                self._data = json.dumps({"refresh_token": "new-ref"}).encode()
+
+            def read(self):
+                return self._data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: _FakeResp())
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text("{}")
+        with pytest.raises(ValueError, match="missing 'access_token'"):
+            await refresh_access_token("fake-refresh-token", auth_path=auth_file)
 
 
 # --- OpenAIProvider auth modes ---
