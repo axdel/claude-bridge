@@ -63,7 +63,7 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
 - **Multi-provider** — adding a provider = one file, zero proxy changes
-- **137 tests** — auth, translation, streaming, routing, stats, connection handling
+- **150 tests** — auth, translation, streaming, routing, stats, connection handling
 
 ## Prerequisites
 
@@ -290,7 +290,7 @@ cd claude-bridge
 uv run pytest tests/ -v     # installs test deps on first run
 ```
 
-No external services — all 137 tests use mock HTTP servers.
+No external services — all 150 tests use mock HTTP servers.
 
 ## Comparison
 
@@ -303,7 +303,7 @@ No external services — all 137 tests use mock HTTP servers.
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 114 | Minimal | Some |
+| Tests | 150 | Minimal | Some |
 
 ## Terms of Service Considerations
 
