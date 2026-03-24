@@ -490,12 +490,13 @@ def _get_fallback_provider() -> Provider | None:
 
 
 async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, bytes]:
-    """Translate, authenticate, forward to provider, translate back.
+    """Authenticate, translate, forward to provider, translate back.
 
     The Codex endpoint always streams, so we read the SSE stream and extract
     the final response from the ``response.completed`` event.
     """
     request_dict = json.loads(body)
+    auth_headers = await provider.authenticate()
     translated, warnings = provider.translate_request(request_dict)
     if not isinstance(translated, dict):
         logger.warning(
@@ -515,8 +516,6 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         return 502, error
     for w in warnings:
         logger.warning("Translation: %s", w)
-
-    auth_headers = await provider.authenticate()
 
     # Open a streaming connection and collect the full response
     def _do_provider_request():
@@ -655,6 +654,8 @@ async def _stream_via_provider(
 ) -> None:
     """Translate request, stream from provider, translate SSE events back to Anthropic format."""
     request_dict = json.loads(body)
+    # Authenticate first — some providers need auth context before translation
+    auth_headers = await provider.authenticate()
     translated, warnings = provider.translate_request(request_dict)
     if not isinstance(translated, dict):
         logger.warning(
@@ -679,10 +680,9 @@ async def _stream_via_provider(
     for w in warnings:
         logger.warning("Translation: %s", w)
 
-    # Enable streaming on the translated request
-    translated["stream"] = True
-
-    auth_headers = await provider.authenticate()
+    # Enable streaming on the translated request (skip for providers that use URL-based streaming)
+    if not getattr(provider, "stream_via_url", False):
+        translated["stream"] = True
 
     def _open_stream():
         data = json.dumps(translated).encode()

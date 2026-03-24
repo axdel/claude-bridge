@@ -145,13 +145,30 @@ def _translate_messages(messages: list[dict], warnings: list[str]) -> list[dict]
     return contents
 
 
-def _strip_schema_key(schema: dict) -> dict:
-    """Recursively strip ``$schema`` from a JSON Schema — Gemini rejects it."""
-    return {
-        k: (_strip_schema_key(v) if isinstance(v, dict) else v)
-        for k, v in schema.items()
-        if k != "$schema"
-    }
+# Gemini only accepts a subset of JSON Schema. These keywords are rejected.
+_UNSUPPORTED_SCHEMA_KEYS = frozenset({
+    "$schema", "$id", "$ref", "$comment", "$defs",
+    "propertyNames", "patternProperties", "additionalItems",
+    "if", "then", "else", "allOf", "anyOf", "oneOf", "not",
+    "contentMediaType", "contentEncoding",
+    "examples", "default", "const", "deprecated",
+    "readOnly", "writeOnly",
+})
+
+
+def _clean_schema(schema: dict) -> dict:
+    """Recursively strip unsupported JSON Schema keywords for Gemini."""
+    cleaned: dict = {}
+    for k, v in schema.items():
+        if k in _UNSUPPORTED_SCHEMA_KEYS:
+            continue
+        if isinstance(v, dict):
+            cleaned[k] = _clean_schema(v)
+        elif isinstance(v, list):
+            cleaned[k] = [_clean_schema(item) if isinstance(item, dict) else item for item in v]
+        else:
+            cleaned[k] = v
+    return cleaned
 
 
 def anthropic_to_gemini(request: dict) -> tuple[dict, list[str]]:
@@ -187,7 +204,7 @@ def anthropic_to_gemini(request: dict) -> tuple[dict, list[str]]:
                     {
                         "name": t["name"],
                         "description": t.get("description", ""),
-                        "parameters": _strip_schema_key(t.get("input_schema", {})),
+                        "parameters": _clean_schema(t.get("input_schema", {})),
                     }
                     for t in request["tools"]
                 ]
@@ -650,7 +667,13 @@ def _get_code_assist_project(auth_headers: dict[str, str]) -> str:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
             data = json.loads(resp.read())
-            _cached_project = data.get("cloudaicompanionProject", "")
+            project = data.get("cloudaicompanionProject", "")
+            if not project:
+                raise ValueError(
+                    "loadCodeAssist returned no cloudaicompanionProject. "
+                    f"Response keys: {list(data.keys())}"
+                )
+            _cached_project = project
             return _cached_project
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
         raise ValueError(f"Failed to load Code Assist project: {exc}") from exc
@@ -658,16 +681,15 @@ def _get_code_assist_project(auth_headers: dict[str, str]) -> str:
 
 def _wrap_code_assist_request(gemini_req: dict, model: str, project: str) -> dict:
     """Wrap a standard Gemini request in the Code Assist envelope."""
-    return {
-        "model": model,
-        "project": project,
-        "request": {
-            "contents": gemini_req.get("contents", []),
-            "systemInstruction": gemini_req.get("system_instruction"),
-            "tools": gemini_req.get("tools", []),
-            "generationConfig": gemini_req.get("generationConfig"),
-        },
-    }
+    inner: dict = {"contents": gemini_req.get("contents", [])}
+    # Only include non-null optional fields — Gemini rejects null values
+    if gemini_req.get("system_instruction"):
+        inner["systemInstruction"] = gemini_req["system_instruction"]
+    if gemini_req.get("tools"):
+        inner["tools"] = gemini_req["tools"]
+    if gemini_req.get("generationConfig"):
+        inner["generationConfig"] = gemini_req["generationConfig"]
+    return {"model": model, "project": project, "request": inner}
 
 
 def _unwrap_code_assist_response(envelope: dict) -> dict:
@@ -693,6 +715,7 @@ class GeminiProvider:
     """
 
     name = "gemini"
+    stream_via_url = True
 
     def __init__(
         self,
@@ -742,6 +765,8 @@ class GeminiProvider:
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
         """Translate Anthropic Messages request to Gemini format."""
         result, warnings = anthropic_to_gemini(anthropic_req)
+        # Gemini controls streaming via URL, not body — strip the field
+        result.pop("stream", None)
         if self.auth_mode == "gemini_oauth":
             result = _wrap_code_assist_request(result, self._model, self._project)
         return result, warnings
