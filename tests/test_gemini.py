@@ -446,3 +446,121 @@ class TestGeminiToAnthropicToolUse:
         gemini_id, sig = _decode_tool_id(tool_id)
         assert gemini_id == "fc99"
         assert sig == "secret-sig-data"
+
+
+# --- SSE stream translation tests ---
+
+
+class TestGeminiStreamTranslation:
+    """Gemini SSE chunks → Anthropic SSE events."""
+
+    def test_text_stream_produces_correct_events(self):
+        from claude_bridge.providers.gemini import translate_gemini_sse_chunk
+
+        state: dict = {}
+        chunk1 = {
+            "candidates": [{"content": {"parts": [{"text": "Hello"}], "role": "model"}}],
+            "usageMetadata": {"promptTokenCount": 5},
+            "responseId": "r1",
+            "modelVersion": "gemini-2.5-pro",
+        }
+        events = translate_gemini_sse_chunk(chunk1, state)
+        event_types = [e["event"] for e in events]
+        assert "message_start" in event_types
+        assert "content_block_start" in event_types
+        assert "content_block_delta" in event_types
+
+    def test_final_chunk_emits_stop_events(self):
+        from claude_bridge.providers.gemini import translate_gemini_sse_chunk
+
+        state: dict = {"started": True, "text_block_open": True, "block_index": 0}
+        final = {
+            "candidates": [{"finishReason": "STOP"}],
+            "usageMetadata": {"candidatesTokenCount": 10},
+        }
+        events = translate_gemini_sse_chunk(final, state)
+        event_types = [e["event"] for e in events]
+        assert "content_block_stop" in event_types
+        assert "message_delta" in event_types
+        assert "message_stop" in event_types
+
+    def test_function_call_in_stream(self):
+        from claude_bridge.providers.gemini import translate_gemini_sse_chunk
+
+        state: dict = {"started": True, "block_index": 0}
+        chunk = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "id": "fc1",
+                                    "name": "edit",
+                                    "args": {"path": "a.py"},
+                                }
+                            }
+                        ],
+                        "role": "model",
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {"candidatesTokenCount": 5},
+        }
+        events = translate_gemini_sse_chunk(chunk, state)
+        event_types = [e["event"] for e in events]
+        assert "content_block_start" in event_types
+        assert "content_block_delta" in event_types
+        # Verify the tool_use block
+        start_events = [e for e in events if e["event"] == "content_block_start"]
+        assert start_events[0]["data"]["content_block"]["type"] == "tool_use"
+
+    def test_safety_stream_synthesizes_refusal(self):
+        from claude_bridge.providers.gemini import translate_gemini_sse_chunk
+
+        state: dict = {"started": True, "block_index": 0}
+        chunk = {
+            "candidates": [{"finishReason": "SAFETY"}],
+            "usageMetadata": {},
+        }
+        events = translate_gemini_sse_chunk(chunk, state)
+        # Should have a text block with safety message
+        deltas = [e for e in events if e["event"] == "content_block_delta"]
+        assert len(deltas) == 1
+        assert "safety" in deltas[0]["data"]["delta"]["text"].lower()
+
+    def test_full_stream_round_trip(self):
+        """Test translate_stream with simulated SSE bytes."""
+        import asyncio
+
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+
+        sse_data = (
+            b'data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],'
+            b'"role":"model"}}],"usageMetadata":{"promptTokenCount":5},'
+            b'"responseId":"r1","modelVersion":"gemini-2.5-pro"}\n\n'
+            b'data: {"candidates":[{"content":{"parts":[{"text":" there"}],'
+            b'"role":"model"},"finishReason":"STOP"}],'
+            b'"usageMetadata":{"candidatesTokenCount":3},"responseId":"r1"}\n\n'
+        )
+
+        async def _chunks():
+            yield sse_data
+
+        async def _collect():
+            return [e async for e in provider.translate_stream(_chunks())]
+
+        events = asyncio.run(_collect())
+        event_types = [e["event"] for e in events]
+        assert "message_start" in event_types
+        assert "message_stop" in event_types
+        text_deltas = [
+            e["data"]["delta"]["text"]
+            for e in events
+            if e["event"] == "content_block_delta"
+            and e["data"].get("delta", {}).get("type") == "text_delta"
+        ]
+        assert "".join(text_deltas) == "Hi there"
