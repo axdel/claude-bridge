@@ -73,6 +73,7 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 
 - **Anthropic account** — for Claude Code ([console.anthropic.com](https://console.anthropic.com/))
 - **ChatGPT Plus** ($20/mo) — for the OpenAI/Codex provider (provides OAuth access)
+- **Google AI Studio** (free) — for the Gemini provider ([aistudio.google.com/apikey](https://aistudio.google.com/apikey))
 
 ### Software (macOS)
 
@@ -150,8 +151,8 @@ claude-codex -- -p opus   # pass flags through to claude
 Each provider gets its own launcher:
 ```bash
 claude-codex       # OpenAI GPT-5.4 via Codex
+claude-gemini      # Google Gemini (gemini-2.5-pro)
 # claude-xai      # xAI Grok (coming soon)
-# claude-gemini   # Google Gemini (coming soon)
 ```
 
 ### Verify it works
@@ -223,6 +224,8 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | Env Var | Default | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — uses standard Responses API when set |
+| `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — get from [AI Studio](https://aistudio.google.com/apikey) |
+| `GEMINI_MODEL` | `gemini-2.5-pro` | Default Gemini model (override to use gemini-2.5-flash, gemini-3.1-pro-preview, etc.) |
 | `REASONING_MODE` | `passthrough` | `passthrough` preserves thinking blocks, `drop` strips them |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `UPSTREAM_TIMEOUT` | `60`/`120` | Upstream request timeout in seconds (60s sync, 120s streaming) |
@@ -244,6 +247,7 @@ src/claude_bridge/
 ├── stream.py         # SSE parsing/formatting utilities
 └── providers/
     ├── openai.py     # OpenAI Codex: OAuth + Anthropic <-> Responses API
+    ├── gemini.py     # Google Gemini: API key + Anthropic <-> generateContent API
     └── xai.py        # xAI Grok: stub
 ```
 

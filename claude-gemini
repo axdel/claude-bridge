@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# claude-gemini — Launch Claude Code via Claude Bridge (Google Gemini)
+# https://github.com/axdel/claude-bridge
+#
+# Usage:
+#   claude-gemini              # from any directory
+#   claude-gemini --debug      # verbose bridge logs
+#   claude-gemini -- -p opus   # pass flags to claude after --
+set -eo pipefail
+
+BRIDGE_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+PORT=$((9000 + RANDOM % 999))
+BRIDGE_PID=""
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
+
+# Parse our flags (before --)
+CLAUDE_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --debug) LOG_LEVEL="DEBUG"; shift ;;
+        --)      shift; CLAUDE_ARGS=("$@"); break ;;
+        *)       CLAUDE_ARGS+=("$1"); shift ;;
+    esac
+done
+
+cleanup() {
+    if [[ -n "$BRIDGE_PID" ]] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
+        echo ""
+        echo "~~~ bridge stopped (pid $BRIDGE_PID) ~~~"
+        kill "$BRIDGE_PID" 2>/dev/null
+        wait "$BRIDGE_PID" 2>/dev/null
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# Start bridge in background
+export PYTHONPATH="${BRIDGE_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
+export LOG_LEVEL
+python3 -m claude_bridge --port "$PORT" --provider gemini 2>/dev/null &
+BRIDGE_PID=$!
+
+# Wait for bridge to accept connections (max 3s)
+for _ in $(seq 1 30); do
+    if python3 -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-pro}"
+cat <<'BANNER'
+
+       _                 _                                  _       _
+  ____| | __ _ _   _  __| | ___        __ _  ___ _ __ ___ (_)_ __ (_)
+ / ___| |/ _` | | | |/ _` |/ _ \ ____ / _` |/ _ \ '_ ` _ \| | '_ \| |
+| (__ | | (_| | |_| | (_| |  __/|____| (_| |  __/ | | | | | | | | | |
+ \___|_|\__,_|\__,_|\__,_|\___|      \__, |\___|_| |_| |_|_|_| |_|_|
+                                      |___/
+BANNER
+BRIDGE_VERSION=$(python3 -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
+echo " port:${PORT}  pid:${BRIDGE_PID}  model:${GEMINI_MODEL}  version:${BRIDGE_VERSION}"
+echo " by axdel  github.com/axdel/claude-bridge"
+echo ""
+
+# Run claude with bridge env
+(
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}"
+    export ANTHROPIC_AUTH_TOKEN=bridge-placeholder
+    unset ANTHROPIC_API_KEY
+    claude ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
+)
