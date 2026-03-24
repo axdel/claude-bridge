@@ -53,8 +53,8 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 ## Features
 
 - **Zero dependencies** — stdlib-only Python, no `pip install`
-- **Standard API key auth** — set `OPENAI_API_KEY` for the official OpenAI Responses API
-- **Codex OAuth fallback** — no API key? Falls back to Codex OAuth automatically
+- **Standard API key auth** — set `OPENAI_API_KEY` or `GEMINI_API_KEY` for official APIs
+- **Subscription OAuth** — no API key? Falls back to Codex OAuth (OpenAI) or Gemini CLI OAuth (Google) automatically
 - **Reasoning passthrough** — thinking blocks preserved by default, not silently stripped
 - **Auto-failover** — circuit breaker routes to fallback on Anthropic 429/500/502/503
 - **Retry with backoff** — transient HTTP errors retried once with 0.5s exponential backoff
@@ -151,7 +151,7 @@ claude-codex -- -p opus   # pass flags through to claude
 Each provider gets its own launcher:
 ```bash
 claude-codex       # OpenAI GPT-5.4 via Codex
-claude-gemini      # Google Gemini (gemini-2.5-pro)
+claude-gemini      # Google Gemini (gemini-3-pro-preview via subscription)
 # claude-xai      # xAI Grok (coming soon)
 ```
 
@@ -224,8 +224,8 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | Env Var | Default | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — uses standard Responses API when set |
-| `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — get from [AI Studio](https://aistudio.google.com/apikey) |
-| `GEMINI_MODEL` | `gemini-2.5-pro` | Default Gemini model (override to use gemini-2.5-flash, gemini-3.1-pro-preview, etc.) |
+| `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — get from [AI Studio](https://aistudio.google.com/apikey). When unset, falls back to Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) |
+| `GEMINI_MODEL` | `gemini-3-pro-preview` | Default Gemini model (OAuth default; API key defaults to `gemini-2.5-pro`) |
 | `REASONING_MODE` | `passthrough` | `passthrough` preserves thinking blocks, `drop` strips them |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `UPSTREAM_TIMEOUT` | `60`/`120` | Upstream request timeout in seconds (60s sync, 120s streaming) |
