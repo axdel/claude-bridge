@@ -681,7 +681,7 @@ def _unwrap_code_assist_response(envelope: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-_OAUTH_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+_OAUTH_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-pro-preview")
 
 
 class GeminiProvider:
