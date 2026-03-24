@@ -14,6 +14,10 @@ Add Google Gemini as second fallback provider (auth, translation, streaming, lau
 - [`244c390`](https://github.com/axdel/claude-bridge/commit/244c390) Add Gemini provider skeleton with API key auth
 Tasks: 5/5
 
+
+### Hotfixes
+- [`81583b0`](https://github.com/axdel/claude-bridge/commit/81583b0) Bump version to 0.5.0, update README test count 156→186
+
 ## 2026-03-23
 
 ### v0.4.0 — Developer Tooling + Reliability Fixes ([PR #5](https://github.com/axdel/claude-bridge/pull/5))
