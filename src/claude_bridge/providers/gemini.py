@@ -145,6 +145,15 @@ def _translate_messages(messages: list[dict], warnings: list[str]) -> list[dict]
     return contents
 
 
+def _strip_schema_key(schema: dict) -> dict:
+    """Recursively strip ``$schema`` from a JSON Schema — Gemini rejects it."""
+    return {
+        k: (_strip_schema_key(v) if isinstance(v, dict) else v)
+        for k, v in schema.items()
+        if k != "$schema"
+    }
+
+
 def anthropic_to_gemini(request: dict) -> tuple[dict, list[str]]:
     """Translate an Anthropic Messages API request to a Gemini generateContent request.
 
@@ -170,7 +179,7 @@ def anthropic_to_gemini(request: dict) -> tuple[dict, list[str]]:
         joined = "\n".join(block.get("text", "") for block in system)
         result["system_instruction"] = {"parts": [{"text": joined}]}
 
-    # Tools → function_declarations
+    # Tools → function_declarations (strip $schema — Gemini rejects it)
     if "tools" in request:
         result["tools"] = [
             {
@@ -178,7 +187,7 @@ def anthropic_to_gemini(request: dict) -> tuple[dict, list[str]]:
                     {
                         "name": t["name"],
                         "description": t.get("description", ""),
-                        "parameters": t.get("input_schema", {}),
+                        "parameters": _strip_schema_key(t.get("input_schema", {})),
                     }
                     for t in request["tools"]
                 ]
