@@ -1,6 +1,6 @@
 [project]
 name = "claude-bridge"
-version = "0.6.0"
+version = "0.6.1"
 description = "Use your Claude Code setup with any LLM provider — transparent API translation proxy"
 requires-python = ">=3.12"
 

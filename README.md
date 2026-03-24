@@ -65,7 +65,7 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
 - **Multi-provider** — adding a provider = one file, zero proxy changes
-- **202 tests** — 87% coverage enforced, type-checked with basedpyright, linted with ruff
+- **202 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -78,22 +78,25 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 ### Software (macOS)
 
 ```bash
-brew install python claude-code codex
+brew install python claude-code codex gemini
 
 # Verify
 python3 --version    # 3.12+
 claude --version
 codex --version
+gemini --version
 
-# Authenticate Codex with your ChatGPT Plus account
-codex login
-cat ~/.codex/auth.json   # should show access_token
+# Authenticate with your subscriptions
+codex login                        # ChatGPT Plus ($20/mo)
+gemini login                       # Google One AI Premium ($20/mo)
+cat ~/.codex/auth.json             # should show access_token
+cat ~/.gemini/oauth_creds.json     # should show access_token
 ```
 
 > **macOS only** for now (brew dependencies). Linux support is untested.
 > **No `pip install` needed** — the bridge is stdlib-only Python.
-> Codex CLI is only for the OpenAI provider — future providers (Grok, Gemini)
-> use standard API keys.
+> Codex CLI is for the OpenAI provider, Gemini CLI is for the Gemini provider.
+> Both use your existing subscriptions — no separate API keys needed.
 
 ## Install
 
@@ -101,12 +104,13 @@ cat ~/.codex/auth.json   # should show access_token
 git clone https://github.com/axdel/claude-bridge.git
 cd claude-bridge
 
-# Make the launcher available system-wide
+# Make the launchers available system-wide
 mkdir -p ~/.local/bin
 ln -sf "$(pwd)/claude-codex" ~/.local/bin/claude-codex
+ln -sf "$(pwd)/claude-gemini" ~/.local/bin/claude-gemini
 
 # Verify
-which claude-codex || echo 'Add to PATH: echo "export PATH=\$HOME/.local/bin:\$PATH" >> ~/.zshrc && source ~/.zshrc'
+which claude-codex claude-gemini || echo 'Add to PATH: echo "export PATH=\$HOME/.local/bin:\$PATH" >> ~/.zshrc && source ~/.zshrc'
 ```
 
 ## Usage
@@ -114,7 +118,8 @@ which claude-codex || echo 'Add to PATH: echo "export PATH=\$HOME/.local/bin:\$P
 ### One command (recommended)
 
 ```bash
-claude-codex
+claude-codex     # use OpenAI GPT-5.4 (ChatGPT Plus subscription)
+claude-gemini    # use Google Gemini 3 Flash (Google One AI Premium subscription)
 ```
 
 You'll see:
@@ -127,16 +132,23 @@ You'll see:
 
  port:9472  pid:12345  model:gpt-5.4
  by axdel  github.com/axdel/claude-bridge
+```
 
- ▐▛███▜▌   Claude Code v2.1.80
-▝▜█████▛▘  Sonnet 4.6 with high effort
-  ▘▘ ▝▝    ~/your-project
+or
 
-❯ ready for work
+```
+      _                 _                                _       _
+  ___| | __ _ _   _  __| | ___       __ _  ___ _ __ ___ (_)_ __ (_)
+ / __| |/ _` | | | |/ _` |/ _ \ ___ / _` |/ _ \ '_ ` _ \| | '_ \| |
+| (__| | (_| | |_| | (_| |  __/|___| (_| |  __/ | | | | | | | | | |
+ \___|_|\__,_|\__,_|\__,_|\___|     \__, |\___|_| |_| |_|_|_| |_|_|
+                                    |___/
+ port:9738  pid:59952  model:gemini-3-flash-preview
+ by axdel  github.com/axdel/claude-bridge
 ```
 
 > Claude Code's banner still says "Sonnet 4.6" — it doesn't know about the bridge.
-> The actual model answering is GPT-5.4.
+> The actual model answering is the one shown in the bridge banner.
 
 The bridge starts on a random port, launches Claude Code through it, and cleans up on exit.
 
@@ -144,20 +156,21 @@ The bridge starts on a random port, launches Claude Code through it, and cleans 
 
 ```bash
 claude-codex              # OpenAI/Codex (GPT-5.4)
+claude-gemini             # Google Gemini (gemini-3-flash-preview)
 claude-codex --debug      # show bridge translation logs
+claude-gemini --debug     # same for Gemini
 claude-codex -- -p opus   # pass flags through to claude
 ```
 
-Each provider gets its own launcher:
+Override the Gemini model:
 ```bash
-claude-codex       # OpenAI GPT-5.4 via Codex
-claude-gemini      # Google Gemini (gemini-3-pro-preview via subscription)
-# claude-xai      # xAI Grok (coming soon)
+GEMINI_MODEL=gemini-2.5-pro claude-gemini      # stable pro model
+GEMINI_MODEL=gemini-3.1-pro-preview claude-gemini  # latest pro (may have capacity limits)
 ```
 
 ### Verify it works
 
-After launching with `claude-codex`, paste this into Claude Code:
+After launching with `claude-codex` or `claude-gemini`, paste this into Claude Code:
 
 > Verify Claude Code uses the local bridge: check ANTHROPIC_BASE_URL, find the bridge port, hit /stats, send one test request, compare stats.
 
@@ -225,7 +238,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
 |---|---|---|
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — uses standard Responses API when set |
 | `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — get from [AI Studio](https://aistudio.google.com/apikey). When unset, falls back to Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) |
-| `GEMINI_MODEL` | `gemini-3-pro-preview` | Default Gemini model (OAuth default; API key defaults to `gemini-2.5-pro`) |
+| `GEMINI_MODEL` | `gemini-3-flash-preview` | Default Gemini model for OAuth. Override to `gemini-2.5-pro`, `gemini-3.1-pro-preview`, etc. API key mode defaults to `gemini-2.5-pro` |
 | `REASONING_MODE` | `passthrough` | `passthrough` preserves thinking blocks, `drop` strips them |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `UPSTREAM_TIMEOUT` | `60`/`120` | Upstream request timeout in seconds (60s sync, 120s streaming) |
@@ -278,7 +291,25 @@ src/claude_bridge/
 | `stop_reason: tool_use` | `status: completed` + function_call in output |
 
 > Uses OpenAI's **Responses API** (not Chat Completions) — richer tool call semantics
-> with `call_id`/`id` separation. Other providers will have their own translation maps.
+> with `call_id`/`id` separation.
+
+### Gemini Translation Map
+
+| Anthropic | Gemini generateContent API |
+|---|---|
+| `system` (str/blocks) | `system_instruction.parts[].text` |
+| `messages[role=user]` | `contents[role=user].parts[].text` |
+| `messages[role=assistant]` | `contents[role=model].parts[].text` |
+| `messages[].content[type=tool_use]` | `contents[].parts[].functionCall` |
+| `messages[].content[type=tool_result]` | `contents[].parts[].functionResponse` |
+| `tools[].input_schema` | `tools[0].function_declarations[].parameters` |
+| Tool ID: `toolu_xxx` | Tool ID: `call_gemini_xxx` (with thoughtSignature encoding) |
+| SSE: `content_block_delta` | SSE: `data:` chunks (complete JSON per chunk) |
+| `stop_reason: tool_use` | `finishReason: STOP` + functionCall in parts |
+
+> Uses Gemini's **generateContent API** via the Code Assist endpoint for OAuth
+> (subscription) or the public API for API key auth. `$schema`, `propertyNames`,
+> and other unsupported JSON Schema keywords are automatically stripped from tool definitions.
 
 ## Known Limitations
 
@@ -299,7 +330,7 @@ cd claude-bridge
 uv run pytest tests/ -v     # installs test deps on first run, shows coverage
 ```
 
-No external services — all 202 tests use mock HTTP servers. Coverage is enforced at 85% (currently 87%).
+No external services — all 202 tests use mock HTTP servers. Coverage is enforced at 80%.
 
 ## Comparison
 
@@ -335,10 +366,21 @@ through a proxy **may fall outside intended use**. This is the same approach tak
 1rgs/claude-code-proxy (3.3k stars) and others — none taken down as of March 2026,
 but past tolerance doesn't guarantee future acceptance.
 
-### xAI / Google
+### Google (Gemini CLI / Google One AI Premium)
 
-When implemented, these use standard API endpoints with your own API keys — straightforward
-client implementations within normal API terms.
+The Gemini provider uses the Gemini CLI OAuth flow (Google One AI Premium subscription).
+Per [Google's Terms](https://policies.google.com/terms), using the Code Assist endpoint
+through a proxy **may fall outside intended use**. This is the same approach as the OpenAI/Codex
+provider — reusing subscription credentials through a local proxy. The Gemini CLI OAuth
+credentials (client ID and secret) are intentionally public per
+[Google's OAuth documentation for installed applications](https://developers.google.com/identity/protocols/oauth2#installed).
+
+When using `GEMINI_API_KEY` instead, this is a standard API client within normal API terms.
+
+### xAI
+
+When implemented, uses standard API endpoints with your own API keys — straightforward
+client implementation within normal API terms.
 
 ### Your Responsibility
 
