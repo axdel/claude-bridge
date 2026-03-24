@@ -65,7 +65,7 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
 - **Multi-provider** — adding a provider = one file, zero proxy changes
-- **186 tests** — 87% coverage enforced, type-checked with basedpyright, linted with ruff
+- **202 tests** — 87% coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -299,7 +299,7 @@ cd claude-bridge
 uv run pytest tests/ -v     # installs test deps on first run, shows coverage
 ```
 
-No external services — all 186 tests use mock HTTP servers. Coverage is enforced at 85% (currently 87%).
+No external services — all 202 tests use mock HTTP servers. Coverage is enforced at 85% (currently 87%).
 
 ## Comparison
 
@@ -312,7 +312,7 @@ No external services — all 186 tests use mock HTTP servers. Coverage is enforc
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 186 | Minimal | Some |
+| Tests | 202 | Minimal | Some |
 
 ## Terms of Service Considerations
 
