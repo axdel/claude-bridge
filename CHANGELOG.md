@@ -4,6 +4,13 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-03-24
 
+### Gemini OAuth — Use Gemini CLI Subscription ([PR #7](https://github.com/axdel/claude-bridge/pull/7))
+Add gemini_oauth auth mode using Gemini CLI subscription (Google One AI Premium) — no API key needed. Default model gemini-3-pro-preview. 186→202 tests
+
+- [`c62f222`](https://github.com/axdel/claude-bridge/commit/c62f222) Update README for Gemini OAuth dual auth mode
+- [`56b5773`](https://github.com/axdel/claude-bridge/commit/56b5773) Add Gemini OAuth using Gemini CLI subscription
+Tasks: 5/5
+
 ### Gemini Provider — Second Fallback for Resilience ([PR #6](https://github.com/axdel/claude-bridge/pull/6))
 Add Google Gemini as second fallback provider (auth, translation, streaming, launcher) — 156→186 tests, 87% coverage
 
