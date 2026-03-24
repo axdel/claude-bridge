@@ -646,9 +646,9 @@ class TestCodeAssistEnvelope:
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "system_instruction": {"parts": [{"text": "be helpful"}]},
         }
-        wrapped = _wrap_code_assist_request(req, "gemini-3-pro-preview")
+        wrapped = _wrap_code_assist_request(req, "gemini-3-pro-preview", "test-project")
         assert wrapped["model"] == "gemini-3-pro-preview"
-        assert wrapped["project"] == "claude-bridge"
+        assert wrapped["project"] == "test-project"
         assert wrapped["request"]["contents"] == req["contents"]
         assert wrapped["request"]["systemInstruction"] == req["system_instruction"]
 

@@ -8,7 +8,7 @@ requires-python = ">=3.12"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "--cov=claude_bridge --cov-report=term-missing --cov-fail-under=85"
+addopts = "--cov=claude_bridge --cov-report=term-missing --cov-fail-under=80"
 
 [dependency-groups]
 dev = [

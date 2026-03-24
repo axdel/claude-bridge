@@ -486,6 +486,9 @@ def _parse_sse_data(raw: bytes, state: dict) -> list[dict]:
             parsed = json.loads(data_str)
         except (json.JSONDecodeError, ValueError):
             continue
+        # Unwrap Code Assist envelope if present
+        if "response" in parsed and "candidates" not in parsed:
+            parsed = parsed["response"]
         events.extend(translate_gemini_sse_chunk(parsed, state))
     return events
 
@@ -615,14 +618,40 @@ async def refresh_gemini_token(refresh_token: str, auth_path: Path | None = None
 # Code Assist envelope — wraps/unwraps requests for the OAuth endpoint
 # ---------------------------------------------------------------------------
 
-_DEFAULT_PROJECT = "claude-bridge"
+_LOAD_CODE_ASSIST_URL = f"{_CODE_ASSIST_URL}:loadCodeAssist"
+
+_cached_project: str | None = None
 
 
-def _wrap_code_assist_request(gemini_req: dict, model: str) -> dict:
+def _get_code_assist_project(auth_headers: dict[str, str]) -> str:
+    """Fetch the cloudaicompanionProject from the loadCodeAssist endpoint.
+
+    Caches the result — the project ID doesn't change within a session.
+    """
+    global _cached_project
+    if _cached_project is not None:
+        return _cached_project
+
+    req = urllib.request.Request(  # noqa: S310
+        _LOAD_CODE_ASSIST_URL, data=b"{}", method="POST"
+    )
+    req.add_header("Content-Type", "application/json")
+    for key, value in auth_headers.items():
+        req.add_header(key, value)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            data = json.loads(resp.read())
+            _cached_project = data.get("cloudaicompanionProject", "")
+            return _cached_project
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ValueError(f"Failed to load Code Assist project: {exc}") from exc
+
+
+def _wrap_code_assist_request(gemini_req: dict, model: str, project: str) -> dict:
     """Wrap a standard Gemini request in the Code Assist envelope."""
     return {
         "model": model,
-        "project": _DEFAULT_PROJECT,
+        "project": project,
         "request": {
             "contents": gemini_req.get("contents", []),
             "systemInstruction": gemini_req.get("system_instruction"),
@@ -667,16 +696,22 @@ class GeminiProvider:
         self.auth_mode = auth_mode
         self._api_key = api_key
         self._auth_path = auth_path
+        self._project: str = ""
         if auth_mode == "api_key":
             model = DEFAULT_MODEL
-            self.endpoint = f"{_BASE_URL}/models/{model}"
+            self.endpoint = (
+                f"{_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
+            )
         else:
             model = _OAUTH_DEFAULT_MODEL
-            self.endpoint = _CODE_ASSIST_URL
+            self.endpoint = f"{_CODE_ASSIST_URL}:streamGenerateContent?alt=sse"
         self._model = model
 
     async def authenticate(self) -> dict[str, str]:
-        """Return auth headers for the configured mode."""
+        """Return auth headers for the configured mode.
+
+        For OAuth mode, also resolves the Code Assist project on first call.
+        """
         if self.auth_mode == "api_key":
             api_key = self._api_key or os.environ.get("GEMINI_API_KEY", "").strip()
             if not api_key:
@@ -687,13 +722,19 @@ class GeminiProvider:
                 raise ValueError(msg)
             return {"x-goog-api-key": api_key}
         token = await get_gemini_bearer_token(self._auth_path)
-        return {"Authorization": f"Bearer {token}"}
+        headers = {"Authorization": f"Bearer {token}"}
+        # Resolve project on first auth (needs the Bearer token)
+        if not self._project:
+            self._project = await asyncio.to_thread(
+                _get_code_assist_project, headers
+            )
+        return headers
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
         """Translate Anthropic Messages request to Gemini format."""
         result, warnings = anthropic_to_gemini(anthropic_req)
         if self.auth_mode == "gemini_oauth":
-            result = _wrap_code_assist_request(result, self._model)
+            result = _wrap_code_assist_request(result, self._model, self._project)
         return result, warnings
 
     def translate_response(self, provider_resp: dict) -> dict:
