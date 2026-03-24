@@ -2,6 +2,18 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-03-24
+
+### Gemini Provider — Second Fallback for Resilience ([PR #6](https://github.com/axdel/claude-bridge/pull/6))
+Add Google Gemini as second fallback provider (auth, translation, streaming, launcher) — 156→186 tests, 87% coverage
+
+- [`69deb6c`](https://github.com/axdel/claude-bridge/commit/69deb6c) Add claude-gemini launcher and update README for Gemini provider
+- [`f7d78ca`](https://github.com/axdel/claude-bridge/commit/f7d78ca) Gemini SSE stream translation to Anthropic events
+- [`3546735`](https://github.com/axdel/claude-bridge/commit/3546735) Gemini response translation (gemini_to_anthropic)
+- [`e30c58b`](https://github.com/axdel/claude-bridge/commit/e30c58b) Gemini request translation (anthropic_to_gemini)
+- [`244c390`](https://github.com/axdel/claude-bridge/commit/244c390) Add Gemini provider skeleton with API key auth
+Tasks: 5/5
+
 ## 2026-03-23
 
 ### v0.4.0 — Developer Tooling + Reliability Fixes ([PR #5](https://github.com/axdel/claude-bridge/pull/5))
