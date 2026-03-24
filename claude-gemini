@@ -47,15 +47,15 @@ for _ in $(seq 1 30); do
     sleep 0.1
 done
 
-GEMINI_MODEL="${GEMINI_MODEL:-gemini-3-pro-preview}"
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-pro}"
 cat <<'BANNER'
 
-       _                 _                                  _       _
-  ____| | __ _ _   _  __| | ___        __ _  ___ _ __ ___ (_)_ __ (_)
- / ___| |/ _` | | | |/ _` |/ _ \ ____ / _` |/ _ \ '_ ` _ \| | '_ \| |
-| (__ | | (_| | |_| | (_| |  __/|____| (_| |  __/ | | | | | | | | | |
- \___|_|\__,_|\__,_|\__,_|\___|      \__, |\___|_| |_| |_|_|_| |_|_|
-                                      |___/
+      _                 _                                _       _
+  ___| | __ _ _   _  __| | ___       __ _  ___ _ __ ___ (_)_ __ (_)
+ / __| |/ _` | | | |/ _` |/ _ \ ___ / _` |/ _ \ '_ ` _ \| | '_ \| |
+| (__| | (_| | |_| | (_| |  __/|___| (_| |  __/ | | | | | | | | | |
+ \___|_|\__,_|\__,_|\__,_|\___|     \__, |\___|_| |_| |_|_|_| |_|_|
+                                    |___/
 BANNER
 BRIDGE_VERSION=$(python3 -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
 echo " port:${PORT}  pid:${BRIDGE_PID}  model:${GEMINI_MODEL}  version:${BRIDGE_VERSION}"
