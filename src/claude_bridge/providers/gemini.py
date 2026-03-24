@@ -203,12 +203,71 @@ def _has_cache_control(request: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_SAFETY_REFUSAL = (
+    "I cannot fulfill this request due to content safety policies. Please rephrase your request."
+)
+
+
 def gemini_to_anthropic(response: dict) -> dict:
     """Translate a Gemini generateContent response to Anthropic Messages format.
 
     Pure function — no I/O.
     """
-    raise NotImplementedError("T-003")
+    candidates = response.get("candidates", [])
+    candidate = candidates[0] if candidates else {}
+    finish_reason = candidate.get("finishReason", "STOP")
+    parts = candidate.get("content", {}).get("parts", [])
+
+    # Translate parts → Anthropic content blocks
+    content: list[dict] = []
+    has_tool_calls = False
+    for idx, part in enumerate(parts):
+        if "text" in part and not part.get("thought"):
+            content.append({"type": "text", "text": part["text"]})
+        elif "functionCall" in part:
+            has_tool_calls = True
+            fc = part["functionCall"]
+            gemini_id = fc.get("id", f"gemini_{idx}")
+            sig = part.get("thoughtSignature")
+            anthropic_id = _encode_tool_id(gemini_id, sig)
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": anthropic_id,
+                    "name": fc["name"],
+                    "input": fc.get("args", {}),
+                }
+            )
+
+    # Handle SAFETY finish with no content
+    if finish_reason == "SAFETY" and not content:
+        content.append({"type": "text", "text": _SAFETY_REFUSAL})
+
+    # Map stop reason
+    if has_tool_calls:
+        stop_reason = "tool_use"
+    elif finish_reason == "MAX_TOKENS":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+
+    # Usage
+    usage_meta = response.get("usageMetadata", {})
+    usage = {
+        "input_tokens": usage_meta.get("promptTokenCount", 0),
+        "output_tokens": usage_meta.get("candidatesTokenCount", 0),
+    }
+
+    resp_id = response.get("responseId", "unknown")
+    return {
+        "id": f"msg_bridge_{resp_id}",
+        "type": "message",
+        "role": "assistant",
+        "model": response.get("modelVersion", ""),
+        "stop_reason": stop_reason,
+        "content": content,
+        "usage": usage,
+    }
 
 
 # ---------------------------------------------------------------------------

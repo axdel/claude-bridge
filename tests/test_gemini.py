@@ -292,3 +292,157 @@ class TestAnthropicToGeminiTools:
         }
         _, warnings = anthropic_to_gemini(request)
         assert any("thinking" in w.lower() for w in warnings)
+
+
+# --- Response translation tests ---
+
+
+class TestGeminiToAnthropicText:
+    """Gemini response → Anthropic Messages format."""
+
+    def test_basic_text_response(self):
+        from claude_bridge.providers.gemini import gemini_to_anthropic
+
+        response = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "Hello!"}], "role": "model"},
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 3},
+            "responseId": "resp_123",
+            "modelVersion": "gemini-2.5-pro",
+        }
+        result = gemini_to_anthropic(response)
+        assert result["type"] == "message"
+        assert result["role"] == "assistant"
+        assert result["stop_reason"] == "end_turn"
+        assert result["content"][0]["type"] == "text"
+        assert result["content"][0]["text"] == "Hello!"
+        assert result["usage"]["input_tokens"] == 5
+        assert result["usage"]["output_tokens"] == 3
+
+    def test_max_tokens_stop_reason(self):
+        from claude_bridge.providers.gemini import gemini_to_anthropic
+
+        response = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "partial"}], "role": "model"},
+                    "finishReason": "MAX_TOKENS",
+                }
+            ],
+            "usageMetadata": {},
+            "responseId": "resp_456",
+        }
+        result = gemini_to_anthropic(response)
+        assert result["stop_reason"] == "max_tokens"
+
+    def test_safety_refusal_synthesized(self):
+        from claude_bridge.providers.gemini import gemini_to_anthropic
+
+        response = {
+            "candidates": [{"finishReason": "SAFETY"}],
+            "usageMetadata": {},
+            "responseId": "resp_safe",
+        }
+        result = gemini_to_anthropic(response)
+        assert result["stop_reason"] == "end_turn"
+        assert len(result["content"]) == 1
+        assert "safety" in result["content"][0]["text"].lower()
+
+    def test_empty_candidates(self):
+        from claude_bridge.providers.gemini import gemini_to_anthropic
+
+        response = {"candidates": [], "usageMetadata": {}, "responseId": "resp_empty"}
+        result = gemini_to_anthropic(response)
+        assert result["content"] == []
+        assert result["stop_reason"] == "end_turn"
+
+
+class TestGeminiToAnthropicToolUse:
+    """Gemini functionCall → Anthropic tool_use blocks."""
+
+    def test_function_call_translated(self):
+        from claude_bridge.providers.gemini import gemini_to_anthropic
+
+        response = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "id": "abc123",
+                                    "name": "get_weather",
+                                    "args": {"city": "NYC"},
+                                }
+                            }
+                        ],
+                        "role": "model",
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+            "responseId": "resp_fc",
+        }
+        result = gemini_to_anthropic(response)
+        assert result["stop_reason"] == "tool_use"
+        block = result["content"][0]
+        assert block["type"] == "tool_use"
+        assert block["name"] == "get_weather"
+        assert block["input"] == {"city": "NYC"}
+        assert block["id"].startswith("call_gemini_")
+
+    def test_function_call_without_id_gets_synthetic(self):
+        from claude_bridge.providers.gemini import gemini_to_anthropic
+
+        response = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"functionCall": {"name": "run_cmd", "args": {"cmd": "ls"}}}],
+                        "role": "model",
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {},
+            "responseId": "resp_noid",
+        }
+        result = gemini_to_anthropic(response)
+        block = result["content"][0]
+        assert block["id"].startswith("call_gemini_")
+
+    def test_thought_signature_encoded_in_id(self):
+        from claude_bridge.providers.gemini import _decode_tool_id, gemini_to_anthropic
+
+        response = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "id": "fc99",
+                                    "name": "edit",
+                                    "args": {},
+                                },
+                                "thoughtSignature": "secret-sig-data",
+                            }
+                        ],
+                        "role": "model",
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {},
+            "responseId": "resp_sig",
+        }
+        result = gemini_to_anthropic(response)
+        tool_id = result["content"][0]["id"]
+        gemini_id, sig = _decode_tool_id(tool_id)
+        assert gemini_id == "fc99"
+        assert sig == "secret-sig-data"
