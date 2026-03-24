@@ -24,6 +24,7 @@ Tasks: 5/5
 
 ### Hotfixes
 - [`81583b0`](https://github.com/axdel/claude-bridge/commit/81583b0) Bump version to 0.5.0, update README test count 156→186
+- [`e262612`](https://github.com/axdel/claude-bridge/commit/e262612) Bump version to 0.6.0, update README test count 186→202
 
 ## 2026-03-23
 
