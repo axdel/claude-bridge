@@ -679,7 +679,9 @@ def _get_code_assist_project(auth_headers: dict[str, str]) -> str:
         raise ValueError(f"Failed to load Code Assist project: {exc}") from exc
 
 
-def _wrap_code_assist_request(gemini_req: dict, model: str, project: str) -> dict:
+def _wrap_code_assist_request(
+    gemini_req: dict, model: str, project: str, session_id: str
+) -> dict:
     """Wrap a standard Gemini request in the Code Assist envelope."""
     inner: dict = {"contents": gemini_req.get("contents", [])}
     # Only include non-null optional fields — Gemini rejects null values
@@ -689,7 +691,12 @@ def _wrap_code_assist_request(gemini_req: dict, model: str, project: str) -> dic
         inner["tools"] = gemini_req["tools"]
     if gemini_req.get("generationConfig"):
         inner["generationConfig"] = gemini_req["generationConfig"]
-    return {"model": model, "project": project, "request": inner}
+    return {
+        "model": model,
+        "project": project,
+        "user_prompt_id": session_id,
+        "request": inner,
+    }
 
 
 def _unwrap_code_assist_response(envelope: dict) -> dict:
@@ -729,6 +736,9 @@ class GeminiProvider:
         self._api_key = api_key
         self._auth_path = auth_path
         self._project: str = ""
+        import uuid
+
+        self._session_id = str(uuid.uuid4())
         if auth_mode == "api_key":
             model = DEFAULT_MODEL
             self.endpoint = (
@@ -754,12 +764,17 @@ class GeminiProvider:
                 raise ValueError(msg)
             return {"x-goog-api-key": api_key}
         token = await get_gemini_bearer_token(self._auth_path)
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": f"GeminiCLI/claude-bridge ({os.uname().sysname})",
+        }
         # Resolve project on first auth (needs the Bearer token)
         if not self._project:
             self._project = await asyncio.to_thread(
                 _get_code_assist_project, headers
             )
+        # Route quota to user's project — critical for paid tier rate limits
+        headers["x-goog-user-project"] = self._project
         return headers
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -768,7 +783,9 @@ class GeminiProvider:
         # Gemini controls streaming via URL, not body — strip the field
         result.pop("stream", None)
         if self.auth_mode == "gemini_oauth":
-            result = _wrap_code_assist_request(result, self._model, self._project)
+            result = _wrap_code_assist_request(
+                result, self._model, self._project, self._session_id
+            )
         return result, warnings
 
     def translate_response(self, provider_resp: dict) -> dict:
