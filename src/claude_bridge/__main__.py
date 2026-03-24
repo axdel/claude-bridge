@@ -16,7 +16,7 @@ from claude_bridge.proxy import start_proxy
 logger = get_logger("main")
 
 
-def _detect_auth_mode() -> tuple[str, str | None]:
+def _detect_openai_auth_mode() -> tuple[str, str | None]:
     """Detect OpenAI auth mode from the environment.
 
     Returns ``(auth_mode, api_key)`` where:
@@ -27,6 +27,19 @@ def _detect_auth_mode() -> tuple[str, str | None]:
     if api_key:
         return "api_key", api_key
     return "codex_oauth", None
+
+
+def _detect_gemini_auth_mode() -> tuple[str, str | None]:
+    """Detect Gemini auth mode from the environment.
+
+    Returns ``(auth_mode, api_key)`` where:
+    - ``("api_key", "<key>")`` when ``GEMINI_API_KEY`` is set and non-empty
+    - ``("gemini_oauth", None)`` otherwise
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if api_key:
+        return "api_key", api_key
+    return "gemini_oauth", None
 
 
 def main() -> None:
@@ -60,20 +73,35 @@ def main() -> None:
     args = parser.parse_args()
     configure_logging()
 
-    # Detect auth mode for OpenAI provider
-    auth_mode, api_key = _detect_auth_mode()
-    if auth_mode == "api_key":
-        logger.info("Auth mode: api_key (OPENAI_API_KEY detected)")
+    # Detect auth mode per provider
+    provider = args.provider
+    provider_kwargs: dict = {}
+
+    if provider == "gemini":
+        auth_mode, api_key = _detect_gemini_auth_mode()
+        provider_kwargs["auth_mode"] = auth_mode
+        if api_key:
+            provider_kwargs["api_key"] = api_key
+        if auth_mode == "api_key":
+            logger.info("Gemini auth: api_key (GEMINI_API_KEY detected)")
+        else:
+            logger.info("Gemini auth: gemini_oauth (using Gemini CLI subscription)")
     else:
-        logger.info("Auth mode: codex_oauth (no OPENAI_API_KEY — falling back to Codex OAuth)")
+        auth_mode, api_key = _detect_openai_auth_mode()
+        provider_kwargs["auth_mode"] = auth_mode
+        if api_key:
+            provider_kwargs["api_key"] = api_key
+        if auth_mode == "api_key":
+            logger.info("Auth mode: api_key (OPENAI_API_KEY detected)")
+        else:
+            logger.info("Auth mode: codex_oauth (no OPENAI_API_KEY — falling back to Codex OAuth)")
 
     asyncio.run(
         _run(
             host=args.host,
             port=args.port,
-            provider_name=args.provider,
-            auth_mode=auth_mode,
-            api_key=api_key,
+            provider_name=provider,
+            provider_kwargs=provider_kwargs,
         )
     )
 
@@ -83,18 +111,14 @@ async def _run(
     host: str,
     port: int,
     provider_name: str | None = None,
-    auth_mode: str = "codex_oauth",
-    api_key: str | None = None,
+    provider_kwargs: dict | None = None,
 ) -> None:
     """Start the server and serve until interrupted."""
-    provider_kwargs = {"auth_mode": auth_mode}
-    if api_key is not None:
-        provider_kwargs["api_key"] = api_key
     server = await start_proxy(
         host=host,
         port=port,
         provider_name=provider_name,
-        provider_kwargs=provider_kwargs,
+        provider_kwargs=provider_kwargs or {},
     )
     async with server:
         await server.serve_forever()

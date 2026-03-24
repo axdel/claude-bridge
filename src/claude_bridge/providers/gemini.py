@@ -1,15 +1,26 @@
-"""Google Gemini provider — API key auth + Anthropic/Gemini translation (stdlib only)."""
+"""Google Gemini provider — OAuth + API key auth, Anthropic/Gemini translation (stdlib only)."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from claude_bridge.provider import PROVIDERS
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
+
+_GEMINI_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+_GEMINI_CLIENT_SECRET = "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"  # noqa: S105  # gitleaks:allow (intentionally public — Google desktop app credential, same as Gemini CLI source)
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105
+_DEFAULT_GEMINI_AUTH_PATH = Path.home() / ".gemini" / "oauth_creds.json"
 
 MODEL_MAP: dict[str, str] = {
     "claude-opus-4-6": "gemini-2.5-pro",
@@ -480,36 +491,215 @@ def _parse_sse_data(raw: bytes, state: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# OAuth token management — reads ~/.gemini/oauth_creds.json (same pattern as OpenAI Codex)
+# ---------------------------------------------------------------------------
+
+
+def read_gemini_auth(path: Path | None = None) -> dict:
+    """Read Gemini CLI OAuth credentials.
+
+    Raises:
+        FileNotFoundError: If oauth_creds.json doesn't exist (hint: run ``gemini login``).
+    """
+    auth_path = path or _DEFAULT_GEMINI_AUTH_PATH
+    if not auth_path.exists():
+        msg = (
+            f"Gemini auth file not found at {auth_path}. Run `gemini login` to authenticate first."
+        )
+        raise FileNotFoundError(msg)
+    return json.loads(auth_path.read_text())
+
+
+def _is_gemini_token_expired(creds: dict, margin_ms: int = 30_000) -> bool:
+    """Check if the Gemini OAuth token is expired using the expiry_date field.
+
+    Gemini CLI stores ``expiry_date`` as a Unix timestamp in milliseconds.
+    Returns True if expired or expiry_date is missing.
+    """
+    import time
+
+    expiry_ms = creds.get("expiry_date")
+    if expiry_ms is None:
+        return True
+    now_ms = int(time.time() * 1000)
+    return now_ms + margin_ms >= expiry_ms
+
+
+_gemini_refresh_lock = asyncio.Lock()
+
+
+async def get_gemini_bearer_token(auth_path: Path | None = None) -> str:
+    """Return a valid Gemini access token, refreshing if expired.
+
+    Uses an asyncio.Lock to prevent concurrent refresh stampede.
+    """
+    async with _gemini_refresh_lock:
+        creds = read_gemini_auth(auth_path)
+        token = creds.get("access_token", "")
+
+        if not _is_gemini_token_expired(creds):
+            return token
+
+        refresh_token = creds.get("refresh_token", "")
+        if not refresh_token:
+            msg = "Gemini auth missing refresh_token — run `gemini login` to re-authenticate."
+            raise ValueError(msg)
+
+        new_token = await refresh_gemini_token(refresh_token, auth_path=auth_path)
+        return new_token
+
+
+async def refresh_gemini_token(refresh_token: str, auth_path: Path | None = None) -> str:
+    """Exchange a refresh token for a new access token via Google OAuth2.
+
+    Updates the local oauth_creds.json atomically and returns the new access_token.
+    """
+    resolved_path = auth_path or _DEFAULT_GEMINI_AUTH_PATH
+
+    def _do_refresh() -> str:
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": _GEMINI_CLIENT_ID,
+                "client_secret": _GEMINI_CLIENT_SECRET,
+            }
+        ).encode()
+        req = urllib.request.Request(  # noqa: S310
+            _GOOGLE_TOKEN_URL, data=body, method="POST"
+        )
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+                token_data: dict = json.loads(resp.read())
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            raise ValueError(f"Gemini token refresh failed: {exc}") from exc
+
+        try:
+            new_access_token: str = token_data["access_token"]
+        except KeyError as exc:
+            raise ValueError(
+                "Gemini token refresh failed: response missing 'access_token'"
+            ) from exc
+
+        # Update expiry — Google returns expires_in (seconds)
+        import time
+
+        expires_in = token_data.get("expires_in", 3600)
+        new_expiry_ms = int(time.time() * 1000) + (expires_in * 1000)
+
+        new_refresh = token_data.get("refresh_token", refresh_token)
+
+        # Atomic write
+        current = json.loads(resolved_path.read_text()) if resolved_path.exists() else {}
+        current["access_token"] = new_access_token
+        current["refresh_token"] = new_refresh
+        current["expiry_date"] = new_expiry_ms
+
+        tmp_path = resolved_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(current, indent=2))
+        os.replace(tmp_path, resolved_path)
+
+        return new_access_token
+
+    return await asyncio.to_thread(_do_refresh)
+
+
+# ---------------------------------------------------------------------------
+# Code Assist envelope — wraps/unwraps requests for the OAuth endpoint
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PROJECT = "claude-bridge"
+
+
+def _wrap_code_assist_request(gemini_req: dict, model: str) -> dict:
+    """Wrap a standard Gemini request in the Code Assist envelope."""
+    return {
+        "model": model,
+        "project": _DEFAULT_PROJECT,
+        "request": {
+            "contents": gemini_req.get("contents", []),
+            "systemInstruction": gemini_req.get("system_instruction"),
+            "tools": gemini_req.get("tools", []),
+            "generationConfig": gemini_req.get("generationConfig"),
+        },
+    }
+
+
+def _unwrap_code_assist_response(envelope: dict) -> dict:
+    """Unwrap a Code Assist envelope to a standard Gemini response."""
+    inner = envelope.get("response", envelope)
+    return inner
+
+
+# ---------------------------------------------------------------------------
 # Concrete Provider implementation
 # ---------------------------------------------------------------------------
 
 
+_OAUTH_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-pro-preview")
+
+
 class GeminiProvider:
-    """Google Gemini provider implementing the Provider protocol."""
+    """Google Gemini provider implementing the Provider protocol.
+
+    Supports two auth modes:
+    - ``api_key``: uses GEMINI_API_KEY env var (x-goog-api-key header to public API)
+    - ``gemini_oauth``: uses Gemini CLI OAuth tokens (Bearer header to Code Assist endpoint)
+    """
 
     name = "gemini"
 
-    def __init__(self) -> None:
-        model = DEFAULT_MODEL
-        self.endpoint = f"{_BASE_URL}/models/{model}"
+    def __init__(
+        self,
+        *,
+        auth_mode: str = "gemini_oauth",
+        api_key: str | None = None,
+        auth_path: Path | None = None,
+        **_kwargs,
+    ) -> None:
+        self.auth_mode = auth_mode
+        self._api_key = api_key
+        self._auth_path = auth_path
+        if auth_mode == "api_key":
+            model = DEFAULT_MODEL
+            self.endpoint = f"{_BASE_URL}/models/{model}"
+        else:
+            model = _OAUTH_DEFAULT_MODEL
+            self.endpoint = _CODE_ASSIST_URL
+        self._model = model
 
     async def authenticate(self) -> dict[str, str]:
-        """Return Gemini auth header. Requires GEMINI_API_KEY env var."""
-        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        if not api_key:
-            msg = (
-                "GEMINI_API_KEY environment variable is required "
-                "for the Gemini provider but was not set or is empty."
-            )
-            raise ValueError(msg)
-        return {"x-goog-api-key": api_key}
+        """Return auth headers for the configured mode."""
+        if self.auth_mode == "api_key":
+            api_key = self._api_key or os.environ.get("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                msg = (
+                    "GEMINI_API_KEY environment variable is required for "
+                    "api_key auth mode but was not set or is empty."
+                )
+                raise ValueError(msg)
+            return {"x-goog-api-key": api_key}
+        token = await get_gemini_bearer_token(self._auth_path)
+        return {"Authorization": f"Bearer {token}"}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
-        """Translate Anthropic Messages request to Gemini generateContent request."""
-        return anthropic_to_gemini(anthropic_req)
+        """Translate Anthropic Messages request to Gemini format."""
+        result, warnings = anthropic_to_gemini(anthropic_req)
+        if self.auth_mode == "gemini_oauth":
+            result = _wrap_code_assist_request(result, self._model)
+        return result, warnings
 
     def translate_response(self, provider_resp: dict) -> dict:
-        """Translate Gemini response to Anthropic Messages response."""
+        """Translate Gemini response to Anthropic Messages format."""
+        if self.auth_mode == "gemini_oauth":
+            provider_resp = _unwrap_code_assist_response(provider_resp)
         return gemini_to_anthropic(provider_resp)
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:  # type: ignore[override]

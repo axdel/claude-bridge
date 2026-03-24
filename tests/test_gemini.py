@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 # --- Auth tests ---
@@ -10,23 +12,21 @@ import pytest
 class TestGeminiAuth:
     """GeminiProvider authentication via GEMINI_API_KEY."""
 
-    def test_authenticate_returns_api_key_header(self, monkeypatch):
-        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key-placeholder")
-        from claude_bridge.providers.gemini import GeminiProvider
-
-        provider = GeminiProvider()
+    def test_authenticate_returns_api_key_header(self):
         import asyncio
 
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(auth_mode="api_key", api_key="test-gemini-key-placeholder")
         headers = asyncio.run(provider.authenticate())
         assert headers == {"x-goog-api-key": "test-gemini-key-placeholder"}
 
-    def test_authenticate_missing_key_raises(self, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        from claude_bridge.providers.gemini import GeminiProvider
-
-        provider = GeminiProvider()
+    def test_authenticate_missing_key_raises(self):
         import asyncio
 
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(auth_mode="api_key")
         with pytest.raises(ValueError, match="GEMINI_API_KEY"):
             asyncio.run(provider.authenticate())
 
@@ -40,12 +40,10 @@ class TestGeminiAuth:
 
         assert GeminiProvider.name == "gemini"
 
-    def test_provider_endpoint_contains_model(self, monkeypatch):
-        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key-placeholder")
+    def test_provider_endpoint_contains_model_in_api_key_mode(self):
         from claude_bridge.providers.gemini import GeminiProvider
 
-        provider = GeminiProvider()
-        assert "generateContent" not in provider.endpoint
+        provider = GeminiProvider(auth_mode="api_key", api_key="test-key-placeholder")
         assert "v1beta/models/" in provider.endpoint
 
 
@@ -564,3 +562,185 @@ class TestGeminiStreamTranslation:
             and e["data"].get("delta", {}).get("type") == "text_delta"
         ]
         assert "".join(text_deltas) == "Hi there"
+
+
+# --- OAuth token management tests ---
+
+
+class TestGeminiOAuth:
+    """Gemini OAuth token management — read, expiry, refresh."""
+
+    def test_read_gemini_auth_missing_raises(self, tmp_path):
+        from claude_bridge.providers.gemini import read_gemini_auth
+
+        with pytest.raises(FileNotFoundError, match="gemini login"):
+            read_gemini_auth(tmp_path / "nonexistent.json")
+
+    def test_read_gemini_auth_returns_data(self, tmp_path):
+        from claude_bridge.providers.gemini import read_gemini_auth
+
+        auth_file = tmp_path / "oauth_creds.json"
+        auth_file.write_text(json.dumps({"access_token": "tok", "refresh_token": "ref"}))
+        data = read_gemini_auth(auth_file)
+        assert data["access_token"] == "tok"
+
+    def test_is_gemini_token_expired_future(self):
+        import time
+
+        from claude_bridge.providers.gemini import _is_gemini_token_expired
+
+        future_ms = int(time.time() * 1000) + 3_600_000
+        assert _is_gemini_token_expired({"expiry_date": future_ms}) is False
+
+    def test_is_gemini_token_expired_past(self):
+        from claude_bridge.providers.gemini import _is_gemini_token_expired
+
+        assert _is_gemini_token_expired({"expiry_date": 1000}) is True
+
+    def test_is_gemini_token_expired_missing(self):
+        from claude_bridge.providers.gemini import _is_gemini_token_expired
+
+        assert _is_gemini_token_expired({}) is True
+
+    def test_get_bearer_token_returns_valid(self, tmp_path):
+        import asyncio
+        import time
+
+        from claude_bridge.providers.gemini import get_gemini_bearer_token
+
+        auth_file = tmp_path / "oauth_creds.json"
+        future_ms = int(time.time() * 1000) + 3_600_000
+        auth_file.write_text(
+            json.dumps(
+                {
+                    "access_token": "valid-tok-placeholder",
+                    "refresh_token": "ref",
+                    "expiry_date": future_ms,
+                }
+            )
+        )
+        token = asyncio.run(get_gemini_bearer_token(auth_file))
+        assert token == "valid-tok-placeholder"
+
+    def test_get_bearer_token_missing_refresh_raises(self, tmp_path):
+        import asyncio
+
+        from claude_bridge.providers.gemini import get_gemini_bearer_token
+
+        auth_file = tmp_path / "oauth_creds.json"
+        auth_file.write_text(json.dumps({"access_token": "tok", "expiry_date": 1000}))
+        with pytest.raises(ValueError, match="refresh_token"):
+            asyncio.run(get_gemini_bearer_token(auth_file))
+
+
+# --- Code Assist envelope tests ---
+
+
+class TestCodeAssistEnvelope:
+    """Wrap/unwrap requests for the Code Assist endpoint."""
+
+    def test_wrap_request(self):
+        from claude_bridge.providers.gemini import _wrap_code_assist_request
+
+        req = {
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "system_instruction": {"parts": [{"text": "be helpful"}]},
+        }
+        wrapped = _wrap_code_assist_request(req, "gemini-3-pro-preview")
+        assert wrapped["model"] == "gemini-3-pro-preview"
+        assert wrapped["project"] == "claude-bridge"
+        assert wrapped["request"]["contents"] == req["contents"]
+        assert wrapped["request"]["systemInstruction"] == req["system_instruction"]
+
+    def test_unwrap_response(self):
+        from claude_bridge.providers.gemini import _unwrap_code_assist_response
+
+        envelope = {
+            "traceId": "abc",
+            "response": {
+                "candidates": [{"content": {"parts": [{"text": "hello"}], "role": "model"}}],
+                "usageMetadata": {"promptTokenCount": 5},
+            },
+        }
+        inner = _unwrap_code_assist_response(envelope)
+        assert "candidates" in inner
+        assert inner["candidates"][0]["content"]["parts"][0]["text"] == "hello"
+
+    def test_unwrap_passthrough_when_no_response_key(self):
+        from claude_bridge.providers.gemini import _unwrap_code_assist_response
+
+        plain = {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]}
+        assert _unwrap_code_assist_response(plain) == plain
+
+
+# --- Dual auth mode tests ---
+
+
+class TestGeminiDualAuth:
+    """GeminiProvider with api_key vs gemini_oauth auth modes."""
+
+    def test_api_key_mode_uses_public_endpoint(self):
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(auth_mode="api_key", api_key="test-key-placeholder")
+        assert "generativelanguage.googleapis.com" in provider.endpoint
+
+    def test_oauth_mode_uses_code_assist_endpoint(self):
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(auth_mode="gemini_oauth")
+        assert "cloudcode-pa.googleapis.com" in provider.endpoint
+
+    def test_api_key_auth_returns_header(self):
+        import asyncio
+
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(auth_mode="api_key", api_key="test-key-placeholder")
+        headers = asyncio.run(provider.authenticate())
+        assert headers == {"x-goog-api-key": "test-key-placeholder"}
+
+    def test_oauth_translate_request_wraps_envelope(self):
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(auth_mode="gemini_oauth")
+        request = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, _ = provider.translate_request(request)
+        assert "project" in result
+        assert "request" in result
+
+    def test_api_key_translate_request_no_envelope(self):
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(auth_mode="api_key", api_key="test-key-placeholder")
+        request = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, _ = provider.translate_request(request)
+        assert "contents" in result
+        assert "project" not in result
+
+    def test_oauth_translate_response_unwraps_envelope(self):
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(auth_mode="gemini_oauth")
+        envelope = {
+            "response": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hello"}], "role": "model"},
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2},
+                "responseId": "r1",
+            }
+        }
+        result = provider.translate_response(envelope)
+        assert result["content"][0]["text"] == "hello"

@@ -347,24 +347,24 @@ class TestDetectAuthMode:
 
     def test_api_key_present_selects_api_key_mode(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "test-key-placeholder")
-        from claude_bridge.__main__ import _detect_auth_mode
+        from claude_bridge.__main__ import _detect_openai_auth_mode
 
-        mode, key = _detect_auth_mode()
+        mode, key = _detect_openai_auth_mode()
         assert mode == "api_key"
         assert key == "test-key-placeholder"
 
     def test_empty_api_key_selects_codex_oauth(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "")
-        from claude_bridge.__main__ import _detect_auth_mode
+        from claude_bridge.__main__ import _detect_openai_auth_mode
 
-        mode, key = _detect_auth_mode()
+        mode, key = _detect_openai_auth_mode()
         assert mode == "codex_oauth"
         assert key is None
 
     def test_missing_api_key_selects_codex_oauth(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        from claude_bridge.__main__ import _detect_auth_mode
+        from claude_bridge.__main__ import _detect_openai_auth_mode
 
-        mode, key = _detect_auth_mode()
+        mode, key = _detect_openai_auth_mode()
         assert mode == "codex_oauth"
         assert key is None
