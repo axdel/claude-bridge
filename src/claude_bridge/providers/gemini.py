@@ -710,7 +710,7 @@ def _unwrap_code_assist_response(envelope: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-_OAUTH_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
+_OAUTH_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 class GeminiProvider:
@@ -773,8 +773,6 @@ class GeminiProvider:
             self._project = await asyncio.to_thread(
                 _get_code_assist_project, headers
             )
-        # Route quota to user's project — critical for paid tier rate limits
-        headers["x-goog-user-project"] = self._project
         return headers
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
