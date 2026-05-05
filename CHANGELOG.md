@@ -4,6 +4,9 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-05-05
 
+### v0.6.3 — gpt-5.5 + xhigh reasoning
+Release v0.6.3.
+
 ### v0.6.2 — gpt-5.5 + xhigh reasoning
 Update OpenAI provider to gpt-5.5 with reasoning effort xhigh for maximum code quality
 
