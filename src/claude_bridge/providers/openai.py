@@ -583,7 +583,7 @@ def translate_openai_sse_event(event: dict) -> list[dict]:
                 "event": "content_block_stop",
                 "data": {
                     "type": "content_block_stop",
-                    "index": data.get("output_index", data.get("content_index", 0)),
+                    "index": data.get("content_index", data.get("output_index", 0)),
                 },
             }
         ]
