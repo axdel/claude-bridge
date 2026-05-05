@@ -10,3 +10,12 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: uv-lock-sync
+        name: sync uv.lock with pyproject.toml
+        entry: bash -c 'uv lock --check 2>/dev/null || (uv lock && git add uv.lock)'
+        language: system
+        files: ^pyproject\.toml$
+        pass_filenames: false
