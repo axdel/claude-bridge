@@ -531,7 +531,7 @@ class TestOpenaiToAnthropicToolUse:
         assert len(result["content"]) == 1
         block = result["content"][0]
         assert block["type"] == "tool_use"
-        assert block["id"] == "call_abc"
+        assert block["id"] == "toolu_abc"
         assert block["name"] == "Edit"
         assert block["input"] == {"path": "/tmp/f.py"}
 

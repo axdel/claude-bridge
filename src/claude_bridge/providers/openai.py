@@ -151,15 +151,17 @@ def _to_openai_id(anthropic_id: str) -> str:
 def _to_anthropic_id(openai_id: str) -> str:
     """Convert OpenAI Responses API tool ID back to Anthropic format.
 
-    OpenAI uses ``fc_xxx``; Anthropic expects ``call_xxx`` or ``toolu_xxx``.
+    OpenAI uses ``fc_xxx``; Claude Code requires ``toolu_xxx`` prefix.
     """
     if not openai_id:
         return openai_id
-    if openai_id.startswith("fc_"):
-        return "call_" + openai_id[3:]
-    if openai_id.startswith("call_") or openai_id.startswith("toolu_"):
+    if openai_id.startswith("toolu_"):
         return openai_id
-    return "call_" + openai_id
+    if openai_id.startswith("fc_"):
+        return "toolu_" + openai_id[3:]
+    if openai_id.startswith("call_"):
+        return "toolu_" + openai_id[5:]
+    return "toolu_" + openai_id
 
 
 def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
