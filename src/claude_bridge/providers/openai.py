@@ -615,6 +615,40 @@ def translate_openai_sse_event(event: dict) -> list[dict]:
     return []
 
 
+def _remap_block_index(
+    event: dict,
+    index_map: dict[int, int],
+    next_index: int,
+    has_tool_calls: bool,
+) -> tuple[dict, int, bool]:
+    """Remap OpenAI output_index to sequential Anthropic block indices.
+
+    Returns (possibly-modified event, updated next_index, updated has_tool_calls).
+    """
+    data = event.get("data", {})
+
+    if event.get("event") == "content_block_start":
+        oai_index = data.get("index", 0)
+        index_map[oai_index] = next_index
+        data["index"] = next_index
+        if data.get("content_block", {}).get("type") == "tool_use":
+            has_tool_calls = True
+        return event, next_index + 1, has_tool_calls
+
+    if event.get("event") in ("content_block_delta", "content_block_stop"):
+        oai_index = data.get("index", 0)
+        data["index"] = index_map.get(oai_index, oai_index)
+        return event, next_index, has_tool_calls
+
+    if event.get("event") == "message_delta" and has_tool_calls:
+        delta = data.get("delta", {})
+        if delta.get("stop_reason") == "end_turn":
+            delta["stop_reason"] = "tool_use"
+        return event, next_index, has_tool_calls
+
+    return event, next_index, has_tool_calls
+
+
 # ---------------------------------------------------------------------------
 # Concrete Provider implementation
 # ---------------------------------------------------------------------------
@@ -672,27 +706,34 @@ class OpenAIProvider:
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw provider byte chunks to Anthropic SSE events.
 
-        Receives raw HTTP response bytes, handles SSE parsing (CRLF
-        normalization, double-newline splitting) and event translation.
-        Yields ``{event, data}`` dicts in Anthropic format.
+        Maintains a block index counter so Anthropic indices are sequential
+        starting at 0 (OpenAI output_index may have gaps from skipped items).
+        Also fixes stop_reason based on whether tool calls were emitted.
         """
         buffer = b""
+        block_index = 0
+        index_map: dict[int, int] = {}
+        has_tool_calls = False
+
         async for chunk in raw_chunks:
             buffer += chunk
-            # Normalize CRLF so the splitter works with both \r\n\r\n and \n\n
             buffer = buffer.replace(b"\r\n", b"\n")
-            # Process complete SSE events (terminated by double newline)
             while b"\n\n" in buffer:
                 event_end = buffer.index(b"\n\n") + 2
                 event_bytes = buffer[:event_end]
                 buffer = buffer[event_end:]
                 for parsed_event in parse_sse_events(event_bytes):
                     for translated in translate_openai_sse_event(parsed_event):
+                        translated, block_index, has_tool_calls = _remap_block_index(
+                            translated, index_map, block_index, has_tool_calls
+                        )
                         yield translated
-        # Process any remaining buffer
         if buffer.strip():
             for parsed_event in parse_sse_events(buffer):
                 for translated in translate_openai_sse_event(parsed_event):
+                    translated, block_index, has_tool_calls = _remap_block_index(
+                        translated, index_map, block_index, has_tool_calls
+                    )
                     yield translated
 
 
