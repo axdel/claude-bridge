@@ -151,43 +151,52 @@ def _translate_messages(messages: list[dict], warnings: list[str]) -> list[dict]
     return contents
 
 
-# Gemini only accepts a subset of JSON Schema. These keywords are rejected.
-_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+# Gemini accepts a strict subset of JSON Schema (OpenAPI 3.0.3 subset).
+# Allowlist approach: only pass through known-supported keywords.
+# Source: https://ai.google.dev/api/caching#Schema
+_SUPPORTED_SCHEMA_KEYS = frozenset(
     {
-        "$schema",
-        "$id",
-        "$ref",
-        "$comment",
-        "$defs",
-        "propertyNames",
-        "patternProperties",
-        "additionalItems",
-        "if",
-        "then",
-        "else",
-        "allOf",
-        "anyOf",
-        "oneOf",
-        "not",
-        "contentMediaType",
-        "contentEncoding",
-        "examples",
+        "type",
+        "format",
+        "title",
+        "description",
+        "nullable",
         "default",
-        "const",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
+        "example",
+        "enum",
+        "properties",
+        "required",
+        "minProperties",
+        "maxProperties",
+        "propertyOrdering",
+        "items",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minimum",
+        "maximum",
+        "anyOf",
     }
 )
 
 
 def _clean_schema(schema: dict) -> dict:
-    """Recursively strip unsupported JSON Schema keywords for Gemini."""
+    """Recursively keep only Gemini-supported JSON Schema keywords.
+
+    The `properties` value is a map of field names → sub-schemas, so we clean
+    each sub-schema but preserve the field names (they aren't schema keywords).
+    """
     cleaned: dict = {}
     for k, v in schema.items():
-        if k in _UNSUPPORTED_SCHEMA_KEYS:
+        if k not in _SUPPORTED_SCHEMA_KEYS:
             continue
-        if isinstance(v, dict):
+        if k == "properties" and isinstance(v, dict):
+            cleaned[k] = {prop: _clean_schema(sub) for prop, sub in v.items()}
+        elif k == "anyOf" and isinstance(v, list):
+            cleaned[k] = [_clean_schema(item) if isinstance(item, dict) else item for item in v]
+        elif isinstance(v, dict):
             cleaned[k] = _clean_schema(v)
         elif isinstance(v, list):
             cleaned[k] = [_clean_schema(item) if isinstance(item, dict) else item for item in v]
