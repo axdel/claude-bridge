@@ -39,7 +39,7 @@ _STRIPPED_KEYS = ("output_config",)
 # Format: "call_gemini_<id>" or "call_gemini_<id>:<base64_sig>" when signature present.
 # ---------------------------------------------------------------------------
 
-_GEMINI_ID_PREFIX = "call_gemini_"
+_GEMINI_ID_PREFIX = "toolu_gemini_"
 
 
 def _encode_tool_id(gemini_id: str, thought_signature: str | None = None) -> str:
@@ -51,11 +51,17 @@ def _encode_tool_id(gemini_id: str, thought_signature: str | None = None) -> str
     return base
 
 
+_LEGACY_GEMINI_ID_PREFIX = "call_gemini_"
+
+
 def _decode_tool_id(anthropic_id: str) -> tuple[str, str | None]:
     """Decode an Anthropic tool ID back to (gemini_id, thought_signature | None)."""
-    if not anthropic_id.startswith(_GEMINI_ID_PREFIX):
+    if anthropic_id.startswith(_GEMINI_ID_PREFIX):
+        remainder = anthropic_id[len(_GEMINI_ID_PREFIX) :]
+    elif anthropic_id.startswith(_LEGACY_GEMINI_ID_PREFIX):
+        remainder = anthropic_id[len(_LEGACY_GEMINI_ID_PREFIX) :]
+    else:
         return anthropic_id, None
-    remainder = anthropic_id[len(_GEMINI_ID_PREFIX) :]
     if ":" in remainder:
         gemini_id, sig_b64 = remainder.split(":", 1)
         try:
@@ -278,7 +284,7 @@ def gemini_to_anthropic(response: dict) -> dict:
     content: list[dict] = []
     has_tool_calls = False
     for idx, part in enumerate(parts):
-        if "text" in part and not part.get("thought"):
+        if "text" in part and part["text"] and not part.get("thought"):
             content.append({"type": "text", "text": part["text"]})
         elif "functionCall" in part:
             has_tool_calls = True
@@ -407,7 +413,7 @@ def translate_gemini_sse_chunk(chunk: dict, state: dict) -> list[dict]:
     block_idx = state.get("block_index", 0)
 
     for part in parts:
-        if "text" in part and not part.get("thought"):
+        if "text" in part and not part.get("thought") and part["text"]:
             # Start a text block if this is new
             if not state.get("text_block_open"):
                 state["text_block_open"] = True
@@ -435,6 +441,7 @@ def translate_gemini_sse_chunk(chunk: dict, state: dict) -> list[dict]:
                 state["text_block_open"] = False
                 block_idx += 1
 
+            state["has_tool_calls"] = True
             fc = part["functionCall"]
             gemini_id = fc.get("id", f"gemini_{block_idx}")
             sig = part.get("thoughtSignature")
@@ -508,7 +515,10 @@ def translate_gemini_sse_chunk(chunk: dict, state: dict) -> list[dict]:
                 "data": {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason},
-                    "usage": {"output_tokens": usage.get("candidatesTokenCount", 0)},
+                    "usage": {
+                        "input_tokens": usage.get("promptTokenCount", 0),
+                        "output_tokens": usage.get("candidatesTokenCount", 0),
+                    },
                 },
             }
         )
@@ -693,7 +703,7 @@ def _get_code_assist_project(auth_headers: dict[str, str]) -> str:
                     f"Response keys: {list(data.keys())}"
                 )
             _cached_project = project
-            return _cached_project
+            return project
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
         raise ValueError(f"Failed to load Code Assist project: {exc}") from exc
 

@@ -392,7 +392,7 @@ class TestGeminiToAnthropicToolUse:
         assert block["type"] == "tool_use"
         assert block["name"] == "get_weather"
         assert block["input"] == {"city": "NYC"}
-        assert block["id"].startswith("call_gemini_")
+        assert block["id"].startswith("toolu_gemini_")
 
     def test_function_call_without_id_gets_synthetic(self):
         from claude_bridge.providers.gemini import gemini_to_anthropic
@@ -412,7 +412,7 @@ class TestGeminiToAnthropicToolUse:
         }
         result = gemini_to_anthropic(response)
         block = result["content"][0]
-        assert block["id"].startswith("call_gemini_")
+        assert block["id"].startswith("toolu_gemini_")
 
     def test_thought_signature_encoded_in_id(self):
         from claude_bridge.providers.gemini import _decode_tool_id, gemini_to_anthropic
