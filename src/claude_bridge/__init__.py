@@ -22,4 +22,4 @@ Adding a new provider:
     4. Set ``LLM_BRIDGE_FALLBACK=<name>`` or ``--provider <name>``
 """
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
