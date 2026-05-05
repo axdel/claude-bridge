@@ -520,7 +520,10 @@ def _sse_response_completed(data: dict) -> list[dict]:
             "data": {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason},
-                "usage": {"output_tokens": usage.get("output_tokens", 0)},
+                "usage": {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                },
             },
         },
         {"event": "message_stop", "data": {"type": "message_stop"}},
