@@ -146,14 +146,33 @@ def _translate_messages(messages: list[dict], warnings: list[str]) -> list[dict]
 
 
 # Gemini only accepts a subset of JSON Schema. These keywords are rejected.
-_UNSUPPORTED_SCHEMA_KEYS = frozenset({
-    "$schema", "$id", "$ref", "$comment", "$defs",
-    "propertyNames", "patternProperties", "additionalItems",
-    "if", "then", "else", "allOf", "anyOf", "oneOf", "not",
-    "contentMediaType", "contentEncoding",
-    "examples", "default", "const", "deprecated",
-    "readOnly", "writeOnly",
-})
+_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+    {
+        "$schema",
+        "$id",
+        "$ref",
+        "$comment",
+        "$defs",
+        "propertyNames",
+        "patternProperties",
+        "additionalItems",
+        "if",
+        "then",
+        "else",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "contentMediaType",
+        "contentEncoding",
+        "examples",
+        "default",
+        "const",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    }
+)
 
 
 def _clean_schema(schema: dict) -> dict:
@@ -679,9 +698,7 @@ def _get_code_assist_project(auth_headers: dict[str, str]) -> str:
         raise ValueError(f"Failed to load Code Assist project: {exc}") from exc
 
 
-def _wrap_code_assist_request(
-    gemini_req: dict, model: str, project: str, session_id: str
-) -> dict:
+def _wrap_code_assist_request(gemini_req: dict, model: str, project: str, session_id: str) -> dict:
     """Wrap a standard Gemini request in the Code Assist envelope."""
     inner: dict = {"contents": gemini_req.get("contents", [])}
     # Only include non-null optional fields — Gemini rejects null values
@@ -741,9 +758,7 @@ class GeminiProvider:
         self._session_id = str(uuid.uuid4())
         if auth_mode == "api_key":
             model = DEFAULT_MODEL
-            self.endpoint = (
-                f"{_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
-            )
+            self.endpoint = f"{_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
         else:
             model = _OAUTH_DEFAULT_MODEL
             self.endpoint = f"{_CODE_ASSIST_URL}:streamGenerateContent?alt=sse"
@@ -770,9 +785,7 @@ class GeminiProvider:
         }
         # Resolve project on first auth (needs the Bearer token)
         if not self._project:
-            self._project = await asyncio.to_thread(
-                _get_code_assist_project, headers
-            )
+            self._project = await asyncio.to_thread(_get_code_assist_project, headers)
         return headers
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
