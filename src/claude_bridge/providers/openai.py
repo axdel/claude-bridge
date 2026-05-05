@@ -120,11 +120,11 @@ async def refresh_access_token(refresh_token: str, auth_path: Path | None = None
 # ---------------------------------------------------------------------------
 
 MODEL_MAP: dict[str, str] = {
-    "claude-opus-4-6": "gpt-5.4",
-    "claude-sonnet-4-6": "gpt-5.4",
-    "claude-haiku-4-5-20251001": "gpt-5.4",
+    "claude-opus-4-6": "gpt-5.5",
+    "claude-sonnet-4-6": "gpt-5.5",
+    "claude-haiku-4-5-20251001": "gpt-5.5",
 }
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = "gpt-5.5"
 
 _STRIPPED_KEYS = ("output_config",)
 
@@ -330,6 +330,7 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     # Build result — Codex endpoint requires stream: true
     result: dict = {
         "model": translated_model,
+        "reasoning": {"effort": "xhigh"},
         "store": False,
         "stream": True,
     }

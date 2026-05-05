@@ -28,7 +28,7 @@ class TestAnthropicToOpenaiTextOnly:
         }
         result, warnings = anthropic_to_openai(request)
 
-        assert result["model"] == "gpt-5.4"
+        assert result["model"] == "gpt-5.5"
         assert result["store"] is False
         assert "max_output_tokens" not in result  # Codex endpoint doesn't support it
         assert len(result["input"]) == 1
@@ -443,7 +443,7 @@ class TestOpenaiToAnthropicTextOnly:
     def test_basic_text_response(self):
         response = {
             "id": "resp_abc123",
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "status": "completed",
             "output": [
                 {
@@ -459,7 +459,7 @@ class TestOpenaiToAnthropicTextOnly:
         assert result["id"] == "msg_bridge_resp_abc123"
         assert result["type"] == "message"
         assert result["role"] == "assistant"
-        assert result["model"] == "gpt-5.4"
+        assert result["model"] == "gpt-5.5"
         assert result["stop_reason"] == "end_turn"
         assert result["content"] == [{"type": "text", "text": "Hello back!"}]
         assert result["usage"] == {"input_tokens": 10, "output_tokens": 5}
@@ -467,7 +467,7 @@ class TestOpenaiToAnthropicTextOnly:
     def test_incomplete_status_maps_to_max_tokens(self):
         response = {
             "id": "resp_xyz",
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "status": "incomplete",
             "output": [
                 {
@@ -484,7 +484,7 @@ class TestOpenaiToAnthropicTextOnly:
     def test_unknown_status_defaults_to_end_turn(self):
         response = {
             "id": "resp_unk",
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "status": "cancelled",
             "output": [],
             "usage": {"input_tokens": 0, "output_tokens": 0},
@@ -494,7 +494,7 @@ class TestOpenaiToAnthropicTextOnly:
 
     def test_missing_id_uses_unknown(self):
         response = {
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "status": "completed",
             "output": [],
             "usage": {"input_tokens": 0, "output_tokens": 0},
@@ -514,7 +514,7 @@ class TestOpenaiToAnthropicToolUse:
     def test_function_call_to_tool_use(self):
         response = {
             "id": "resp_tools",
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "status": "completed",
             "output": [
                 {
@@ -538,7 +538,7 @@ class TestOpenaiToAnthropicToolUse:
     def test_mixed_text_and_tool_use(self):
         response = {
             "id": "resp_mixed",
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "status": "completed",
             "output": [
                 {
@@ -573,7 +573,7 @@ class TestTranslationRobustness:
         """json.loads on malformed arguments falls back to _raw wrapper."""
         response = {
             "id": "resp_bad",
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "status": "completed",
             "output": [
                 {
@@ -706,7 +706,7 @@ class TestTranslationRobustness:
         """Empty string arguments parses to empty dict."""
         response = {
             "id": "resp_empty",
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "status": "completed",
             "output": [
                 {

@@ -215,7 +215,7 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
         resp = {
             "id": "resp_test123",
             "status": "completed",
-            "model": "gpt-5.4",
+            "model": "gpt-5.5",
             "output": [
                 {
                     "type": "message",

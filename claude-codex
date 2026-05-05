@@ -57,7 +57,7 @@ cat <<'BANNER'
 
 BANNER
 BRIDGE_VERSION=$(python3 -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
-echo " port:${PORT}  pid:${BRIDGE_PID}  model:gpt-5.4  version:${BRIDGE_VERSION}"
+echo " port:${PORT}  pid:${BRIDGE_PID}  model:gpt-5.5  version:${BRIDGE_VERSION}"
 echo " by axdel  github.com/axdel/claude-bridge"
 echo ""
 

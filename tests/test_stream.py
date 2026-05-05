@@ -102,7 +102,7 @@ class TestOpenAIToAnthropicSSETranslation:
                 "type": "response.created",
                 "response": {
                     "id": "resp_123",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.5",
                     "status": "in_progress",
                     "usage": {"input_tokens": 42, "output_tokens": 0},
                 },
@@ -181,7 +181,7 @@ class TestOpenAIToAnthropicSSETranslation:
                 "type": "response.completed",
                 "response": {
                     "id": "resp_456",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.5",
                     "status": "completed",
                     "usage": {"input_tokens": 10, "output_tokens": 25},
                 },
@@ -218,7 +218,7 @@ class TestOpenAIToAnthropicSSETranslation:
                 "type": "response.completed",
                 "response": {
                     "id": "resp_789",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.5",
                     "status": "incomplete",
                     "usage": {"input_tokens": 5, "output_tokens": 100},
                 },
@@ -260,7 +260,7 @@ class TestTranslateStream:
                 "type": "response.created",
                 "response": {
                     "id": "resp_1",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.5",
                     "status": "in_progress",
                     "usage": {"input_tokens": 10, "output_tokens": 0},
                 },

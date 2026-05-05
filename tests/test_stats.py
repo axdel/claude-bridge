@@ -89,7 +89,7 @@ class TestBridgeStats:
 
     def test_set_provider_info(self):
         stats = BridgeStats()
-        stats.set_provider_info("openai", "gpt-5.4")
+        stats.set_provider_info("openai", "gpt-5.5")
         snap = stats.snapshot()
         assert snap["provider_name"] == "openai"
-        assert snap["model"] == "gpt-5.4"
+        assert snap["model"] == "gpt-5.5"
