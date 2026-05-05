@@ -2,6 +2,11 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-05-05
+
+### Hotfixes
+- [`626f148`](https://github.com/axdel/claude-bridge/commit/626f148) update codex model to gpt-5.5 with xhigh reasoning effort
+
 ## 2026-03-24
 
 ### Gemini OAuth — Use Gemini CLI Subscription ([PR #7](https://github.com/axdel/claude-bridge/pull/7))
