@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from claude_bridge.providers.openai import (
     OpenAIProvider,
     _to_anthropic_id,
@@ -361,7 +359,7 @@ class TestRequestInvariants:
 
 
 # ---------------------------------------------------------------------------
-# tool_choice + parallel controls — NOT YET IMPLEMENTED (T-002)
+# tool_choice + parallel controls
 # ---------------------------------------------------------------------------
 
 
@@ -383,32 +381,40 @@ class TestToolChoiceContract:
             "tool_choice": tool_choice,
         }
 
-    @pytest.mark.xfail(strict=True, reason="T-002 implements tool_choice mapping")
     def test_auto_maps_to_auto(self):
         result, _ = anthropic_to_openai(self._request({"type": "auto"}))
         assert result["tool_choice"] == "auto"
 
-    @pytest.mark.xfail(strict=True, reason="T-002 implements tool_choice mapping")
     def test_none_maps_to_none(self):
         result, _ = anthropic_to_openai(self._request({"type": "none"}))
         assert result["tool_choice"] == "none"
 
-    @pytest.mark.xfail(strict=True, reason="T-002 implements tool_choice mapping")
     def test_any_maps_to_required(self):
         result, _ = anthropic_to_openai(self._request({"type": "any"}))
         assert result["tool_choice"] == "required"
 
-    @pytest.mark.xfail(strict=True, reason="T-002 implements tool_choice mapping")
     def test_named_tool_maps_to_forced_function(self):
         result, _ = anthropic_to_openai(self._request({"type": "tool", "name": "Read"}))
         assert result["tool_choice"] == {"type": "function", "name": "Read"}
+
+    def test_absent_tool_choice_omits_the_field(self):
+        # No policy requested → provider default; the bridge must not invent one.
+        result, _ = anthropic_to_openai(
+            {"model": "claude-opus-4-6", "messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert "tool_choice" not in result
+
+    def test_unknown_tool_choice_type_warns_and_omits(self):
+        # Unsupported policy degrades safely: warn, and omit rather than guess.
+        result, warnings = anthropic_to_openai(self._request({"type": "totally_new"}))
+        assert "tool_choice" not in result
+        assert any("totally_new" in w for w in warnings)
 
 
 class TestParallelToolContract:
     """Anthropic ``disable_parallel_tool_use`` must serialize tool calls on the
     provider side, or Claude Code's one-at-a-time tool loop breaks."""
 
-    @pytest.mark.xfail(strict=True, reason="T-002 implements parallel_tool_calls mapping")
     def test_disable_parallel_maps_to_parallel_tool_calls_false(self):
         request = {
             "model": "claude-opus-4-6",
@@ -418,6 +424,19 @@ class TestParallelToolContract:
         }
         result, _ = anthropic_to_openai(request)
         assert result["parallel_tool_calls"] is False
+
+    def test_parallel_not_constrained_when_not_disabled(self):
+        # Default Anthropic behavior allows parallel tools; the bridge must not
+        # silently force serialization when the client did not ask for it.
+        result, _ = anthropic_to_openai(
+            {
+                "model": "claude-opus-4-6",
+                "tools": [{"name": "Read", "description": "", "input_schema": {}}],
+                "messages": [{"role": "user", "content": "hi"}],
+                "tool_choice": {"type": "auto"},
+            }
+        )
+        assert "parallel_tool_calls" not in result
 
 
 # ---------------------------------------------------------------------------

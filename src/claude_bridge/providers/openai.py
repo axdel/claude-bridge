@@ -303,6 +303,33 @@ def _has_cache_control(request: dict) -> bool:
     return False
 
 
+def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
+    """Map an Anthropic ``tool_choice`` to OpenAI Responses request fields.
+
+    Returns ``(fields, warnings)`` where ``fields`` carries the keys to merge into
+    the translated request: ``tool_choice`` (``"auto"``/``"none"``/``"required"`` or a
+    forced ``{"type": "function", "name": ...}`` object) and ``parallel_tool_calls``
+    when Anthropic's ``disable_parallel_tool_use`` is set. Unsupported choice types
+    are omitted with a warning rather than guessed.
+    """
+    fields: dict = {}
+    warnings: list[str] = []
+    choice_type = tool_choice.get("type")
+    if choice_type == "auto":
+        fields["tool_choice"] = "auto"
+    elif choice_type == "none":
+        fields["tool_choice"] = "none"
+    elif choice_type == "any":
+        fields["tool_choice"] = "required"
+    elif choice_type == "tool":
+        fields["tool_choice"] = {"type": "function", "name": tool_choice["name"]}
+    else:
+        warnings.append(f"Unsupported tool_choice type '{choice_type}', omitting tool_choice")
+    if tool_choice.get("disable_parallel_tool_use"):
+        fields["parallel_tool_calls"] = False
+    return fields, warnings
+
+
 def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     """Translate an Anthropic Messages API request to an OpenAI Responses API request.
 
@@ -364,6 +391,13 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
             }
             for tool in request["tools"]
         ]
+
+    # tool_choice / parallel controls — preserve Claude Code's requested tool policy
+    tool_choice = request.get("tool_choice")
+    if tool_choice is not None:
+        tc_fields, tc_warnings = _translate_tool_choice(tool_choice)
+        result.update(tc_fields)
+        warnings.extend(tc_warnings)
 
     # Messages → input
     input_items: list[dict] = []
