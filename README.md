@@ -330,7 +330,23 @@ cd claude-bridge
 uv run pytest tests/ -v     # installs test deps on first run, shows coverage
 ```
 
-No external services — all 202 tests use mock HTTP servers. Coverage is enforced at 80%.
+No external services — every test uses mock HTTP servers or pure-function
+fixtures. Coverage is enforced at 80%.
+
+### Mutation testing
+
+Mutation testing (dev-only — `pytest-gremlins`, never a runtime dependency)
+checks that the tests actually constrain behavior rather than merely execute it.
+Always scope it to the source files you changed; an unscoped run mutates the
+whole tree — slower, and noisy with unrelated survivors:
+
+```bash
+CHANGED=$(git diff --name-only HEAD -- '*.py' | rg -v '(^|/)tests?/' | paste -sd, -)
+uv run pytest --no-cov --gremlins \
+  --gremlin-targets="$CHANGED" --gremlin-parallel --gremlin-cache
+```
+
+Target: ≥85% kill rate on changed source files (zero survivors for auth code).
 
 ## Comparison
 
