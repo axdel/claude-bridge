@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import os
 import sys
@@ -76,3 +77,39 @@ def get_logger(name: str) -> logging.Logger:
     The logger inherits its level from the parent configured by ``configure_logging()``.
     """
     return logging.getLogger(f"{_NAMESPACE}.{name}")
+
+
+# ---------------------------------------------------------------------------
+# Redacted compatibility trace — structural-only, env-gated, never raises
+# ---------------------------------------------------------------------------
+
+_TRACE_ENV = "CLAUDE_BRIDGE_TRACE_PATH"
+
+
+def is_trace_enabled() -> bool:
+    """Return True when compatibility tracing is enabled via ``CLAUDE_BRIDGE_TRACE_PATH``.
+
+    Read at call time (not import time) so the environment can change between runs
+    and tests can toggle it without re-importing the module.
+    """
+    return bool(os.environ.get(_TRACE_ENV))
+
+
+def trace_event(event: str, fields: dict) -> None:
+    """Append one structural trace line to the trace file when tracing is enabled.
+
+    Writes a single JSON object per line: ``{"req": <id>, "event": <name>, **fields}``.
+    The sink is content-agnostic: callers MUST pass only structural data (counts,
+    types, names, ids, lengths) — redaction is the caller's contract, never the
+    sink's. Any failure (disabled, unwritable path, serialization error) is
+    swallowed so tracing can never break or fail a user request.
+    """
+    path = os.environ.get(_TRACE_ENV)
+    if not path:
+        return
+    try:
+        record = {"req": request_id_var.get(""), "event": event, **fields}
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except Exception:
+        get_logger("trace").debug("trace write failed", exc_info=True)

@@ -15,7 +15,7 @@ import time as _time
 import urllib.error
 import urllib.request
 
-from claude_bridge.log import get_logger, request_id_var
+from claude_bridge.log import get_logger, is_trace_enabled, request_id_var, trace_event
 from claude_bridge.provider import PROVIDERS, Provider
 from claude_bridge.router import Router
 from claude_bridge.stats import BridgeStats
@@ -267,6 +267,177 @@ def _is_streaming(body: bytes) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Redacted compatibility trace — structural summaries + self-guarding hooks.
+#
+# The summarizers below are the redaction allowlist: each constructs a dict of
+# explicitly named structural fields (counts, type names, tool names, lengths,
+# token totals, stop reasons). They NEVER copy prompt text, tool arguments,
+# tool results, reasoning payloads, request headers, or credentials into the
+# trace. Redaction is enforced by construction here, not by discipline at the
+# call sites. The hooks self-guard on ``is_trace_enabled()`` so the host
+# functions carry zero added complexity and zero overhead when tracing is off.
+# ---------------------------------------------------------------------------
+
+
+def _block_type_counts(blocks: object) -> dict[str, int]:
+    """Count content blocks by their ``type`` field — structure only, no content."""
+    counts: dict[str, int] = {}
+    if not isinstance(blocks, list):
+        return counts
+    for block in blocks:
+        if isinstance(block, dict):
+            block_type = str(block.get("type", "unknown"))
+            counts[block_type] = counts.get(block_type, 0) + 1
+    return counts
+
+
+def _summarize_anthropic_request(request: dict) -> dict:
+    """Structural-only summary of an inbound Anthropic request.
+
+    Emits model, stream flag, message/tool counts, tool names, top-level block
+    type counts, the tool_choice *type*, and the system prompt *length* — never
+    any prompt text, tool argument, or tool result.
+    """
+    messages = request.get("messages")
+    message_list = messages if isinstance(messages, list) else []
+    block_types: dict[str, int] = {}
+    for message in message_list:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            block_types["text"] = block_types.get("text", 0) + 1
+        else:
+            for block_type, count in _block_type_counts(content).items():
+                block_types[block_type] = block_types.get(block_type, 0) + count
+    tools = request.get("tools") or []
+    tool_names = sorted(str(tool.get("name", "")) for tool in tools if isinstance(tool, dict))
+    tool_choice = request.get("tool_choice")
+    system = request.get("system")
+    return {
+        "model": str(request.get("model", "")),
+        "stream": bool(request.get("stream")),
+        "message_count": len(message_list),
+        "system_chars": len(json.dumps(system)) if system is not None else 0,
+        "block_types": block_types,
+        "tool_count": len(tools),
+        "tool_names": tool_names,
+        "tool_choice": tool_choice.get("type") if isinstance(tool_choice, dict) else tool_choice,
+    }
+
+
+def _summarize_provider_request(translated: dict, warning_count: int) -> dict:
+    """Structural-only summary of a translated provider request.
+
+    Emits model, stream flag, input item count, tool count/names, the resolved
+    tool_choice, reasoning effort, and the translation warning count — never any
+    translated input content.
+    """
+    tools = translated.get("tools") or []
+    tool_names = sorted(str(tool.get("name", "")) for tool in tools if isinstance(tool, dict))
+    tool_choice = translated.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        tool_choice = f"{tool_choice.get('type')}:{tool_choice.get('name')}"
+    reasoning = translated.get("reasoning")
+    summary = {
+        "model": str(translated.get("model", "")),
+        "stream": bool(translated.get("stream")),
+        "input_items": len(translated.get("input") or []),
+        "tool_count": len(tools),
+        "tool_names": tool_names,
+        "tool_choice": tool_choice,
+        "reasoning_effort": reasoning.get("effort") if isinstance(reasoning, dict) else None,
+        "warning_count": warning_count,
+    }
+    if "parallel_tool_calls" in translated:
+        summary["parallel_tool_calls"] = bool(translated.get("parallel_tool_calls"))
+    return summary
+
+
+def _summarize_anthropic_response(response: dict) -> dict:
+    """Structural-only summary of an outbound Anthropic response.
+
+    Emits model, stop_reason, block type counts, and token usage — never the
+    response text or tool_use arguments.
+    """
+    usage = response.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    return {
+        "model": str(response.get("model", "")),
+        "stop_reason": response.get("stop_reason"),
+        "block_types": _block_type_counts(response.get("content")),
+        "input_tokens": usage.get("input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+    }
+
+
+def _summarize_stream_event(event: dict) -> dict:
+    """Structural-only summary of one translated Anthropic SSE event.
+
+    Emits the event name, block index, block/delta *type*, stop_reason, and
+    output token total — never the streamed text or partial tool-argument JSON.
+    """
+    data = event.get("data")
+    data = data if isinstance(data, dict) else {}
+    summary: dict = {"sse": event.get("event", "")}
+    if "index" in data:
+        summary["index"] = data.get("index")
+    content_block = data.get("content_block")
+    if isinstance(content_block, dict):
+        summary["block_type"] = content_block.get("type")
+    delta = data.get("delta")
+    if isinstance(delta, dict):
+        if "type" in delta:
+            summary["delta_type"] = delta.get("type")
+        if "stop_reason" in delta:
+            summary["stop_reason"] = delta.get("stop_reason")
+    usage = data.get("usage")
+    if isinstance(usage, dict) and "output_tokens" in usage:
+        summary["output_tokens"] = usage.get("output_tokens")
+    return summary
+
+
+def _trace_inbound_request(body: bytes) -> None:
+    """Trace the structural shape of an inbound Anthropic request, if enabled."""
+    if not is_trace_enabled():
+        return
+    try:
+        trace_event("inbound_request", _summarize_anthropic_request(json.loads(body)))
+    except Exception:
+        logger.debug("inbound trace failed", exc_info=True)
+
+
+def _trace_provider_request(translated: dict, warning_count: int) -> None:
+    """Trace the structural shape of a translated provider request, if enabled."""
+    if not is_trace_enabled():
+        return
+    try:
+        trace_event("provider_request", _summarize_provider_request(translated, warning_count))
+    except Exception:
+        logger.debug("provider request trace failed", exc_info=True)
+
+
+def _trace_provider_response(response: dict) -> None:
+    """Trace the structural shape of a translated provider response, if enabled."""
+    if not is_trace_enabled():
+        return
+    try:
+        trace_event("provider_response", _summarize_anthropic_response(response))
+    except Exception:
+        logger.debug("provider response trace failed", exc_info=True)
+
+
+def _trace_stream_event(event: dict) -> None:
+    """Trace the structural shape of one translated SSE event, if enabled."""
+    if not is_trace_enabled():
+        return
+    try:
+        trace_event("stream_event", _summarize_stream_event(event))
+    except Exception:
+        logger.debug("stream event trace failed", exc_info=True)
+
+
 async def _process_request(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -370,6 +541,7 @@ async def _route_request(
     request_start: float,
 ) -> None:
     """Route a /v1/messages request to the appropriate backend."""
+    _trace_inbound_request(body)
     if provider is not None:
         mode = "stream" if streaming else "sync"
         logger.info("-> DIRECT %s (%s) model=%s", provider.name, mode, request_model)
@@ -516,6 +688,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         return 502, error
     for w in warnings:
         logger.warning("Translation: %s", w)
+    _trace_provider_request(translated, len(warnings))
 
     # Open a streaming connection and collect the full response
     def _do_provider_request():
@@ -545,6 +718,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
             return 502, json.dumps({"error": "could not parse provider response"}).encode()
 
     anthropic_response = provider.translate_response(response_dict)
+    _trace_provider_response(anthropic_response)
     return 200, json.dumps(anthropic_response).encode()
 
 
@@ -679,6 +853,7 @@ async def _stream_via_provider(
         return
     for w in warnings:
         logger.warning("Translation: %s", w)
+    _trace_provider_request(translated, len(warnings))
 
     # Enable streaming on the translated request (skip for providers that use URL-based streaming)
     if not getattr(provider, "stream_via_url", False):
@@ -727,6 +902,7 @@ async def _stream_via_provider(
 
     try:
         async for anthropic_event in provider.translate_stream(_raw_chunks()):
+            _trace_stream_event(anthropic_event)
             sse_bytes = format_anthropic_sse(anthropic_event["event"], anthropic_event["data"])
             event_name = anthropic_event["event"]
             if event_name not in _QUIET_SSE_EVENTS:
