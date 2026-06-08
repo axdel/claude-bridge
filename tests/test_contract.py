@@ -580,6 +580,52 @@ class TestUsageShape:
         assert usage == {"input_tokens": 50, "output_tokens": 10}
 
 
+class TestOracleEnvelopeShape:
+    """The Anthropic Messages response envelope every Claude Code turn must parse.
+
+    Seeds the optional Moonshot/Kimi oracle workflow (README -> "Verifying Against an
+    Anthropic-Compatible Reference"): the deterministic offline anchor a maintainer
+    diffs a redacted live-reference response against. Expected values come from the
+    Anthropic Messages API object schema (the ``type`` and ``role`` constants, the
+    ``stop_reason`` enum) — never from running the translator under test.
+    """
+
+    @staticmethod
+    def _completed_text_response() -> dict:
+        """A minimal completed Responses payload: one assistant text turn."""
+        return {
+            "id": "resp_oracle",
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "Done."}]}],
+            "usage": {"input_tokens": 12, "output_tokens": 3},
+        }
+
+    def test_envelope_is_an_assistant_message(self):
+        # Anthropic spec constants: a Messages response is always type "message" with
+        # role "assistant". The bridge sets both as literals; an oracle diff would flag
+        # any drift here immediately.
+        result = openai_to_anthropic(self._completed_text_response())
+        assert result["type"] == "message"
+        assert result["role"] == "assistant"
+
+    def test_envelope_carries_every_required_anthropic_field(self):
+        # Spec oracle: the Messages response object requires this field set. Dropping
+        # any one breaks SDK parsing on the Claude Code side — the exact regression the
+        # oracle workflow exists to catch before it ships.
+        result = openai_to_anthropic(self._completed_text_response())
+        required = {"id", "type", "role", "model", "content", "stop_reason", "usage"}
+        assert required <= result.keys()
+        assert isinstance(result["id"], str) and result["id"]
+        assert isinstance(result["content"], list) and result["content"]
+
+    def test_stop_reason_is_a_valid_anthropic_enum_value(self):
+        # Spec table: stop_reason is one of these four (or null mid-stream; a completed
+        # response is never null). A value outside the set is an SDK parse error.
+        result = openai_to_anthropic(self._completed_text_response())
+        assert result["stop_reason"] in {"end_turn", "max_tokens", "stop_sequence", "tool_use"}
+
+
 # ---------------------------------------------------------------------------
 # Unsupported / special content blocks (server-tool, MCP) — D-SRVTOOL-001
 # ---------------------------------------------------------------------------

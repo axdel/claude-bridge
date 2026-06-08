@@ -348,6 +348,76 @@ uv run pytest --no-cov --gremlins \
 
 Target: ≥85% kill rate on changed source files (zero survivors for auth code).
 
+## Verifying Against an Anthropic-Compatible Reference (optional)
+
+The contract tests pin the bridge against the Anthropic Messages and OpenAI
+Responses **specifications**. If you want a second opinion from a live
+Anthropic-compatible endpoint — one that speaks the same `/v1/messages` wire
+format Claude Code expects — you can use one as a **black-box oracle**: send the
+same request to both, then compare the response *shape*. Moonshot's Kimi endpoint
+is one such reference.
+
+This is a maintainer convenience, **not** a feature and **not** a provider. It
+adds no code path, no dependency, and no provider to the bridge.
+
+> **Not a CI requirement.** Oracle checks are manual and opt-in. The test suite
+> (`uv run pytest`) runs fully offline against fixtures and is the only gate CI
+> enforces. Never wire an oracle endpoint, credential, or network call into CI.
+
+### Credentials stay out of the repo
+
+The reference is reached the same way Claude Code reaches any Anthropic endpoint —
+through environment variables, set only in your shell for the duration of a run:
+
+```bash
+# Point Claude Code (or a one-off client) at the reference. Credentials come from
+# your environment or a private file OUTSIDE this repo — never inline, never committed.
+export ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic
+export ANTHROPIC_AUTH_TOKEN="$(cat ~/.secrets/moonshot-token)"   # private file, git-ignored path
+claude
+```
+
+- **Never** paste a token into a script, wrapper, README, fixture, or trace file.
+- Source it from an environment variable or a private file outside the working tree.
+- **If a token was ever stored inline** in a launcher or wrapper, treat it as
+  compromised: **rotate it now**, then move it to an environment variable. A key
+  that lived in a file on disk should not be trusted again.
+
+### Manual fixture-ratification workflow
+
+The bridge's redacted trace mode captures the *structure* of every request and
+response — counts, types, names, ids, and lengths only, never prompt text, file
+contents, tool output, or credentials (redaction is enforced by construction; see
+`proxy.py`). That structural trace is exactly what you diff against the reference:
+
+1. **Capture** a redacted shape trace from the bridge by pointing it at a file:
+
+   ```bash
+   CLAUDE_BRIDGE_TRACE_PATH=/tmp/bridge-trace.jsonl ./start.sh --provider openai
+   # drive a representative Claude Code session, then inspect the structural trace:
+   cat /tmp/bridge-trace.jsonl    # one JSON shape-summary per line — safe to read, no secrets
+   ```
+
+2. **Compare** that shape against the reference. Drive the *same* prompts with
+   `ANTHROPIC_BASE_URL` pointed at Moonshot, and check the envelope matches: top-level
+   fields (`id`, `type`, `role`, `model`, `content`, `stop_reason`, `usage`), the
+   `stop_reason` enum value, `content` block types and ordering, and streaming event
+   order. The bridge currently omits the optional `stop_sequence` field, for example —
+   an envelope diff is how you'd spot a gap like that.
+
+3. **Ratify** any confirmed difference as a **deterministic offline test** in
+   `tests/test_contract.py`. Encode the *expected* shape from the
+   specification (and the reference that confirmed it), not from running the bridge —
+   so the test bites when the translation drifts. `TestOracleEnvelopeShape` is the
+   seed example: it pins the full Anthropic Messages response envelope as the anchor a
+   reference diff is measured against. New oracle findings extend that class (or a
+   sibling) and then run forever in CI, fully offline.
+
+The loop is: **reference reveals a shape difference → encode it as an offline
+spec-derived test → the bridge is held to it without ever needing the reference
+again.** No credential, endpoint, or network call ever enters the committed test
+suite.
+
 ## Comparison
 
 | | Claude Bridge | [1rgs/claude-code-proxy](https://github.com/1rgs/claude-code-proxy) | [fuergaosi233/claude-code-proxy](https://github.com/fuergaosi233/claude-code-proxy) |
