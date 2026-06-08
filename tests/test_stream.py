@@ -581,48 +581,6 @@ class TestTranslateStream:
 
 
 # ---------------------------------------------------------------------------
-# _extract_completed_response tests
-# ---------------------------------------------------------------------------
-
-
-class TestExtractCompletedResponse:
-    """Tests for proxy._extract_completed_response() SSE parser."""
-
-    def test_finds_response_completed(self):
-        from claude_bridge.proxy import _extract_completed_response
-
-        sse = (
-            b"event: response.created\n"
-            b'data: {"type":"response.created","response":{"id":"r1"}}\n\n'
-            b"event: response.completed\n"
-            b'data: {"type":"response.completed",'
-            b'"response":{"id":"r1","status":"completed","output":[]}}\n\n'
-        )
-        result = _extract_completed_response(sse)
-        assert result is not None
-        assert result["id"] == "r1"
-        assert result["status"] == "completed"
-
-    def test_returns_none_when_no_completed(self):
-        from claude_bridge.proxy import _extract_completed_response
-
-        sse = (
-            b"event: response.created\n"
-            b'data: {"type":"response.created","response":{"id":"r1"}}\n\n'
-        )
-        result = _extract_completed_response(sse)
-        assert result is None
-
-    def test_handles_malformed_json_lines(self):
-        from claude_bridge.proxy import _extract_completed_response
-
-        sse = b'data: not-json\n\ndata: {"type":"response.completed","response":{"id":"r2"}}\n\n'
-        result = _extract_completed_response(sse)
-        assert result is not None
-        assert result["id"] == "r2"
-
-
-# ---------------------------------------------------------------------------
 # SSE format round-trip test
 # ---------------------------------------------------------------------------
 

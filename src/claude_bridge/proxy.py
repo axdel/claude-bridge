@@ -679,8 +679,10 @@ def _get_fallback_provider() -> Provider | None:
 async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, bytes]:
     """Authenticate, translate, forward to provider, translate back.
 
-    The Codex endpoint always streams, so we read the SSE stream and extract
-    the final response from the ``response.completed`` event.
+    The Codex endpoint always streams (even for non-streaming clients), so we read
+    the whole SSE stream, translate it through the streaming path, and fold the
+    Anthropic events into one Messages response — the ``response.completed`` event
+    carries an empty ``output``, so the deltas are the only source of content.
     """
     request_dict = json.loads(body)
     auth_headers = await provider.authenticate()
@@ -721,31 +723,126 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         logger.error("Provider error: %s", raw_response[:500])
         return status_code, raw_response
 
-    # Parse SSE stream to find the response.completed event with the full response
-    response_dict = _extract_completed_response(raw_response)
-    if response_dict is None:
-        # Fallback: try plain JSON parse
-        try:
-            response_dict = json.loads(raw_response)
-        except (json.JSONDecodeError, ValueError):
-            return 502, json.dumps({"error": "could not parse provider response"}).encode()
+    # The Codex backend always streams (even for non-streaming clients) and its
+    # response.completed.output is empty — the text/reasoning/tool-calls live only
+    # in the delta events. So run the SAME stream translation as the streaming path
+    # (which also captures reasoning continuity) and fold the Anthropic SSE events
+    # into a single Messages response, rather than reading the empty completed output.
+    async def _single_chunk():
+        yield raw_response
 
-    anthropic_response = provider.translate_response(response_dict)
+    try:
+        events = [event async for event in provider.translate_stream(_single_chunk())]
+    except Exception:
+        logger.exception("Provider stream translation failed")
+        return 502, json.dumps({"error": "could not parse provider response"}).encode()
+
+    anthropic_response = _aggregate_stream_to_message(events)
+    if anthropic_response is None:
+        logger.error("Provider stream carried no message_start: %s", raw_response[:200])
+        return 502, json.dumps({"error": "could not parse provider response"}).encode()
+
     _trace_provider_response(anthropic_response)
     return 200, json.dumps(anthropic_response).encode()
 
 
-def _extract_completed_response(raw_sse: bytes) -> dict | None:
-    """Extract the full response dict from a ``response.completed`` SSE event."""
-    for line in raw_sse.decode("utf-8", errors="replace").split("\n"):
-        if line.startswith("data: "):
-            try:
-                event_data = json.loads(line[6:])
-                if event_data.get("type") == "response.completed":
-                    return event_data.get("response")
-            except (json.JSONDecodeError, ValueError):
-                continue
-    return None
+class _MessageAccumulator:
+    """Folds Anthropic SSE event payloads into a single Messages response.
+
+    Owns the in-progress message, its content blocks (keyed by index, kept in
+    arrival order), and the per-block tool-argument JSON buffers. Each ``on_*``
+    method consumes one event's ``data`` payload; ``build`` produces the final
+    response or ``None`` if no ``message_start`` was ever seen.
+    """
+
+    def __init__(self) -> None:
+        self._message: dict | None = None
+        self._blocks: dict[int, dict] = {}
+        self._tool_json: dict[int, str] = {}
+        self._order: list[int] = []
+
+    def on_message_start(self, data: dict) -> None:
+        msg = data.get("message", {})
+        self._message = {
+            "id": msg.get("id", "msg_bridge_unknown"),
+            "type": "message",
+            "role": "assistant",
+            "model": msg.get("model", ""),
+            "stop_reason": None,
+            "content": [],
+            "usage": dict(msg.get("usage", {"input_tokens": 0, "output_tokens": 0})),
+        }
+
+    def on_content_block_start(self, data: dict) -> None:
+        index = data.get("index", 0)
+        block = dict(data.get("content_block", {}))
+        self._blocks[index] = block
+        self._order.append(index)
+        if block.get("type") == "tool_use":
+            self._tool_json[index] = ""
+
+    def on_content_block_delta(self, data: dict) -> None:
+        block = self._blocks.get(data.get("index", 0))
+        if block is None:
+            return
+        delta = data.get("delta", {})
+        if delta.get("type") == "text_delta":
+            block["text"] = block.get("text", "") + delta.get("text", "")
+        elif delta.get("type") == "input_json_delta":
+            index = data.get("index", 0)
+            self._tool_json[index] = self._tool_json.get(index, "") + delta.get("partial_json", "")
+
+    def on_content_block_stop(self, data: dict) -> None:
+        index = data.get("index", 0)
+        block = self._blocks.get(index)
+        if block is None or block.get("type") != "tool_use":
+            return
+        raw_args = self._tool_json.get(index, "")
+        try:
+            block["input"] = json.loads(raw_args) if raw_args else {}
+        except (json.JSONDecodeError, ValueError):
+            block["input"] = {"_raw": raw_args}
+
+    def on_message_delta(self, data: dict) -> None:
+        if self._message is None:
+            return
+        delta = data.get("delta", {})
+        if "stop_reason" in delta:
+            self._message["stop_reason"] = delta["stop_reason"]
+        if data.get("usage"):
+            self._message["usage"] = data["usage"]
+
+    def build(self) -> dict | None:
+        if self._message is None:
+            return None
+        self._message["content"] = [self._blocks[index] for index in self._order]
+        return self._message
+
+
+def _aggregate_stream_to_message(events: list[dict]) -> dict | None:
+    """Fold a sequence of Anthropic SSE events into a single Messages response.
+
+    The inverse of the streaming translation: ``message_start`` seeds the message,
+    ``content_block_*`` build the text/tool_use blocks in arrival order, and
+    ``message_delta`` carries the final stop_reason and usage — producing the same
+    shape ``openai_to_anthropic`` does. Returns ``None`` when no ``message_start``
+    was seen (malformed/empty upstream — the caller maps this to 502).
+
+    Pure function — no I/O.
+    """
+    accumulator = _MessageAccumulator()
+    handlers = {
+        "message_start": accumulator.on_message_start,
+        "content_block_start": accumulator.on_content_block_start,
+        "content_block_delta": accumulator.on_content_block_delta,
+        "content_block_stop": accumulator.on_content_block_stop,
+        "message_delta": accumulator.on_message_delta,
+    }
+    for event in events:
+        handler = handlers.get(event.get("event", ""))
+        if handler is not None:
+            handler(event.get("data", {}))
+    return accumulator.build()
 
 
 def _forward_request(

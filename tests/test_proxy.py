@@ -208,27 +208,131 @@ class _Mock500UpstreamHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _sse_bytes(events: list[tuple[str, dict]]) -> bytes:
+    """Serialize ``(event_name, data)`` pairs as a provider SSE byte stream.
+
+    Each data payload carries a ``"type"`` mirroring the event name, matching the
+    real OpenAI Responses wire format (the type appears both on the ``event:``
+    line and inside ``data``).
+    """
+    parts = [
+        f"event: {name}\ndata: {json.dumps({'type': name, **data})}\n\n" for name, data in events
+    ]
+    return "".join(parts).encode()
+
+
+def _codex_text_sse(
+    text: str,
+    *,
+    resp_id: str = "resp_test123",
+    model: str = "gpt-5.5",
+    input_tokens: int = 10,
+    output_tokens: int = 5,
+) -> bytes:
+    """A faithful Codex Responses SSE stream for a text turn.
+
+    Mirrors the real Codex backend: text arrives via ``output_text.delta`` events
+    and ``response.completed.output`` is EMPTY — the bug that broke the
+    non-streaming path. Splits ``text`` across two deltas so concatenation is
+    exercised.
+    """
+    mid = len(text) // 2
+    return _sse_bytes(
+        [
+            (
+                "response.created",
+                {
+                    "response": {
+                        "id": resp_id,
+                        "model": model,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                    }
+                },
+            ),
+            ("response.content_part.added", {"content_index": 0}),
+            ("response.output_text.delta", {"content_index": 0, "delta": text[:mid]}),
+            ("response.output_text.delta", {"content_index": 0, "delta": text[mid:]}),
+            ("response.output_text.done", {"content_index": 0}),
+            (
+                "response.completed",
+                {
+                    "response": {
+                        "id": resp_id,
+                        "status": "completed",
+                        "model": model,
+                        "output": [],
+                        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                    }
+                },
+            ),
+        ]
+    )
+
+
+def _codex_tool_sse(
+    *,
+    call_id: str = "call_weather1",
+    name: str = "get_weather",
+    arg_fragments: tuple[str, ...] = ('{"city":', '"NYC"}'),
+    resp_id: str = "resp_tool1",
+    model: str = "gpt-5.5",
+) -> bytes:
+    """A faithful Codex Responses SSE stream for a tool-call turn.
+
+    The function call is delivered entirely via stream deltas with an EMPTY
+    ``response.completed.output`` — so ``tool_use`` stop_reason must come from the
+    streamed ``content_block_start``, not the completed output.
+    """
+    events: list[tuple[str, dict]] = [
+        (
+            "response.created",
+            {
+                "response": {
+                    "id": resp_id,
+                    "model": model,
+                    "usage": {"input_tokens": 12, "output_tokens": 0},
+                }
+            },
+        ),
+        (
+            "response.output_item.added",
+            {
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": call_id, "name": name},
+            },
+        ),
+    ]
+    events += [
+        ("response.function_call_arguments.delta", {"output_index": 0, "delta": fragment})
+        for fragment in arg_fragments
+    ]
+    events += [
+        ("response.function_call_arguments.done", {"output_index": 0}),
+        (
+            "response.completed",
+            {
+                "response": {
+                    "id": resp_id,
+                    "status": "completed",
+                    "model": model,
+                    "output": [],
+                    "usage": {"input_tokens": 12, "output_tokens": 8},
+                }
+            },
+        ),
+    ]
+    return _sse_bytes(events)
+
+
 class _MockOpenAIHandler(BaseHTTPRequestHandler):
-    """Returns a valid OpenAI Responses API response."""
+    """Returns a faithful Codex Responses SSE stream (empty completed output)."""
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         _body = self.rfile.read(length)
-        resp = {
-            "id": "resp_test123",
-            "status": "completed",
-            "model": "gpt-5.5",
-            "output": [
-                {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "hello from openai fallback"}],
-                }
-            ],
-            "usage": {"input_tokens": 10, "output_tokens": 5},
-        }
-        payload = json.dumps(resp).encode()
+        payload = _codex_text_sse("hello from openai fallback")
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -925,3 +1029,398 @@ def test_retry_request_no_retry_on_http_error():
     status, _body = _retry_request(http_error, retries=1, backoff=0.0)
     assert status == 400
     assert call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming provider path: aggregate the Codex SSE stream into one Message
+# (regression for the empty-content bug — Codex completed.output is always []).
+# ---------------------------------------------------------------------------
+
+
+def _provider_at(endpoint: str) -> _FakeOpenAIProvider:
+    """A real-translation fake provider whose HTTP endpoint is a local mock."""
+    return _FakeOpenAIProvider(endpoint=endpoint)
+
+
+@pytest.fixture()
+def _codex_sse_mock():
+    """Mock provider endpoint that streams a faithful Codex SSE response.
+
+    The handler echoes whichever stream the test installs via ``server.payload``,
+    defaulting to a text turn. Yields the base URL.
+    """
+    payload_holder = {"bytes": _codex_text_sse("hello from codex deltas")}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            body = payload_holder["bytes"]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}", payload_holder
+    server.shutdown()
+
+
+def _anthropic_request_bytes(text: str = "hi") -> bytes:
+    return json.dumps(
+        {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": text}],
+        }
+    ).encode()
+
+
+def _text_stream_events() -> list[dict]:
+    """Oracle-derived Anthropic SSE events for a two-delta text turn.
+
+    Hand-written from the Anthropic Messages streaming spec — NOT produced by
+    running the translator — so the fold's output can be checked against an
+    independent oracle.
+    """
+    return [
+        {
+            "event": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_bridge_resp_x",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "gpt-5.5",
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                },
+            },
+        },
+        {"event": "ping", "data": {"type": "ping"}},
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hel"},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "lo"},
+            },
+        },
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+        {
+            "event": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        },
+        {"event": "message_stop", "data": {"type": "message_stop"}},
+    ]
+
+
+def test_aggregate_stream_to_message_concatenates_text_deltas():
+    """Text deltas fold into a single text block; id/model/stop/usage preserved."""
+    from claude_bridge.proxy import _aggregate_stream_to_message
+
+    message = _aggregate_stream_to_message(_text_stream_events())
+    assert message is not None
+
+    # Oracle: "Hel" + "lo" = "Hello" by the streaming spec (deltas concatenate).
+    assert message["content"] == [{"type": "text", "text": "Hello"}]
+    assert message["id"] == "msg_bridge_resp_x"
+    assert message["model"] == "gpt-5.5"
+    assert message["role"] == "assistant"
+    assert message["type"] == "message"
+    assert message["stop_reason"] == "end_turn"
+    # Oracle: the auto-compact signal — final usage comes from message_delta.
+    assert message["usage"] == {"input_tokens": 10, "output_tokens": 5}
+
+
+def test_aggregate_stream_to_message_parses_tool_use_json():
+    """input_json_delta fragments fold into a parsed tool_use input dict."""
+    from claude_bridge.proxy import _aggregate_stream_to_message
+
+    events = [
+        {
+            "event": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_bridge_t",
+                    "model": "gpt-5.5",
+                    "usage": {"input_tokens": 7, "output_tokens": 0},
+                },
+            },
+        },
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "call_abc",
+                    "name": "get_weather",
+                    "input": {},
+                },
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": '{"city":'},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": '"NYC"}'},
+            },
+        },
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+        {
+            "event": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"input_tokens": 7, "output_tokens": 3},
+            },
+        },
+        {"event": "message_stop", "data": {"type": "message_stop"}},
+    ]
+
+    message = _aggregate_stream_to_message(events)
+    assert message is not None
+
+    # Oracle: json.loads('{"city:' + '"NYC"}') == {"city": "NYC"} — hand-derivable.
+    assert message["content"] == [
+        {"type": "tool_use", "id": "call_abc", "name": "get_weather", "input": {"city": "NYC"}}
+    ]
+    assert message["stop_reason"] == "tool_use"
+
+
+def test_aggregate_stream_to_message_preserves_block_order():
+    """A text block followed by a tool_use block keeps arrival order."""
+    from claude_bridge.proxy import _aggregate_stream_to_message
+
+    events = [
+        {
+            "event": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_bridge_o",
+                    "model": "gpt-5.5",
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                },
+            },
+        },
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "look"},
+            },
+        },
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "call_z",
+                    "name": "search",
+                    "input": {},
+                },
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"},
+            },
+        },
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": 1}},
+        {
+            "event": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            },
+        },
+        {"event": "message_stop", "data": {"type": "message_stop"}},
+    ]
+
+    message = _aggregate_stream_to_message(events)
+    assert message is not None
+
+    assert [b["type"] for b in message["content"]] == ["text", "tool_use"]
+    assert message["content"][0]["text"] == "look"
+    assert message["content"][1]["id"] == "call_z"
+
+
+def test_aggregate_stream_to_message_malformed_tool_json_keeps_raw():
+    """Unparseable tool arguments fall back to {'_raw': ...} (never crash)."""
+    from claude_bridge.proxy import _aggregate_stream_to_message
+
+    events = [
+        {
+            "event": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_bridge_m",
+                    "model": "gpt-5.5",
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                },
+            },
+        },
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "call_m", "name": "f", "input": {}},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{not json"},
+            },
+        },
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+        {
+            "event": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {"event": "message_stop", "data": {"type": "message_stop"}},
+    ]
+
+    message = _aggregate_stream_to_message(events)
+    assert message is not None
+
+    assert message["content"][0]["input"] == {"_raw": "{not json"}
+
+
+def test_aggregate_stream_to_message_no_message_start_returns_none():
+    """A stream with no message_start (malformed/empty) is unusable → None."""
+    from claude_bridge.proxy import _aggregate_stream_to_message
+
+    assert _aggregate_stream_to_message([]) is None
+    assert _aggregate_stream_to_message([{"event": "ping", "data": {"type": "ping"}}]) is None
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_codex_empty_output_populates_text(_codex_sse_mock):
+    """REGRESSION: Codex completed.output is [] — text must come from deltas.
+
+    F2P: against the pre-fix code (_extract_completed_response reads the empty
+    output) this returns content == [] ; the fold makes it the delta text.
+    """
+    from claude_bridge.proxy import _forward_via_provider
+
+    url, _payload = _codex_sse_mock
+    provider = _provider_at(f"{url}/v1/responses")
+
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+
+    assert status == 200
+    response = json.loads(body)
+    # Oracle: the two deltas of "hello from codex deltas" reassemble verbatim.
+    assert response["content"] == [{"type": "text", "text": "hello from codex deltas"}]
+    assert response["stop_reason"] == "end_turn"
+    assert response["model"] == "gpt-5.5"
+    # The auto-compact signal must survive: input_tokens is the real context size.
+    assert response["usage"]["input_tokens"] == 10
+    assert response["usage"]["output_tokens"] == 5
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_codex_tool_call_populates_tool_use(_codex_sse_mock):
+    """A Codex tool turn (empty completed.output) folds into a tool_use block."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    url, payload = _codex_sse_mock
+    payload["bytes"] = _codex_tool_sse()
+    provider = _provider_at(f"{url}/v1/responses")
+
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+
+    assert status == 200
+    response = json.loads(body)
+    # Oracle: Claude Code requires toolu_ ids; call_weather1 -> toolu_weather1.
+    assert response["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_weather1",
+            "name": "get_weather",
+            "input": {"city": "NYC"},
+        }
+    ]
+    # stop_reason comes from the streamed tool_use block, not the empty output.
+    assert response["stop_reason"] == "tool_use"
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_unparseable_stream_returns_502(_codex_sse_mock):
+    """A non-SSE provider body (no message_start) is a 502, not a blank message."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    url, payload = _codex_sse_mock
+    payload["bytes"] = b"this is not an SSE stream at all"
+    provider = _provider_at(f"{url}/v1/responses")
+
+    status, _body = await _forward_via_provider(provider, _anthropic_request_bytes())
+
+    assert status == 502
