@@ -4,6 +4,9 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-06-08
 
+### v0.7.0 — Claude Code Wire Compatibility
+Release v0.7.0.
+
 ### feat: claude Code wire compatibility for the OpenAI Responses provider ([PR #8](https://github.com/axdel/claude-bridge/pull/8))
 Faithful Claude Code wire translation for GPT-5.5: serialized tool loops, encrypted-reasoning continuity, stop/usage disambiguation, non-streaming aggregation, and Anthropic error envelopes.
 
