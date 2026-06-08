@@ -12,6 +12,7 @@ import urllib.request
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import claude_bridge.config as config
 from claude_bridge.auth import is_token_expired
 from claude_bridge.provider import PROVIDERS
 from claude_bridge.stream import parse_sse_events
@@ -130,7 +131,7 @@ DEFAULT_MODEL = "gpt-5.5"
 _STRIPPED_KEYS = ("output_config",)
 
 # Reasoning mode: "passthrough" preserves thinking blocks, "drop" strips them.
-_REASONING_MODE = os.environ.get("REASONING_MODE", "passthrough").lower()
+_REASONING_MODE = config.reasoning_mode()
 
 # Upper bound on the per-provider encrypted-reasoning cache (one entry per in-flight
 # tool call). Bounds memory under long agentic sessions; oldest entries evict first.

@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import secrets
 import time as _time
 import urllib.error
 import urllib.request
 
+import claude_bridge.config as config
 from claude_bridge.log import get_logger, is_trace_enabled, request_id_var, trace_event
 from claude_bridge.provider import PROVIDERS, Provider
 from claude_bridge.router import Router
@@ -23,23 +23,16 @@ from claude_bridge.stream import format_anthropic_sse
 
 logger = get_logger("proxy")
 
-_DEFAULT_UPSTREAM = "https://api.anthropic.com"
-_MAX_REQUEST_BODY = int(os.environ.get("MAX_REQUEST_BODY", 10_485_760))
+_MAX_REQUEST_BODY = config.max_request_body()
 
 
 def _get_timeout(default: int) -> int:
     """Return upstream timeout in seconds from UPSTREAM_TIMEOUT env var, or *default*."""
-    raw = os.environ.get("UPSTREAM_TIMEOUT")
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except (ValueError, TypeError):
+
+    def _warn_invalid(raw: str) -> None:
         logger.warning("Invalid UPSTREAM_TIMEOUT=%r, using default %ds", raw, default)
-        return default
-    if value <= 0:
-        return default
-    return value
+
+    return config.upstream_timeout(default, on_invalid=_warn_invalid)
 
 
 _TRANSIENT_ERRORS = (urllib.error.URLError, TimeoutError, OSError)
@@ -117,7 +110,7 @@ async def start_proxy(
     provider_kwargs: dict | None = None,
 ) -> asyncio.Server:
     """Start the proxy server and return the asyncio.Server handle."""
-    upstream = upstream_url or os.environ.get("ANTHROPIC_REAL_URL", _DEFAULT_UPSTREAM)
+    upstream = upstream_url or config.anthropic_real_url()
 
     provider = None
     if provider_name:
@@ -645,14 +638,8 @@ _provider_cache: dict[str, Provider] = {}
 
 
 def _get_fallback_chain() -> list[str]:
-    """Return the ordered list of fallback provider names.
-
-    Reads ``LLM_BRIDGE_FALLBACK`` env var (comma-separated). Defaults to ``["openai"]``.
-    """
-    raw = os.environ.get("LLM_BRIDGE_FALLBACK")
-    if raw is None:
-        return ["openai"]
-    return [name.strip() for name in raw.split(",") if name.strip()]
+    """Return the ordered list of fallback provider names."""
+    return config.fallback_chain()
 
 
 def _get_cached_provider(name: str) -> Provider | None:

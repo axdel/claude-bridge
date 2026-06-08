@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
+
+import claude_bridge.config as config
 
 # Import implemented providers so they register themselves in the PROVIDERS dict.
 import claude_bridge.providers.gemini
@@ -22,7 +23,7 @@ def _detect_openai_auth_mode() -> tuple[str, str | None]:
     - ``("api_key", "<key>")`` when ``OPENAI_API_KEY`` is set and non-empty
     - ``("codex_oauth", None)`` otherwise
     """
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = config.openai_api_key()
     if api_key:
         return "api_key", api_key
     return "codex_oauth", None
@@ -35,7 +36,7 @@ def _detect_gemini_auth_mode() -> tuple[str, str | None]:
     - ``("api_key", "<key>")`` when ``GEMINI_API_KEY`` is set and non-empty
     - ``("gemini_oauth", None)`` otherwise
     """
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = config.gemini_api_key()
     if api_key:
         return "api_key", api_key
     return "gemini_oauth", None

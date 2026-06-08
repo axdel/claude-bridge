@@ -46,6 +46,35 @@ class TestGeminiAuth:
         provider = GeminiProvider(auth_mode="api_key", api_key="test-key-placeholder")
         assert "v1beta/models/" in provider.endpoint
 
+    def test_api_key_mode_uses_configured_default_model(self, monkeypatch):
+        import claude_bridge.config as config
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        monkeypatch.delenv(config.GEMINI_MODEL_ENV, raising=False)
+        provider = GeminiProvider(auth_mode="api_key", api_key="test-key-placeholder")
+        assert provider._model == config.GEMINI_API_KEY_DEFAULT_MODEL
+        assert config.GEMINI_API_KEY_DEFAULT_MODEL in provider.endpoint
+
+    def test_oauth_mode_uses_configured_default_model(self, monkeypatch):
+        import claude_bridge.config as config
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        monkeypatch.delenv(config.GEMINI_MODEL_ENV, raising=False)
+        provider = GeminiProvider(auth_mode="gemini_oauth")
+        assert provider._model == config.GEMINI_OAUTH_DEFAULT_MODEL
+        assert provider.endpoint.endswith(":streamGenerateContent?alt=sse")
+
+    def test_gemini_model_env_overrides_both_default_models(self, monkeypatch):
+        import claude_bridge.config as config
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        monkeypatch.setenv(config.GEMINI_MODEL_ENV, "gemini-3.1-pro-preview")
+        api_key_provider = GeminiProvider(auth_mode="api_key", api_key="test-key-placeholder")
+        oauth_provider = GeminiProvider(auth_mode="gemini_oauth")
+        assert api_key_provider._model == "gemini-3.1-pro-preview"
+        assert oauth_provider._model == "gemini-3.1-pro-preview"
+        assert "gemini-3.1-pro-preview" in api_key_provider.endpoint
+
 
 # --- Request translation tests ---
 

@@ -525,28 +525,31 @@ async def test_xai_stub_is_not_registered_for_cache_fallback_or_direct_mode(monk
 
 
 def test_fallback_chain_from_env(monkeypatch):
-    """LLM_BRIDGE_FALLBACK env var controls fallback order."""
+    """LLM_BRIDGE_FALLBACK env var controls fallback order through config."""
+    import claude_bridge.config as config
     from claude_bridge.proxy import _get_fallback_chain
 
-    monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "openai,xai")
+    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "openai,xai")
     chain = _get_fallback_chain()
     assert chain == ["openai", "xai"]
 
 
 def test_fallback_chain_default(monkeypatch):
     """Without env var, fallback defaults to ['openai']."""
+    import claude_bridge.config as config
     from claude_bridge.proxy import _get_fallback_chain
 
-    monkeypatch.delenv("LLM_BRIDGE_FALLBACK", raising=False)
+    monkeypatch.delenv(config.LLM_BRIDGE_FALLBACK_ENV, raising=False)
     chain = _get_fallback_chain()
     assert chain == ["openai"]
 
 
 def test_fallback_chain_empty_string(monkeypatch):
     """Empty LLM_BRIDGE_FALLBACK means no fallback available."""
+    import claude_bridge.config as config
     from claude_bridge.proxy import _get_fallback_chain
 
-    monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "")
+    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "")
     chain = _get_fallback_chain()
     assert chain == []
 
@@ -558,38 +561,42 @@ def test_fallback_chain_empty_string(monkeypatch):
 
 def test_get_timeout_returns_default_when_unset(monkeypatch):
     """Without UPSTREAM_TIMEOUT env var, _get_timeout returns the provided default."""
+    import claude_bridge.config as config
     from claude_bridge.proxy import _get_timeout
 
-    monkeypatch.delenv("UPSTREAM_TIMEOUT", raising=False)
+    monkeypatch.delenv(config.UPSTREAM_TIMEOUT_ENV, raising=False)
     assert _get_timeout(60) == 60
     assert _get_timeout(120) == 120
 
 
 def test_get_timeout_reads_env_var(monkeypatch):
     """UPSTREAM_TIMEOUT overrides the default for all callsites."""
+    import claude_bridge.config as config
     from claude_bridge.proxy import _get_timeout
 
-    monkeypatch.setenv("UPSTREAM_TIMEOUT", "30")
+    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "30")
     assert _get_timeout(60) == 30
     assert _get_timeout(120) == 30
 
 
 def test_get_timeout_ignores_invalid_env_var(monkeypatch):
     """Non-numeric UPSTREAM_TIMEOUT falls back to default."""
+    import claude_bridge.config as config
     from claude_bridge.proxy import _get_timeout
 
-    monkeypatch.setenv("UPSTREAM_TIMEOUT", "not-a-number")
+    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "not-a-number")
     assert _get_timeout(120) == 120
 
 
 def test_get_timeout_ignores_zero_and_negative(monkeypatch):
     """Zero or negative UPSTREAM_TIMEOUT falls back to default."""
+    import claude_bridge.config as config
     from claude_bridge.proxy import _get_timeout
 
-    monkeypatch.setenv("UPSTREAM_TIMEOUT", "0")
+    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
     assert _get_timeout(120) == 120
 
-    monkeypatch.setenv("UPSTREAM_TIMEOUT", "-5")
+    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "-5")
     assert _get_timeout(60) == 60
 
 

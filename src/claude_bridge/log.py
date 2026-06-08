@@ -25,6 +25,8 @@ import os
 import sys
 from typing import TextIO
 
+import claude_bridge.config as config
+
 _NAMESPACE = "claude_bridge"
 
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="")
@@ -53,7 +55,7 @@ def configure_logging(
             ``LOG_LEVEL`` env var, then ``INFO``.
         stream: Output stream. Defaults to ``sys.stderr``.
     """
-    resolved_level = level or os.environ.get("LOG_LEVEL", "INFO")
+    resolved_level = config.log_level(level)
     resolved_stream = stream or sys.stderr
 
     root_logger = logging.getLogger(_NAMESPACE)
@@ -83,8 +85,6 @@ def get_logger(name: str) -> logging.Logger:
 # Redacted compatibility trace — structural-only, env-gated, never raises
 # ---------------------------------------------------------------------------
 
-_TRACE_ENV = "CLAUDE_BRIDGE_TRACE_PATH"
-
 # Set once the first trace failure has been surfaced at WARNING, so a persistently
 # broken trace target degrades to DEBUG instead of flooding the operator's log.
 _trace_failure_warned = False
@@ -96,7 +96,7 @@ def is_trace_enabled() -> bool:
     Read at call time (not import time) so the environment can change between runs
     and tests can toggle it without re-importing the module.
     """
-    return bool(os.environ.get(_TRACE_ENV))
+    return config.trace_path() is not None
 
 
 def _warn_trace_failure(message: str, *, exc_info: bool = False) -> None:
@@ -122,7 +122,7 @@ def trace_event(event: str, fields: dict) -> None:
     swallowed so tracing can never break or fail a user request; the first failure
     is surfaced once at WARNING for diagnosability.
     """
-    path = os.environ.get(_TRACE_ENV)
+    path = config.trace_path()
     if not path:
         return
     # A non-regular target (directory, FIFO, device) would error on open or — for a

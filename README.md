@@ -248,13 +248,13 @@ curl -s localhost:9999/stats | python3 -m json.tool
 |---|---|---|
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
 | `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — direct Gemini mode uses the public API when set; otherwise it uses Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) |
-| `GEMINI_MODEL` | `gemini-3-flash-preview` OAuth / `gemini-2.5-pro` API key | Gemini model override. OAuth defaults to Gemini 3 Flash; API-key mode defaults to Gemini 2.5 Pro |
+| `GEMINI_MODEL` | API-key: `gemini-2.5-pro`; OAuth: `gemini-3-flash-preview` | Gemini model override. Both auth modes honor the same env var; when unset, API-key mode uses the API-key default and OAuth mode uses the OAuth default |
 | `REASONING_MODE` | `passthrough` | OpenAI thinking-block handling: `passthrough` preserves tagged thinking text, `drop` strips it. Gemini strips thinking blocks because it has no equivalent |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `UPSTREAM_TIMEOUT` | `60`/`120` | Upstream request timeout in seconds (60s sync, 120s streaming) |
+| `UPSTREAM_TIMEOUT` | caller default (`60` sync / `120` streaming) | Upstream request timeout in seconds; invalid, zero, or negative values fall back to the caller default |
 | `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10MB) |
 | `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback preference list; the first registered provider is used |
-| `LLM_BRIDGE_PORT` | `9999` | Default proxy port |
+| `LLM_BRIDGE_PORT` | `9999` | Shell launcher default proxy port |
 | `ANTHROPIC_REAL_URL` | `https://api.anthropic.com` | Real Anthropic endpoint (passthrough) |
 | `CLAUDE_BRIDGE_TRACE_PATH` | _(none)_ | Optional redacted JSONL structural trace path for wire-compatibility debugging |
 

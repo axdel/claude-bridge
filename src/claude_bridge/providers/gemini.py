@@ -12,6 +12,7 @@ import urllib.request
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import claude_bridge.config as config
 from claude_bridge.provider import PROVIDERS
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -27,7 +28,7 @@ MODEL_MAP: dict[str, str] = {
     "claude-sonnet-4-6": "gemini-2.5-flash",
     "claude-haiku-4-5-20251001": "gemini-2.5-flash",
 }
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+DEFAULT_MODEL = config.gemini_api_key_model()
 
 _STRIPPED_KEYS = ("output_config",)
 
@@ -777,7 +778,7 @@ def _unwrap_code_assist_response(envelope: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-_OAUTH_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+_OAUTH_DEFAULT_MODEL = config.gemini_oauth_model()
 
 
 class GeminiProvider:
@@ -807,10 +808,10 @@ class GeminiProvider:
 
         self._session_id = str(uuid.uuid4())
         if auth_mode == "api_key":
-            model = DEFAULT_MODEL
+            model = config.gemini_api_key_model()
             self.endpoint = f"{_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
         else:
-            model = _OAUTH_DEFAULT_MODEL
+            model = config.gemini_oauth_model()
             self.endpoint = f"{_CODE_ASSIST_URL}:streamGenerateContent?alt=sse"
         self._model = model
 
@@ -820,7 +821,7 @@ class GeminiProvider:
         For OAuth mode, also resolves the Code Assist project on first call.
         """
         if self.auth_mode == "api_key":
-            api_key = self._api_key or os.environ.get("GEMINI_API_KEY", "").strip()
+            api_key = self._api_key or config.gemini_api_key()
             if not api_key:
                 msg = (
                     "GEMINI_API_KEY environment variable is required for "
