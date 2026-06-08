@@ -428,25 +428,88 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     return result, warnings
 
 
+# OpenAI Responses ``incomplete_details.reason`` that signals a moderation block, not
+# token-budget exhaustion. Disambiguating the two is the whole point of T-006: mapping
+# a content-filtered turn to ``max_tokens`` makes Claude Code auto-compact a context
+# nowhere near full and retry endlessly.
+_CONTENT_FILTER_REASON = "content_filter"
+
+# Surfaced to Claude Code when a turn is content-filtered with no model text, so the turn
+# renders as a visible refusal rather than a blank assistant message. Mirrors the Gemini
+# provider's ``_SAFETY_REFUSAL``.
+_CONTENT_FILTER_REFUSAL = (
+    "I cannot complete this response because it was blocked by content safety filters. "
+    "Please rephrase your request."
+)
+
+
+def _coerce_token_count(value: object) -> int:
+    """Coerce a provider token count to a non-negative int.
+
+    Provider usage may carry floats or nulls; Anthropic's usage fields are integers
+    that Claude Code's ``/context`` math divides by. Non-numeric values default to 0.
+    """
+    try:
+        return max(0, int(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _anthropic_usage(oai_usage: object) -> dict:
+    """Project OpenAI Responses usage onto Anthropic's flat integer shape.
+
+    OpenAI ``input_tokens`` already includes cached tokens and ``output_tokens`` already
+    includes reasoning tokens (both are subsets, per the Responses contract), so each maps
+    straight to Anthropic's corresponding total. Cached tokens are deliberately NOT split
+    into ``cache_read_input_tokens`` — Anthropic's totals are non-overlapping, so doing so
+    would double-count. Missing or non-numeric fields default to 0. See D-USAGE-001.
+    """
+    usage = oai_usage if isinstance(oai_usage, dict) else {}
+    return {
+        "input_tokens": _coerce_token_count(usage.get("input_tokens", 0)),
+        "output_tokens": _coerce_token_count(usage.get("output_tokens", 0)),
+    }
+
+
+def _incomplete_reason(response: dict) -> str:
+    """Return ``incomplete_details.reason`` from a Responses object, or ``""`` if absent.
+
+    GPT-5 sometimes returns ``status: "incomplete"`` with a null ``incomplete_details``;
+    that absence reads as token exhaustion (the conservative default).
+    """
+    details = response.get("incomplete_details")
+    return details.get("reason", "") if isinstance(details, dict) else ""
+
+
+def _stop_reason(status: str, has_tool_calls: bool, incomplete_reason: str) -> str:
+    """Map an OpenAI Responses terminal status to an Anthropic ``stop_reason``.
+
+    Tool calls win — Claude Code must run the tool rather than compact. A content-filtered
+    completion ends the turn cleanly (``end_turn``); any other ``incomplete`` is treated as
+    output-token exhaustion (``max_tokens``), the signal Claude Code auto-compacts on.
+    """
+    if has_tool_calls:
+        return "tool_use"
+    if status == "incomplete":
+        return "end_turn" if incomplete_reason == _CONTENT_FILTER_REASON else "max_tokens"
+    return "end_turn"
+
+
 def openai_to_anthropic(response: dict) -> dict:
     """Translate an OpenAI Responses API response to an Anthropic Messages API response.
 
     Pure function — no I/O.
     """
-    # Map status → stop_reason
+    # Map status → stop_reason (disambiguating content_filter from token exhaustion)
     status = response.get("status", "completed")
     output_items = response.get("output", [])
     has_tool_calls = any(i.get("type") == "function_call" for i in output_items)
-    if has_tool_calls:
-        stop_reason = "tool_use"
-    elif status == "incomplete":
-        stop_reason = "max_tokens"
-    else:
-        stop_reason = "end_turn"
+    incomplete_reason = _incomplete_reason(response)
+    stop_reason = _stop_reason(status, has_tool_calls, incomplete_reason)
 
     # Translate output items → content blocks
     content: list[dict] = []
-    for item in response.get("output", []):
+    for item in output_items:
         item_type = item.get("type")
 
         if item_type == "message":
@@ -454,6 +517,10 @@ def openai_to_anthropic(response: dict) -> dict:
             for block in item.get("content", []):
                 if block.get("type") == "output_text":
                     content.append({"type": "text", "text": block["text"]})
+
+        elif item_type == "refusal":
+            # A model refusal carries human-readable text — surface it, don't drop it.
+            content.append({"type": "text", "text": item.get("refusal", "")})
 
         elif item_type == "function_call":
             raw_args = item.get("arguments", "{}")
@@ -472,12 +539,13 @@ def openai_to_anthropic(response: dict) -> dict:
                 }
             )
 
-    # Map usage
-    oai_usage = response.get("usage") or {}
-    usage = {
-        "input_tokens": oai_usage.get("input_tokens", 0),
-        "output_tokens": oai_usage.get("output_tokens", 0),
-    }
+    # Content-filtered turn with no model text → synthesize a visible refusal so the
+    # turn never renders as a blank assistant message.
+    has_text = any(b.get("type") == "text" and b.get("text") for b in content)
+    if incomplete_reason == _CONTENT_FILTER_REASON and not has_text:
+        content.append({"type": "text", "text": _CONTENT_FILTER_REFUSAL})
+
+    usage = _anthropic_usage(response.get("usage"))
 
     return {
         "id": f"msg_bridge_{response.get('id', 'unknown')}",
@@ -544,7 +612,7 @@ def _sse_response_created(data: dict) -> list[dict]:
                     "model": resp.get("model", ""),
                     "stop_reason": None,
                     "usage": {
-                        "input_tokens": usage.get("input_tokens", 0),
+                        "input_tokens": _coerce_token_count(usage.get("input_tokens", 0)),
                         "output_tokens": 0,
                     },
                 },
@@ -579,33 +647,62 @@ def _sse_output_item_added(data: dict) -> list[dict]:
     ]
 
 
+def _synthesize_refusal_block(text: str) -> list[dict]:
+    """Build start/delta/stop SSE events for a synthetic refusal text block.
+
+    Emitted when a streamed turn is content-filtered with no model text, so the stream
+    does not end on an empty assistant message. The placeholder index 0 is reassigned to
+    the next sequential Anthropic block index by ``_remap_block_index``.
+    """
+    return [
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            },
+        },
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+    ]
+
+
 def _sse_response_completed(data: dict) -> list[dict]:
-    """Translate response.completed → message_delta + message_stop."""
+    """Translate response.completed → [refusal block?] + message_delta + message_stop.
+
+    A content-filtered turn is prefixed with a synthesized refusal text block and ends
+    with ``end_turn``; any other ``incomplete`` maps to ``max_tokens``.
+    """
     resp = data.get("response", {})
-    usage = resp.get("usage") or {}
     status = resp.get("status", "completed")
     output = resp.get("output", [])
     has_tool_calls = any(i.get("type") == "function_call" for i in output)
-    if has_tool_calls:
-        stop_reason = "tool_use"
-    elif status == "incomplete":
-        stop_reason = "max_tokens"
-    else:
-        stop_reason = "end_turn"
-    return [
+    incomplete_reason = _incomplete_reason(resp)
+    stop_reason = _stop_reason(status, has_tool_calls, incomplete_reason)
+
+    events: list[dict] = []
+    if incomplete_reason == _CONTENT_FILTER_REASON:
+        events.extend(_synthesize_refusal_block(_CONTENT_FILTER_REFUSAL))
+    events.append(
         {
             "event": "message_delta",
             "data": {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason},
-                "usage": {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                },
+                "usage": _anthropic_usage(resp.get("usage")),
             },
-        },
-        {"event": "message_stop", "data": {"type": "message_stop"}},
-    ]
+        }
+    )
+    events.append({"event": "message_stop", "data": {"type": "message_stop"}})
+    return events
 
 
 # Events that are informational — no Anthropic equivalent.

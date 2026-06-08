@@ -464,6 +464,52 @@ class TestResponseStopReason:
         response = {"status": "completed", "output": [{"type": "message", "content": []}]}
         assert openai_to_anthropic(response)["stop_reason"] == "end_turn"
 
+    def test_incomplete_max_output_tokens_maps_to_max_tokens(self):
+        # Oracle: OpenAI incomplete_details.reason "max_output_tokens" is truncation,
+        # which Anthropic reports as max_tokens — the signal Claude Code auto-compacts on.
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+        }
+        assert openai_to_anthropic(response)["stop_reason"] == "max_tokens"
+
+    def test_incomplete_content_filter_does_not_mask_as_max_tokens(self):
+        # A moderation block must NOT look like token exhaustion, or Claude Code
+        # auto-compacts a context that is nowhere near full. Anthropic convention
+        # (mirrors the Gemini provider): refusal text + end_turn.
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [],
+        }
+        result = openai_to_anthropic(response)
+        assert result["stop_reason"] == "end_turn"
+        assert any(
+            block.get("type") == "text" and block.get("text") for block in result["content"]
+        )
+
+    def test_refusal_output_item_becomes_text_block(self):
+        # A model refusal item carries human-readable text; it must reach Claude Code
+        # as a text block rather than being silently dropped.
+        response = {
+            "status": "completed",
+            "output": [{"type": "refusal", "refusal": "I can't help with that."}],
+        }
+        result = openai_to_anthropic(response)
+        assert result["stop_reason"] == "end_turn"
+        assert {"type": "text", "text": "I can't help with that."} in result["content"]
+
+    def test_tool_use_takes_precedence_over_incomplete(self):
+        # A truncated turn that still emitted a tool call is a tool_use turn — Claude
+        # Code must run the tool, not compact.
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "function_call", "name": "Read", "call_id": "fc_1"}],
+        }
+        assert openai_to_anthropic(response)["stop_reason"] == "tool_use"
+
 
 class TestUsageShape:
     """Usage must be integers — Claude Code's /context math divides by them."""
@@ -482,6 +528,56 @@ class TestUsageShape:
     def test_missing_usage_defaults_to_zero_integers(self):
         usage = openai_to_anthropic({"status": "completed", "output": []})["usage"]
         assert usage == {"input_tokens": 0, "output_tokens": 0}
+
+    def test_float_usage_coerced_to_int(self):
+        # Claude Code's /context math divides by these; a float would break integer
+        # arithmetic. Coerce defensively to int regardless of provider quirks.
+        response = {
+            "status": "completed",
+            "output": [],
+            "usage": {"input_tokens": 100.0, "output_tokens": 7.0},
+        }
+        usage = openai_to_anthropic(response)["usage"]
+        assert usage == {"input_tokens": 100, "output_tokens": 7}
+        assert isinstance(usage["input_tokens"], int)
+        assert isinstance(usage["output_tokens"], int)
+
+    def test_non_numeric_usage_defaults_to_zero(self):
+        response = {"status": "completed", "output": [], "usage": {"input_tokens": None}}
+        usage = openai_to_anthropic(response)["usage"]
+        assert usage == {"input_tokens": 0, "output_tokens": 0}
+
+    def test_cache_and_reasoning_details_fold_into_totals(self):
+        # OpenAI's input_tokens already INCLUDES cached_tokens, and output_tokens
+        # already INCLUDES reasoning_tokens (both are subsets per the Responses
+        # contract). Anthropic's input_tokens/output_tokens are the full totals, so
+        # the bridge reports them flat — never splitting cached out as an extra field
+        # (which would double-count under Anthropic's non-overlapping model). The
+        # optional *_details objects must not leak or perturb the flat totals.
+        # See D-USAGE-001.
+        response = {
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "input_tokens_details": {"cached_tokens": 768},
+                "output_tokens_details": {"reasoning_tokens": 150},
+            },
+        }
+        usage = openai_to_anthropic(response)["usage"]
+        assert usage == {"input_tokens": 1000, "output_tokens": 200}
+
+    def test_missing_token_detail_objects_default_safely(self):
+        # Providers may omit the optional *_details objects entirely; absence must
+        # not raise or alter the flat totals.
+        response = {
+            "status": "completed",
+            "output": [],
+            "usage": {"input_tokens": 50, "output_tokens": 10},
+        }
+        usage = openai_to_anthropic(response)["usage"]
+        assert usage == {"input_tokens": 50, "output_tokens": 10}
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +706,26 @@ class TestCountTokensContract:
             "system": "You are Claude Code with a long set of rules and skills.",
         }
         assert estimate_input_tokens(with_system) > estimate_input_tokens(base)
+
+    def test_tool_result_content_is_counted(self):
+        # Tool-result payloads (file contents, command output) dominate Claude Code's
+        # context growth — they must contribute to the estimate, not be ignored.
+        base = {"messages": [{"role": "user", "content": "ok"}]}
+        with_tool_result = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "x" * 5000,
+                        }
+                    ],
+                }
+            ]
+        }
+        assert estimate_input_tokens(with_tool_result) > estimate_input_tokens(base)
 
 
 # ---------------------------------------------------------------------------
