@@ -1098,12 +1098,25 @@ class TestSummarizeProviderRequest:
         from claude_bridge.proxy import _summarize_provider_request
 
         translated, warnings = anthropic_to_openai(_secret_laden_request())
-        summary = _summarize_provider_request(translated, len(warnings))
+        summary = _summarize_provider_request(translated, warnings)
         assert summary["tool_count"] == 2
         assert summary["tool_names"] == ["Bash", "Read"]
         assert summary["input_items"] >= 3
         assert summary["warning_count"] == len(warnings)
         assert summary["stream"] is True
+
+    def test_warning_strings_included_for_trace(self):
+        # REQ1: the trace carries the sanitized warning *strings*, not just a count,
+        # so a degraded translation is diagnosable from the trace alone (T-003 spec).
+        from claude_bridge.proxy import _summarize_provider_request
+
+        warnings = [
+            "Stripped 'thinking' config (reasoning_mode=drop)",
+            "Unsupported tool_choice type 'x', omitting tool_choice",
+        ]
+        summary = _summarize_provider_request({"model": "m", "input": []}, warnings)
+        assert summary["warnings"] == warnings
+        assert summary["warning_count"] == 2
 
     def test_forced_tool_choice_renders_structurally(self):
         from claude_bridge.proxy import _summarize_provider_request
@@ -1114,16 +1127,16 @@ class TestSummarizeProviderRequest:
             "tools": [{"type": "function", "name": "Read"}],
             "tool_choice": {"type": "function", "name": "Read"},
         }
-        summary = _summarize_provider_request(translated, 0)
+        summary = _summarize_provider_request(translated, [])
         assert summary["tool_choice"] == "function:Read"
 
     def test_parallel_flag_emitted_only_when_present(self):
         from claude_bridge.proxy import _summarize_provider_request
 
         with_flag = _summarize_provider_request(
-            {"model": "m", "input": [], "parallel_tool_calls": False}, 0
+            {"model": "m", "input": [], "parallel_tool_calls": False}, []
         )
-        without_flag = _summarize_provider_request({"model": "m", "input": []}, 0)
+        without_flag = _summarize_provider_request({"model": "m", "input": []}, [])
         assert with_flag["parallel_tool_calls"] is False
         assert "parallel_tool_calls" not in without_flag
 
@@ -1132,7 +1145,7 @@ class TestSummarizeProviderRequest:
         from claude_bridge.proxy import _summarize_provider_request
 
         translated, warnings = anthropic_to_openai(_secret_laden_request())
-        _assert_no_secrets(_summarize_provider_request(translated, len(warnings)))
+        _assert_no_secrets(_summarize_provider_request(translated, warnings))
 
     def test_injected_encrypted_reasoning_never_leaks(self):
         # The provider echoes opaque encrypted reasoning into the outbound request
@@ -1146,7 +1159,7 @@ class TestSummarizeProviderRequest:
                 {"type": "function_call", "id": "fc_1", "call_id": "fc_1", "name": "Read"},
             ],
         }
-        summary = _summarize_provider_request(translated, 0)
+        summary = _summarize_provider_request(translated, [])
         assert summary["input_items"] == 2
         assert "SECRET_REASONING" not in json.dumps(summary)
 
@@ -1272,7 +1285,7 @@ class TestTraceHooks:
         target = tmp_path / "trace.jsonl"
         monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
         translated, warnings = anthropic_to_openai(_secret_laden_request())
-        _trace_provider_request(translated, len(warnings))
+        _trace_provider_request(translated, warnings)
         content = target.read_text(encoding="utf-8")
         for marker in _SECRET_MARKERS:
             assert marker not in content

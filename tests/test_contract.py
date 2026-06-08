@@ -19,6 +19,7 @@ import json
 
 from claude_bridge.providers.openai import (
     OpenAIProvider,
+    _safe_token,
     _to_anthropic_id,
     _to_openai_id,
     anthropic_to_openai,
@@ -730,6 +731,75 @@ class TestUnsupportedContentBlocks:
         assert "function_call_output" in kinds  # tool_result preserved
         # The canonical tool loop has no unsupported blocks → no degradation warnings.
         assert not any("redacted placeholder" in w for w in warnings)
+
+
+class TestLogInjectionNeutralization:
+    """A request's block / tool_choice ``type`` is attacker-controllable and flows
+    verbatim into a translation warning that the proxy writes to the human log and
+    the structural trace. An unsanitized newline lets a hostile request forge a
+    second log record (CWE-117). Every such token is neutralized at construction
+    via ``_safe_token``. See ADV1."""
+
+    def test_safe_token_preserves_benign_identifier(self):
+        # Oracle: an already-safe identifier is returned unchanged — identity, not
+        # mutation. Derived from "neutralize control chars", which a clean token has none of.
+        assert _safe_token("server_tool_use") == "server_tool_use"
+
+    def test_safe_token_strips_control_characters(self):
+        # Oracle: newline (0x0A), carriage return (0x0D), and tab (0x09) are
+        # non-printable control characters; the CWE-117 contract removes every one.
+        # Expected value hand-derived from the spec, not from running the sanitizer.
+        assert _safe_token("a\nb\rc\td") == "abcd"
+
+    def test_safe_token_removes_newline_that_would_forge_a_record(self):
+        # Oracle: the canonical injection payload is a newline introducing a fake
+        # log line; after sanitizing, no newline remains to split the record.
+        forged = "x\n2026-01-01 12:00:00 WARNING forged-by-attacker"
+        assert "\n" not in _safe_token(forged)
+        assert "\r" not in _safe_token(forged)
+
+    def test_safe_token_caps_oversized_token(self):
+        # Oracle: an unbounded type floods the log/trace line; the bridge caps the
+        # payload at _SAFE_TOKEN_MAX (64) printable chars plus a literal "..." marker.
+        # Exact match (vs startswith/len bound) kills marker-drop and slice-width mutants.
+        assert _safe_token("a" * 500) == "a" * 64 + "..."
+
+    def test_safe_token_keeps_token_at_exact_cap(self):
+        # Oracle: a token exactly at the cap is returned whole — the boundary truncates
+        # only what exceeds 64. Kills the > vs >= off-by-one on the cap comparison.
+        assert _safe_token("a" * 64) == "a" * 64
+
+    def test_safe_token_coerces_non_string(self):
+        # tool_choice.get("type") is None when the key is absent; the warning still
+        # interpolates it, so the sanitizer must coerce to str before stripping.
+        assert _safe_token(None) == "None"
+
+    def test_unsupported_block_warning_neutralizes_injected_newline(self):
+        # End-to-end: a hostile block type must not inject a control char into the
+        # degradation warning, and the redacted placeholder carries the sanitized token.
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [{"type": "evil\ntype\rx"}]}],
+        }
+        result, warnings = anthropic_to_openai(request)
+        assert warnings, "a hostile block must still emit a degradation warning"
+        for w in warnings:
+            assert "\n" not in w and "\r" not in w
+        assert any("eviltypex" in w for w in warnings)
+        assert "eviltypex" in json.dumps(result)
+
+    def test_unsupported_tool_choice_warning_neutralizes_injected_newline(self):
+        request = {
+            "model": "claude-opus-4-6",
+            "tools": [{"name": "Read", "description": "", "input_schema": {}}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "evil\ntype"},
+        }
+        _, warnings = anthropic_to_openai(request)
+        assert any("eviltype" in w for w in warnings)
+        for w in warnings:
+            assert "\n" not in w and "\r" not in w
 
 
 # ---------------------------------------------------------------------------

@@ -327,12 +327,14 @@ def _summarize_anthropic_request(request: dict) -> dict:
     }
 
 
-def _summarize_provider_request(translated: dict, warning_count: int) -> dict:
+def _summarize_provider_request(translated: dict, warnings: list[str]) -> dict:
     """Structural-only summary of a translated provider request.
 
     Emits model, stream flag, input item count, tool count/names, the resolved
-    tool_choice, reasoning effort, and the translation warning count — never any
-    translated input content.
+    tool_choice, reasoning effort, and the translation warnings — both the count
+    and the sanitized warning strings, which name what was stripped — never any
+    translated input content. The warning strings are neutralized at construction
+    (see ``_safe_token``), so they are safe to persist to the trace.
     """
     tools = translated.get("tools") or []
     tool_names = sorted(str(tool.get("name", "")) for tool in tools if isinstance(tool, dict))
@@ -348,7 +350,8 @@ def _summarize_provider_request(translated: dict, warning_count: int) -> dict:
         "tool_names": tool_names,
         "tool_choice": tool_choice,
         "reasoning_effort": reasoning.get("effort") if isinstance(reasoning, dict) else None,
-        "warning_count": warning_count,
+        "warning_count": len(warnings),
+        "warnings": list(warnings),
     }
     if "parallel_tool_calls" in translated:
         summary["parallel_tool_calls"] = bool(translated.get("parallel_tool_calls"))
@@ -408,14 +411,26 @@ def _trace_inbound_request(body: bytes) -> None:
         logger.debug("inbound trace failed", exc_info=True)
 
 
-def _trace_provider_request(translated: dict, warning_count: int) -> None:
+def _trace_provider_request(translated: dict, warnings: list[str]) -> None:
     """Trace the structural shape of a translated provider request, if enabled."""
     if not is_trace_enabled():
         return
     try:
-        trace_event("provider_request", _summarize_provider_request(translated, warning_count))
+        trace_event("provider_request", _summarize_provider_request(translated, warnings))
     except Exception:
         logger.debug("provider request trace failed", exc_info=True)
+
+
+def _emit_translation_warnings(warnings: list[str], translated: dict) -> None:
+    """Surface translation warnings to every observer — the human log and the
+    structural trace — from a single place.
+
+    Both the streaming and non-streaming request paths route their warnings here so
+    the logged warnings and the traced warnings can never drift out of lockstep.
+    """
+    for warning in warnings:
+        logger.warning("Translation: %s", warning)
+    _trace_provider_request(translated, warnings)
 
 
 def _trace_provider_response(response: dict) -> None:
@@ -686,9 +701,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
             }
         ).encode()
         return 502, error
-    for w in warnings:
-        logger.warning("Translation: %s", w)
-    _trace_provider_request(translated, len(warnings))
+    _emit_translation_warnings(warnings, translated)
 
     # Open a streaming connection and collect the full response
     def _do_provider_request():
@@ -851,9 +864,7 @@ async def _stream_via_provider(
             ).encode(),
         )
         return
-    for w in warnings:
-        logger.warning("Translation: %s", w)
-    _trace_provider_request(translated, len(warnings))
+    _emit_translation_warnings(warnings, translated)
 
     # Enable streaming on the translated request (skip for providers that use URL-based streaming)
     if not getattr(provider, "stream_via_url", False):

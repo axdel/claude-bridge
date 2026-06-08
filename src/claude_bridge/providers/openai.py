@@ -136,6 +136,25 @@ _REASONING_MODE = os.environ.get("REASONING_MODE", "passthrough").lower()
 # tool call). Bounds memory under long agentic sessions; oldest entries evict first.
 _REASONING_CACHE_MAX = 256
 
+# Upper bound on a user-controlled token (block/tool_choice ``type``) embedded in a
+# translation warning. Caps log/trace line length against a hostile oversized type.
+_SAFE_TOKEN_MAX = 64
+
+
+def _safe_token(value: object) -> str:
+    """Neutralize an attacker-controlled token for safe embedding in a log line or trace.
+
+    A block / tool_choice ``type`` comes straight from the client request and is
+    interpolated into a translation warning that reaches the human log and the
+    structural trace. Strips non-printable characters (newline, carriage return,
+    tab, ANSI escapes — CWE-117 log injection) and caps the result at
+    ``_SAFE_TOKEN_MAX`` so a hostile type cannot forge log records or flood the trace.
+    """
+    cleaned = "".join(ch for ch in str(value) if ch.isprintable())
+    if len(cleaned) > _SAFE_TOKEN_MAX:
+        return cleaned[:_SAFE_TOKEN_MAX] + "..."
+    return cleaned
+
 
 def _to_openai_id(anthropic_id: str) -> str:
     """Convert Anthropic tool ID to OpenAI Responses API format.
@@ -244,11 +263,12 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
     # Degrade to a type-named placeholder that NEVER echoes the block's nested content:
     # a raw str(block) would both pollute the provider request with a Python dict repr
     # AND leak the block's tool inputs/outputs.
+    safe_type = _safe_token(block_type)
     warnings.append(
-        f"Unsupported content block type '{block_type}' replaced with a redacted "
+        f"Unsupported content block type '{safe_type}' replaced with a redacted "
         "placeholder (no provider equivalent)"
     )
-    return {"type": "input_text", "text": f"[unsupported content block: {block_type}]"}, warnings
+    return {"type": "input_text", "text": f"[unsupported content block: {safe_type}]"}, warnings
 
 
 def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
@@ -336,7 +356,9 @@ def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
     elif choice_type == "tool":
         fields["tool_choice"] = {"type": "function", "name": tool_choice["name"]}
     else:
-        warnings.append(f"Unsupported tool_choice type '{choice_type}', omitting tool_choice")
+        warnings.append(
+            f"Unsupported tool_choice type '{_safe_token(choice_type)}', omitting tool_choice"
+        )
     if tool_choice.get("disable_parallel_tool_use"):
         fields["parallel_tool_calls"] = False
     return fields, warnings
