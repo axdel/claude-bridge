@@ -1,0 +1,24 @@
+# Decision Records
+
+Tracked registry for claude-bridge architecture, governance, and compatibility decisions.
+
+This file is the canonical home for decision records. Ignored local memory files such as
+`CLAUDE.md`, when present, should point here instead of duplicating the registry.
+
+## Registry
+
+| ID | Decision | Rationale | Status | Context | Invalidates |
+|-|-|-|-|-|-|
+| D-RUNTIME-001 | Keep runtime stdlib-only with zero runtime dependencies | Portability and supply-chain risk matter more than convenience helpers for this local bridge. | accepted | 2026-03-20 initial project conventions | — |
+| D-API-001 | Target OpenAI Responses API instead of Chat Completions | Responses has richer tool-call semantics, including `call_id` and `id` separation, that better match Anthropic Messages. | accepted | 2026-03-20 initial OpenAI provider | — |
+| D-AUTH-001 | Prefer API-key auth by default, with Codex OAuth as experimental fallback | Standard API-key mode is the supported path while subscription OAuth remains policy-gray and local-only. | accepted | 2026-03-20 initial OpenAI provider | — |
+| D-THINK-001 | Preserve native reasoning formats rather than cross-mapping semantics | Anthropic thinking and provider reasoning are not equivalent, so opaque passthrough or dropping is safer than pretending they translate. | accepted | 2026-03-20 reasoning-mode design | — |
+| D-REASON-001 | Stateful reasoning continuity qualifies the translation purity rule | GPT-5.5 with `store:false` requires clients to echo prior encrypted reasoning for multi-turn tool use, while the pure translation functions remain side-effect-free. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
+| D-CACHE-001 | Bound the provider-local reasoning cache with LRU eviction | A 256-entry oldest-first cache prevents hidden unbounded provider state while preserving tool-loop continuity. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
+| D-USAGE-001 | Report OpenAI usage as flat Anthropic totals | OpenAI `input_tokens` and `output_tokens` already include cached and reasoning details, so splitting them into Anthropic cache fields would double-count. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
+| D-SRVTOOL-001 | Treat unsupported server-tool blocks as redacted unsupported content | Unknown server-tool blocks have no proven target-provider equivalent, so safe degradation beats speculative translation. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
+| D-SSE-001 | Cap malformed SSE buffers instead of rewriting normal buffering | A 4 MiB cap bounds malformed streams while well-formed SSE drains quickly, making a bytearray rewrite unnecessary. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
+| D-TRACE-001 | Use open-append-close JSONL trace writes for compatibility diagnostics | The opt-in fail-open trace is simpler and more rotation-friendly without a long-lived handle. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
+| D-GOV-001 | Keep decision records in tracked `DECISIONS.md`, not ignored local `CLAUDE.md` | The registry must be committed and diffable while project-local memory remains ignored and outside branch scope. | accepted | feature/audit-drift-remediation T-001 | Ignored local `CLAUDE.md` §Key Decisions should point here out-of-band |
+| D-CONFIG-001 | Centralize runtime env ownership in a minimal stdlib `config.py` | A small config owner fixes scattered env reads without adding dependencies or broad settings injection. | accepted | feature/audit-drift-remediation plan | README.md §Configuration |
+| D-PROVIDER-001 | Declare provider stream and sync-response behavior via `ProviderCapabilities` | Provider-specific behavior should be explicit in `provider.py` while `proxy.py` continues to own HTTP transport, retries, stats, and errors. | accepted | feature/audit-drift-remediation plan | README.md §Adding a New Provider, `provider.py` provider contract |

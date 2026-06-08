@@ -324,6 +324,12 @@ src/claude_bridge/
 > (subscription) or the public API for API key auth. `$schema`, `propertyNames`,
 > and other unsupported JSON Schema keywords are automatically stripped from tool definitions.
 
+## Decision Records
+
+Architecture and compatibility decisions live in [`DECISIONS.md`](DECISIONS.md).
+Ignored local memory files such as `CLAUDE.md`, when present, should point to that
+tracked registry instead of duplicating decision rows.
+
 ## Known Limitations
 
 - Claude Code's startup banner always shows "Sonnet 4.6" regardless of actual model
