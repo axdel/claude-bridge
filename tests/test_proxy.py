@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import urllib.error
 import urllib.request
+from collections.abc import AsyncIterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
@@ -504,11 +506,20 @@ class _BrokenProvider:
     async def authenticate(self) -> dict[str, str]:
         return {}
 
-    def translate_request(self, anthropic_req: dict) -> tuple[None, list[str]]:
-        return None, []
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        # Deliberately violates the protocol (returns None where a dict is required)
+        # to drive the proxy's translation-failure path — the 502 this test asserts.
+        return None, []  # type: ignore[return-value]
 
     def translate_response(self, provider_resp: dict) -> dict:
         return {}
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        # Unreachable — this provider fails at translate_request. Present only so the
+        # class satisfies the Provider protocol structurally (it has a yield, making it
+        # an async generator that yields nothing).
+        for _ in ():
+            yield {}
 
 
 @pytest.mark.asyncio
@@ -907,7 +918,7 @@ def test_retry_request_no_retry_on_http_error():
             "http://test",
             400,
             "Bad Request",
-            {},
+            {},  # type: ignore[arg-type]
             None,  # type: ignore[arg-type]
         )
 

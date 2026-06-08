@@ -343,8 +343,13 @@ whole tree — slower, and noisy with unrelated survivors:
 ```bash
 CHANGED=$(git diff --name-only HEAD -- '*.py' | rg -v '(^|/)tests?/' | paste -sd, -)
 uv run pytest --no-cov --gremlins \
-  --gremlin-targets="$CHANGED" --gremlin-parallel --gremlin-cache
+  --gremlin-targets="$CHANGED" --gremlin-no-coverage-filter \
+  --gremlin-parallel --gremlin-cache
 ```
+
+`--gremlin-no-coverage-filter` is required: without it, gremlins consults a coverage
+map that does not yet include freshly added lines and reports them as false survivors.
+Disabling the filter runs the full selected test set per mutant — accurate, slightly slower.
 
 Target: ≥85% kill rate on changed source files (zero survivors for auth code).
 
@@ -429,7 +434,7 @@ suite.
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 202 | Minimal | Some |
+| Tests | 297 | Minimal | Some |
 
 ## Terms of Service Considerations
 
