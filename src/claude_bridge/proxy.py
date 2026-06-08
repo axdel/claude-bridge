@@ -676,6 +676,49 @@ def _get_fallback_provider() -> Provider | None:
     return None
 
 
+# HTTP status → Anthropic error type (docs.anthropic.com/en/api/errors). Anything
+# unmapped falls back to ``api_error`` so a novel upstream status never crashes.
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+    500: "api_error",
+    529: "overloaded_error",
+}
+
+
+def _anthropic_error_body(status_code: int, message: str) -> bytes:
+    """Build an Anthropic-shaped error envelope for a status code and message."""
+    error_type = _ANTHROPIC_ERROR_TYPES.get(status_code, "api_error")
+    return json.dumps(
+        {"type": "error", "error": {"type": error_type, "message": message}}
+    ).encode()
+
+
+def _provider_error_message(raw_body: bytes) -> str:
+    """Extract a human-readable message from an upstream provider error body.
+
+    Understands the OpenAI ``{"error": {"message": ...}}`` shape and degrades to the
+    decoded body (truncated) when the payload is not the expected JSON.
+    """
+    try:
+        parsed = json.loads(raw_body)
+    except (json.JSONDecodeError, ValueError):
+        return raw_body.decode("utf-8", errors="replace")[:500]
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        return error.get("message") or error.get("type") or json.dumps(error)[:500]
+    if isinstance(error, str):
+        return error
+    if isinstance(parsed, dict) and parsed.get("message"):
+        return parsed["message"]
+    return raw_body.decode("utf-8", errors="replace")[:500]
+
+
 async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, bytes]:
     """Authenticate, translate, forward to provider, translate back.
 
@@ -693,16 +736,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
             provider.name,
             type(translated).__name__,
         )
-        error = json.dumps(
-            {
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": "Provider translation failed",
-                },
-            }
-        ).encode()
-        return 502, error
+        return 502, _anthropic_error_body(502, "Provider translation failed")
     _emit_translation_warnings(warnings, translated)
 
     # Open a streaming connection and collect the full response
@@ -721,7 +755,9 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     logger.info("Provider response: %d (%dB)", status_code, len(raw_response))
     if status_code != 200:
         logger.error("Provider error: %s", raw_response[:500])
-        return status_code, raw_response
+        return status_code, _anthropic_error_body(
+            status_code, _provider_error_message(raw_response)
+        )
 
     # The Codex backend always streams (even for non-streaming clients) and its
     # response.completed.output is empty — the text/reasoning/tool-calls live only
@@ -735,12 +771,12 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         events = [event async for event in provider.translate_stream(_single_chunk())]
     except Exception:
         logger.exception("Provider stream translation failed")
-        return 502, json.dumps({"error": "could not parse provider response"}).encode()
+        return 502, _anthropic_error_body(502, "could not parse provider response")
 
     anthropic_response = _aggregate_stream_to_message(events)
     if anthropic_response is None:
         logger.error("Provider stream carried no message_start: %s", raw_response[:200])
-        return 502, json.dumps({"error": "could not parse provider response"}).encode()
+        return 502, _anthropic_error_body(502, "could not parse provider response")
 
     _trace_provider_response(anthropic_response)
     return 200, json.dumps(anthropic_response).encode()
@@ -986,13 +1022,15 @@ async def _stream_via_provider(
     try:
         resp = await asyncio.to_thread(_open_stream)
     except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")[:500]
-        logger.error("Provider HTTP %d: %s", exc.code, err_body)
-        _write_response(writer, exc.code, json.dumps({"error": err_body}).encode())
+        err_body = exc.read()
+        logger.error("Provider HTTP %d: %s", exc.code, err_body[:500])
+        _write_response(
+            writer, exc.code, _anthropic_error_body(exc.code, _provider_error_message(err_body))
+        )
         return
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.error("Provider connection error: %s", exc)
-        _write_response(writer, 502, json.dumps({"error": "provider unavailable"}).encode())
+        _write_response(writer, 502, _anthropic_error_body(502, "provider unavailable"))
         return
 
     _write_sse_headers(writer)

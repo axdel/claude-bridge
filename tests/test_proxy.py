@@ -894,12 +894,15 @@ async def test_stream_via_provider_http_error_returns_error():
                 "stream": True,
                 "messages": [{"role": "user", "content": "hi"}],
             }
-            status, _data = await asyncio.to_thread(
+            status, data = await asyncio.to_thread(
                 _http_post,
                 f"http://127.0.0.1:{proxy_port}/v1/messages",
                 request_body,
             )
             assert status == 500
+            # The provider error is translated to an Anthropic error envelope.
+            assert data["type"] == "error"
+            assert data["error"]["type"] == "api_error"
         finally:
             proxy_server.close()
             await proxy_server.wait_closed()
@@ -1424,3 +1427,115 @@ async def test_forward_via_provider_unparseable_stream_returns_502(_codex_sse_mo
     status, _body = await _forward_via_provider(provider, _anthropic_request_bytes())
 
     assert status == 502
+
+
+# ---------------------------------------------------------------------------
+# Provider error translation: upstream OpenAI errors → Anthropic error envelope
+# (so a Codex 400 context_length_exceeded reaches Claude Code cleanly, not as a
+# raw OpenAI shape).
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_error_body_maps_status_to_type():
+    """HTTP status maps to the Anthropic error type from the API spec table."""
+    from claude_bridge.proxy import _anthropic_error_body
+
+    # Oracle: Anthropic API error types (docs.anthropic.com/en/api/errors).
+    cases = {
+        400: "invalid_request_error",
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        413: "request_too_large",
+        429: "rate_limit_error",
+        500: "api_error",
+        529: "overloaded_error",
+    }
+    for status, expected_type in cases.items():
+        body = json.loads(_anthropic_error_body(status, "boom"))
+        assert body == {"type": "error", "error": {"type": expected_type, "message": "boom"}}
+
+
+def test_anthropic_error_body_unknown_status_is_api_error():
+    """An unmapped status defaults to api_error (never crashes)."""
+    from claude_bridge.proxy import _anthropic_error_body
+
+    body = json.loads(_anthropic_error_body(418, "teapot"))
+    assert body["error"]["type"] == "api_error"
+    assert body["error"]["message"] == "teapot"
+
+
+def test_provider_error_message_extracts_openai_message():
+    """The OpenAI {'error': {'message': ...}} shape yields just the message."""
+    from claude_bridge.proxy import _provider_error_message
+
+    raw = json.dumps(
+        {
+            "error": {
+                "message": "Input tokens exceed the configured limit of 400000 tokens.",
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+            }
+        }
+    ).encode()
+    # Oracle: the human-readable string is .error.message, not the whole envelope.
+    assert (
+        _provider_error_message(raw)
+        == "Input tokens exceed the configured limit of 400000 tokens."
+    )
+
+
+def test_provider_error_message_non_json_falls_back_to_body():
+    """A non-JSON error body is surfaced verbatim (decoded, truncated)."""
+    from claude_bridge.proxy import _provider_error_message
+
+    assert _provider_error_message(b"502 Bad Gateway") == "502 Bad Gateway"
+
+
+class _MockOverflowHandler(BaseHTTPRequestHandler):
+    """Returns HTTP 400 with the OpenAI context_length_exceeded error shape."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        payload = json.dumps(
+            {
+                "error": {
+                    "message": "Input tokens exceed the configured limit of 400000 tokens.",
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                }
+            }
+        ).encode()
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_overflow_returns_anthropic_error():
+    """A Codex 400 overflow is translated to an Anthropic error envelope (not raw)."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _MockOverflowHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        provider = _provider_at(f"http://127.0.0.1:{port}/v1/responses")
+        status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    finally:
+        server.shutdown()
+
+    assert status == 400
+    response = json.loads(body)
+    # Oracle: Anthropic error shape; 400 -> invalid_request_error; message preserved.
+    assert response["type"] == "error"
+    assert response["error"]["type"] == "invalid_request_error"
+    assert "400000" in response["error"]["message"]
+    # The raw OpenAI envelope must NOT leak through.
+    assert "error" not in json.loads(body).get("error", {})
