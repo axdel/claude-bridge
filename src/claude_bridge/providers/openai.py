@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -130,6 +131,10 @@ _STRIPPED_KEYS = ("output_config",)
 
 # Reasoning mode: "passthrough" preserves thinking blocks, "drop" strips them.
 _REASONING_MODE = os.environ.get("REASONING_MODE", "passthrough").lower()
+
+# Upper bound on the per-provider encrypted-reasoning cache (one entry per in-flight
+# tool call). Bounds memory under long agentic sessions; oldest entries evict first.
+_REASONING_CACHE_MAX = 256
 
 
 def _to_openai_id(anthropic_id: str) -> str:
@@ -356,12 +361,19 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     model = request.get("model", "")
     translated_model = MODEL_MAP.get(model, DEFAULT_MODEL)
 
-    # Build result — Codex endpoint requires stream: true
+    # Build result — Codex endpoint requires stream: true.
+    # include=reasoning.encrypted_content: with store:false the model is stateless,
+    # so it returns each reasoning item's encrypted continuation blob. The provider
+    # echoes these back before their function_calls on the next turn (see
+    # _associate_reasoning_with_calls / OpenAIProvider._inject_reasoning); without it
+    # gpt-5-class models reject the follow-up with "function_call was provided without
+    # its required reasoning item".
     result: dict = {
         "model": translated_model,
         "reasoning": {"effort": "xhigh"},
         "store": False,
         "stream": True,
+        "include": ["reasoning.encrypted_content"],
     }
 
     # System prompt → instructions (required by Codex endpoint)
@@ -476,6 +488,38 @@ def openai_to_anthropic(response: dict) -> dict:
         "content": content,
         "usage": usage,
     }
+
+
+def _associate_reasoning_with_calls(output: list[dict]) -> dict[str, dict]:
+    """Map each tool call's id to the reasoning item that immediately precedes it.
+
+    Walks the Responses ``output`` once: a reasoning item carrying
+    ``encrypted_content`` becomes the pending continuation state for the next
+    function_call; once paired (or interrupted by any other item) it is consumed.
+    Keys use the call's ``call_id`` (falling back to ``id``) normalized to ``fc_``
+    form — the same identity ``openai_to_anthropic`` exposes to Claude Code — so the
+    next request's function_calls look up by the matching key.
+
+    Pure function — no I/O, no state.
+    """
+    associations: dict[str, dict] = {}
+    pending: dict | None = None
+    for item in output:
+        if not isinstance(item, dict):
+            pending = None
+            continue
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            pending = item if item.get("encrypted_content") else None
+        elif item_type == "function_call":
+            if pending is not None:
+                key = _to_openai_id(item.get("call_id") or item.get("id", ""))
+                if key:
+                    associations[key] = pending
+            pending = None
+        else:
+            pending = None
+    return associations
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +762,11 @@ class OpenAIProvider:
             self.endpoint = _API_KEY_ENDPOINT
         else:
             self.endpoint = _CODEX_ENDPOINT
+        # Encrypted reasoning blobs keyed by fc_ call id, captured from responses and
+        # re-injected before their function_calls on the next request. In-memory only —
+        # opaque, never persisted, never logged, never returned to Claude Code.
+        self._reasoning_by_call_id: dict[str, dict] = {}
+        self._reasoning_lock = threading.Lock()
 
     async def authenticate(self) -> dict[str, str]:
         """Return Authorization header with a valid bearer token."""
@@ -732,13 +781,64 @@ class OpenAIProvider:
         token = await get_bearer_token(self._auth_path)
         return {"Authorization": f"Bearer {token}"}
 
+    def _stash_reasoning(self, associations: dict[str, dict]) -> None:
+        """Store captured reasoning blobs, refreshing recency and evicting the oldest
+        entries once the cache exceeds its bound."""
+        if not associations:
+            return
+        with self._reasoning_lock:
+            for call_id, reasoning in associations.items():
+                self._reasoning_by_call_id.pop(call_id, None)
+                self._reasoning_by_call_id[call_id] = reasoning
+            while len(self._reasoning_by_call_id) > _REASONING_CACHE_MAX:
+                oldest = next(iter(self._reasoning_by_call_id))
+                del self._reasoning_by_call_id[oldest]
+
+    def _inject_reasoning(self, translated: dict) -> None:
+        """Insert each cached reasoning item immediately before the function_call it
+        belongs to, in-place on ``translated['input']``. Each reasoning item is inserted
+        at most once (a duplicate item id would be rejected), so parallel calls sharing
+        one reasoning item get a single preceding copy."""
+        input_items = translated.get("input")
+        if not isinstance(input_items, list):
+            return
+        with self._reasoning_lock:
+            if not self._reasoning_by_call_id:
+                return
+            cache = dict(self._reasoning_by_call_id)
+        new_input: list[dict] = []
+        inserted: set = set()
+        for item in input_items:
+            if item.get("type") == "function_call":
+                key = _to_openai_id(item.get("call_id") or item.get("id", ""))
+                reasoning = cache.get(key)
+                if reasoning is not None:
+                    dedup_key = reasoning.get("id") or id(reasoning)
+                    if dedup_key not in inserted:
+                        new_input.append(reasoning)
+                        inserted.add(dedup_key)
+            new_input.append(item)
+        translated["input"] = new_input
+
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
-        """Translate Anthropic Messages request to OpenAI Responses request."""
-        return anthropic_to_openai(anthropic_req)
+        """Translate Anthropic Messages request to OpenAI Responses request, echoing any
+        captured encrypted reasoning back before its function_calls."""
+        result, warnings = anthropic_to_openai(anthropic_req)
+        self._inject_reasoning(result)
+        return result, warnings
 
     def translate_response(self, provider_resp: dict) -> dict:
-        """Translate OpenAI Responses response to Anthropic Messages response."""
+        """Translate OpenAI Responses response to Anthropic Messages response, capturing
+        each function_call's preceding encrypted reasoning for the next request."""
+        self._stash_reasoning(_associate_reasoning_with_calls(provider_resp.get("output", [])))
         return openai_to_anthropic(provider_resp)
+
+    def _capture_stream_reasoning(self, parsed_event: dict) -> None:
+        """Capture encrypted reasoning from a streamed response.completed event."""
+        if parsed_event.get("event") != "response.completed":
+            return
+        response_obj = (parsed_event.get("data") or {}).get("response") or {}
+        self._stash_reasoning(_associate_reasoning_with_calls(response_obj.get("output", [])))
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw provider byte chunks to Anthropic SSE events.
@@ -760,6 +860,7 @@ class OpenAIProvider:
                 event_bytes = buffer[:event_end]
                 buffer = buffer[event_end:]
                 for parsed_event in parse_sse_events(event_bytes):
+                    self._capture_stream_reasoning(parsed_event)
                     for translated in translate_openai_sse_event(parsed_event):
                         translated, block_index, has_tool_calls = _remap_block_index(
                             translated, index_map, block_index, has_tool_calls
@@ -767,6 +868,7 @@ class OpenAIProvider:
                         yield translated
         if buffer.strip():
             for parsed_event in parse_sse_events(buffer):
+                self._capture_stream_reasoning(parsed_event)
                 for translated in translate_openai_sse_event(parsed_event):
                     translated, block_index, has_tool_calls = _remap_block_index(
                         translated, index_map, block_index, has_tool_calls

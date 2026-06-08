@@ -1123,6 +1123,22 @@ class TestSummarizeProviderRequest:
         translated, warnings = anthropic_to_openai(_secret_laden_request())
         _assert_no_secrets(_summarize_provider_request(translated, len(warnings)))
 
+    def test_injected_encrypted_reasoning_never_leaks(self):
+        # The provider echoes opaque encrypted reasoning into the outbound request
+        # (T-005). The summarizer must count it as an input item, never serialize it.
+        from claude_bridge.proxy import _summarize_provider_request
+
+        translated = {
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "SECRET_REASONING"},
+                {"type": "function_call", "id": "fc_1", "call_id": "fc_1", "name": "Read"},
+            ],
+        }
+        summary = _summarize_provider_request(translated, 0)
+        assert summary["input_items"] == 2
+        assert "SECRET_REASONING" not in json.dumps(summary)
+
 
 class TestSummarizeAnthropicResponse:
     """_summarize_anthropic_response emits stop_reason, block counts, and token
