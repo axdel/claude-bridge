@@ -86,6 +86,15 @@ def _http_post_raw(url: str, body: dict, headers: dict | None = None) -> tuple[i
         return exc.code, exc.read()
 
 
+def _http_post_stream_raw(url: str, body: dict) -> tuple[int, bytes]:
+    """Stdlib HTTP POST helper for SSE responses — returns status and raw bytes."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, resp.read()
+
+
 def _http_get(url: str) -> int:
     """Stdlib HTTP GET — returns status code only."""
     req = urllib.request.Request(url, method="GET")
@@ -1181,6 +1190,94 @@ async def test_stream_via_provider_connection_refused_returns_502():
             await proxy_server.wait_closed()
     finally:
         cleanup()
+
+
+class _StreamFailureProvider:
+    """Provider that fails after SSE headers have already been written."""
+
+    name = "stream-failure"
+    endpoint = "http://127.0.0.1:1/unused"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+    )
+
+    async def authenticate(self) -> dict[str, str]:
+        return {}
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        return {"model": anthropic_req["model"], "input": []}, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return provider_resp
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        async for _chunk in raw_chunks:
+            raise ValueError("stream translation failed")
+            yield {}
+
+
+class _ProviderOkStreamHandler(BaseHTTPRequestHandler):
+    """Returns one provider byte chunk so translate_stream starts after headers."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        payload = b"data: {}\n\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_stream_via_provider_post_header_failure_emits_error_event_and_stats():
+    """Provider stream translation failures emit SSE error events and count as errors."""
+    provider_port = _find_free_port()
+    provider_server = HTTPServer(("127.0.0.1", provider_port), _ProviderOkStreamHandler)
+    provider_thread = Thread(target=provider_server.serve_forever, daemon=True)
+    provider_thread.start()
+    provider = _StreamFailureProvider()
+    provider.endpoint = f"http://127.0.0.1:{provider_port}/stream"
+
+    from claude_bridge.proxy import _make_handler
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    stats = BridgeStats()
+    proxy_port = _find_free_port()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, stats)
+    proxy_server = await asyncio.start_server(handler, "127.0.0.1", proxy_port)
+    try:
+        status, raw_body = await asyncio.to_thread(
+            _http_post_stream_raw,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+        assert status == 200
+        assert b"event: error" in raw_body
+        assert b"Unexpected provider stream failure" in raw_body
+
+        stats_status, stats_body = await asyncio.to_thread(
+            _http_post_raw,
+            f"http://127.0.0.1:{proxy_port}/stats",
+            {},
+        )
+        assert stats_status == 200
+        assert json.loads(stats_body)["errors_total"] == 1
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+        provider_server.shutdown()
 
 
 @pytest.mark.asyncio

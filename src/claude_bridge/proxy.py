@@ -255,13 +255,17 @@ def _record_sync_response(
     stats.record_response(status_code, latency_ms, tokens_in, tokens_out)
 
 
-def _record_latency(stats: BridgeStats | None, request_start: float) -> None:
-    """Record latency only (for streaming responses where tokens aren't easily available)."""
+def _record_stream_response(
+    stats: BridgeStats | None,
+    request_start: float,
+    status_code: int,
+) -> None:
+    """Record streaming latency with the observed terminal status."""
     if stats is None:
         return
 
     latency_ms = (_time.monotonic() - request_start) * 1000
-    stats.record_response(200, latency_ms, 0, 0)
+    stats.record_response(status_code, latency_ms, 0, 0)
 
 
 def _is_streaming(body: bytes) -> bool:
@@ -568,8 +572,8 @@ async def _route_request(
         if stats:
             stats.set_provider_info(provider.name, request_model)
         if streaming:
-            await _stream_via_provider(provider, body, writer)
-            _record_latency(stats, request_start)
+            status_code = await _stream_via_provider(provider, body, writer)
+            _record_stream_response(stats, request_start, status_code)
         else:
             status_code, response_body = await _forward_via_provider(provider, body)
             _write_response(writer, status_code, response_body)
@@ -578,8 +582,8 @@ async def _route_request(
         logger.info("-> passthrough (stream) model=%s", request_model)
         if stats:
             stats.set_provider_info("anthropic", request_model)
-        await _stream_passthrough(upstream_url, body, headers, writer)
-        _record_latency(stats, request_start)
+        status_code = await _stream_passthrough(upstream_url, body, headers, writer)
+        _record_stream_response(stats, request_start, status_code)
     else:
         logger.info("-> auto-route (sync) model=%s", request_model)
         if stats:
@@ -1010,7 +1014,7 @@ async def _stream_passthrough(
     body: bytes,
     client_headers: dict[str, str],
     writer: asyncio.StreamWriter,
-) -> None:
+) -> int:
     """Stream an SSE response from the Anthropic upstream back to the client unchanged."""
 
     def _open_stream():
@@ -1025,7 +1029,7 @@ async def _stream_passthrough(
         resp = await asyncio.to_thread(_open_stream)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
         _write_response(writer, 502, json.dumps({"error": "upstream unavailable"}).encode())
-        return
+        return 502
 
     _write_sse_headers(writer)
 
@@ -1037,21 +1041,23 @@ async def _stream_passthrough(
             await _safe_write(writer, chunk)
     except _ClientDisconnected:
         logger.debug("Client disconnected during passthrough stream")
+        return 499
     finally:
         resp.close()
+    return 200
 
 
 async def _stream_via_provider(
     provider: Provider,
     body: bytes,
     writer: asyncio.StreamWriter,
-) -> None:
+) -> int:
     """Translate request, stream from provider, translate SSE events back to Anthropic format."""
     try:
         request_dict = json.loads(body)
     except (json.JSONDecodeError, ValueError):
         _write_response(writer, 400, _anthropic_error_body(400, "Malformed JSON request"))
-        return
+        return 400
     try:
         # Authenticate first — some providers need auth context before translation
         auth_headers = await provider.authenticate()
@@ -1059,7 +1065,7 @@ async def _stream_via_provider(
     except Exception:
         logger.exception("Provider preflight failed")
         _write_response(writer, 502, _anthropic_error_body(502, "Provider preflight failed"))
-        return
+        return 502
     if not isinstance(translated, dict):
         logger.warning(
             "Provider %s translate_request returned %s, expected dict",
@@ -1079,7 +1085,7 @@ async def _stream_via_provider(
                 }
             ).encode(),
         )
-        return
+        return 502
     _emit_translation_warnings(warnings, translated)
 
     # Enable streaming on the translated request when the provider declares body selection.
@@ -1110,11 +1116,11 @@ async def _stream_via_provider(
         _write_response(
             writer, exc.code, _anthropic_error_body(exc.code, _provider_error_message(err_body))
         )
-        return
+        return exc.code
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.error("Provider connection error: %s", exc)
         _write_response(writer, 502, _anthropic_error_body(502, "provider unavailable"))
-        return
+        return 502
 
     _write_sse_headers(writer)
 
@@ -1139,8 +1145,26 @@ async def _stream_via_provider(
             await _safe_write(writer, sse_bytes)
     except _ClientDisconnected:
         logger.debug("Client disconnected during provider stream")
+        return 499
     except Exception:
         logger.exception("Unexpected error during provider stream")
+        error_event = format_anthropic_sse(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "Unexpected provider stream failure",
+                },
+            },
+        )
+        try:
+            await _safe_write(writer, error_event)
+        except _ClientDisconnected:
+            logger.debug("Client disconnected before provider stream error event")
+            return 499
+        return 502
+    return 200
 
 
 def _write_response(
