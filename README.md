@@ -69,8 +69,9 @@ of leaking provider-incompatible content.
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
-- **Multi-provider** — adding a provider = one provider file plus registration import
-- **321 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
+- **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
+- **343 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -252,7 +253,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | `REASONING_MODE` | `passthrough` | OpenAI thinking-block handling: `passthrough` preserves tagged thinking text, `drop` strips it. Gemini strips thinking blocks because it has no equivalent |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `UPSTREAM_TIMEOUT` | caller default (`60` sync / `120` streaming) | Upstream request timeout in seconds; invalid, zero, or negative values fall back to the caller default |
-| `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10MB) |
+| `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10 MiB) |
 | `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback preference list; the first registered provider is used |
 | `LLM_BRIDGE_PORT` | `9999` | Shell launcher default proxy port |
 | `ANTHROPIC_REAL_URL` | `https://api.anthropic.com` | Real Anthropic endpoint (passthrough) |
@@ -281,14 +282,19 @@ src/claude_bridge/
 
 1. Create `src/claude_bridge/providers/yourprovider.py`
 2. Implement the `Provider` protocol:
+   - `capabilities` — declare `ProviderCapabilities(stream_request_mode=..., sync_response_mode=...)`
    - `authenticate()` — return auth headers
    - `translate_request()` — Anthropic -> your format
    - `translate_response()` — your format -> Anthropic
    - `translate_stream()` — raw bytes -> Anthropic SSE events
-3. Register: `PROVIDERS["yourprovider"] = YourProvider`
-4. Import in `__main__.py`
+3. Register only implemented providers: `PROVIDERS["yourprovider"] = YourProvider`
+4. Import registered providers in `__main__.py`
 5. Use: `./start.sh --provider yourprovider`
 6. Optionally copy `claude-codex` -> `claude-yourprovider` (change `--provider` and banner model)
+
+Capability modes are explicit: `stream_request_mode="body_parameter"` means the proxy sets `stream: true` in the provider request body, while `stream_request_mode="url"` means streaming is selected by endpoint URL. `sync_response_mode="sse"` keeps the current SSE aggregation path for non-streaming Anthropic clients; `sync_response_mode="json"` parses provider JSON and calls `translate_response()` directly.
+
+Unimplemented placeholders should stay unregistered and unimported, like the current xAI stub.
 
 ### OpenAI Translation Map
 
@@ -466,7 +472,7 @@ suite.
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 321 | Minimal | Some |
+| Tests | 343 | Minimal | Some |
 
 ## Terms of Service Considerations
 

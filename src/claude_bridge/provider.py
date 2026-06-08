@@ -1,8 +1,7 @@
 """Abstract provider interface for LLM API translation.
 
-Every LLM provider (OpenAI, Gemini, xAI, etc.) implements the ``Provider``
-protocol defined here. The proxy never imports provider-specific code —
-it only uses this interface.
+Every registered LLM provider implements the ``Provider`` protocol defined here.
+The proxy never imports provider-specific code — it only uses this interface.
 
 To add a new provider:
 

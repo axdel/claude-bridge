@@ -1,8 +1,8 @@
-"""xAI Grok provider stub — placeholder for future implementation.
+"""xAI Grok provider placeholder for future implementation.
 
-Implements the Provider protocol with NotImplementedError stubs.
-To complete: fill in authenticate(), translate_request(), translate_response(),
-and translate_stream() with xAI API specifics.
+This module intentionally does not register ``XAIProvider`` in ``PROVIDERS``.
+To enable xAI, implement authentication plus request/response/stream translation,
+declare provider capabilities, then register and import the provider.
 """
 
 from __future__ import annotations
@@ -20,14 +20,14 @@ class XAIProvider:
         """Return xAI auth headers. Requires XAI_API_KEY env var."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
 
-    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+    def translate_request(self, _anthropic_req: dict) -> tuple[dict, list[str]]:
         """Translate Anthropic request to xAI format."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
 
-    def translate_response(self, provider_resp: dict) -> dict:
+    def translate_response(self, _provider_resp: dict) -> dict:
         """Translate xAI response back to Anthropic format."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
 
-    def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+    def translate_stream(self, _raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw xAI byte chunks to Anthropic-format SSE events."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
