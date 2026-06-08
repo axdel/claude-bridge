@@ -118,6 +118,29 @@ class TestOpenAIToAnthropicSSETranslation:
         assert msg["usage"]["input_tokens"] == 42
         assert msg["usage"]["output_tokens"] == 0
 
+    def test_response_created_usage_coerced_to_int(self):
+        # message_start carries the first input_tokens estimate Claude Code's
+        # /context bar renders. A float there breaks the integer accounting just
+        # like on the completion path — coerce both ends of the stream.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.created",
+            "data": {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_flt_start",
+                    "model": "gpt-5.5",
+                    "status": "in_progress",
+                    "usage": {"input_tokens": 42.0, "output_tokens": 0},
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        usage = results[0]["data"]["message"]["usage"]
+        assert usage["input_tokens"] == 42
+        assert isinstance(usage["input_tokens"], int)
+
     def test_content_part_added_emits_content_block_start(self):
         from claude_bridge.providers.openai import translate_openai_sse_event
 
@@ -227,6 +250,111 @@ class TestOpenAIToAnthropicSSETranslation:
         results = translate_openai_sse_event(event)
         assert results[0]["data"]["delta"]["stop_reason"] == "max_tokens"
 
+    def test_completed_max_output_tokens_maps_to_max_tokens(self):
+        # incomplete_details.reason == "max_output_tokens" is the genuine
+        # token-budget exhaustion signal — must surface as max_tokens.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.completed",
+            "data": {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_mot",
+                    "model": "gpt-5.5",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 5, "output_tokens": 100},
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        message_delta = next(r for r in results if r["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "max_tokens"
+
+    def test_completed_content_filter_maps_to_end_turn_not_max_tokens(self):
+        # A content-filtered completion is NOT budget exhaustion. Mapping it to
+        # max_tokens makes Claude Code's auto-compact think it ran out of room and
+        # retry forever. content_filter must terminate the turn cleanly (end_turn).
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.completed",
+            "data": {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_cf",
+                    "model": "gpt-5.5",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "content_filter"},
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        message_delta = next(r for r in results if r["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "end_turn"
+
+    def test_completed_content_filter_synthesizes_refusal_block(self):
+        # A bare end_turn with empty content would render as a blank assistant
+        # turn in Claude Code. Synthesize a visible refusal text block so the
+        # user learns why the turn stopped — mirrors the Gemini SAFETY path.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.completed",
+            "data": {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_cf2",
+                    "model": "gpt-5.5",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "content_filter"},
+                    "usage": {"input_tokens": 5, "output_tokens": 0},
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        events = [r["event"] for r in results]
+        assert events == [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+        start = results[0]["data"]
+        assert start["content_block"] == {"type": "text", "text": ""}
+        delta = results[1]["data"]
+        assert delta["delta"]["type"] == "text_delta"
+        assert delta["delta"]["text"].strip() != ""
+
+    def test_message_delta_usage_coerced_to_int(self):
+        # Some providers emit float token counts. Anthropic usage fields are
+        # integers — a float leaks the provider's wire format into Claude Code's
+        # context accounting. Coerce on the streaming path too.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.completed",
+            "data": {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_flt",
+                    "model": "gpt-5.5",
+                    "status": "completed",
+                    "usage": {"input_tokens": 10.0, "output_tokens": 25.7},
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        message_delta = next(r for r in results if r["event"] == "message_delta")
+        usage = message_delta["data"]["usage"]
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 25
+        assert isinstance(usage["input_tokens"], int)
+        assert isinstance(usage["output_tokens"], int)
+
 
 # ---------------------------------------------------------------------------
 # translate_stream integration tests
@@ -252,7 +380,7 @@ class TestTranslateStream:
         """Multiple SSE events in one chunk are all translated."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         created_event = _make_sse_event(
             "response.created",
@@ -293,7 +421,7 @@ class TestTranslateStream:
         """An SSE event split across two byte chunks is correctly buffered."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         full_event = _make_sse_event(
             "response.output_text.delta",
@@ -323,7 +451,7 @@ class TestTranslateStream:
         """CRLF line endings in SSE are normalized and parsed correctly."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         event_bytes = (
             b"event: response.output_text.delta\r\n"
@@ -343,7 +471,7 @@ class TestTranslateStream:
         """Events with no Anthropic equivalent are silently skipped."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         # response.output_item.added for a non-function_call item produces no output
         event_bytes = _make_sse_event(
@@ -366,7 +494,7 @@ class TestTranslateStream:
         """Empty byte chunks don't produce events or errors."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         text_event = _make_sse_event(
             "response.output_text.delta",
@@ -385,47 +513,71 @@ class TestTranslateStream:
         assert len(events) == 1
         assert events[0]["data"]["delta"]["text"] == "ok"
 
+    @pytest.mark.asyncio
+    async def test_content_filter_refusal_block_gets_sequential_index(self):
+        """A content-filtered stream with prior text yields a refusal block whose
+        index follows the real text block (1), not a duplicate of it (0)."""
+        from claude_bridge.providers.openai import OpenAIProvider
 
-# ---------------------------------------------------------------------------
-# _extract_completed_response tests
-# ---------------------------------------------------------------------------
+        provider = OpenAIProvider()
 
-
-class TestExtractCompletedResponse:
-    """Tests for proxy._extract_completed_response() SSE parser."""
-
-    def test_finds_response_completed(self):
-        from claude_bridge.proxy import _extract_completed_response
-
-        sse = (
-            b"event: response.created\n"
-            b'data: {"type":"response.created","response":{"id":"r1"}}\n\n'
-            b"event: response.completed\n"
-            b'data: {"type":"response.completed",'
-            b'"response":{"id":"r1","status":"completed","output":[]}}\n\n'
+        part_added = _make_sse_event(
+            "response.content_part.added",
+            {"type": "response.content_part.added", "content_index": 0},
         )
-        result = _extract_completed_response(sse)
-        assert result is not None
-        assert result["id"] == "r1"
-        assert result["status"] == "completed"
-
-    def test_returns_none_when_no_completed(self):
-        from claude_bridge.proxy import _extract_completed_response
-
-        sse = (
-            b"event: response.created\n"
-            b'data: {"type":"response.created","response":{"id":"r1"}}\n\n'
+        text_delta = _make_sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "partial",
+            },
         )
-        result = _extract_completed_response(sse)
-        assert result is None
+        text_done = _make_sse_event(
+            "response.output_text.done",
+            {
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "partial",
+            },
+        )
+        completed = _make_sse_event(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_cf3",
+                    "model": "gpt-5.5",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "content_filter"},
+                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                },
+            },
+        )
 
-    def test_handles_malformed_json_lines(self):
-        from claude_bridge.proxy import _extract_completed_response
+        events = []
+        async for event in provider.translate_stream(
+            _chunks_from([part_added + text_delta + text_done + completed])
+        ):
+            events.append(event)
 
-        sse = b'data: not-json\n\ndata: {"type":"response.completed","response":{"id":"r2"}}\n\n'
-        result = _extract_completed_response(sse)
-        assert result is not None
-        assert result["id"] == "r2"
+        # Real text block is index 0; the synthesized refusal block must be index 1.
+        refusal_starts = [
+            e for e in events if e["event"] == "content_block_start" and e["data"]["index"] == 1
+        ]
+        assert len(refusal_starts) == 1
+        refusal_delta = next(
+            e
+            for e in events
+            if e["event"] == "content_block_delta"
+            and e["data"].get("delta", {}).get("type") == "text_delta"
+            and e["data"]["index"] == 1
+        )
+        assert refusal_delta["data"]["delta"]["text"].strip() != ""
+        message_delta = next(e for e in events if e["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "end_turn"
 
 
 # ---------------------------------------------------------------------------
@@ -443,3 +595,36 @@ class TestSSEFormatRoundTrip:
         assert len(parsed) == 1
         assert parsed[0]["event"] == "content_block_delta"
         assert parsed[0]["data"]["delta"]["text"] == "hello"
+
+
+class TestStreamBufferBounding:
+    """A provider that streams without "\n\n" event terminators must not grow the
+    SSE buffer without bound (OOM) or hang — translate_stream caps the undrained
+    buffer and aborts fast. See SCL-2."""
+
+    @pytest.mark.asyncio
+    async def test_aborts_when_unterminated_buffer_exceeds_cap(self, monkeypatch):
+        from claude_bridge.providers import openai as openai_mod
+
+        monkeypatch.setattr(openai_mod, "_MAX_SSE_BUFFER", 64)
+        provider = openai_mod.OpenAIProvider()
+        # Five 32-byte chunks with no "\n\n" → 160 bytes accumulated, never a complete
+        # event. Oracle: the cap contract aborts a malformed stream rather than
+        # buffering it without limit.
+        chunks = [b"x" * 32] * 5
+
+        with pytest.raises(RuntimeError, match="malformed"):
+            async for _ in provider.translate_stream(_chunks_from(chunks)):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_does_not_abort_at_exact_cap(self, monkeypatch):
+        from claude_bridge.providers import openai as openai_mod
+
+        monkeypatch.setattr(openai_mod, "_MAX_SSE_BUFFER", 64)
+        provider = openai_mod.OpenAIProvider()
+        # Exactly cap bytes, still unterminated: the bound is exclusive, so this must
+        # NOT abort — kills the > vs >= off-by-one on the cap check. Garbage bytes
+        # parse to zero events at the tail; the assertion is the absence of a raise.
+        events = [e async for e in provider.translate_stream(_chunks_from([b"x" * 64]))]
+        assert events == []

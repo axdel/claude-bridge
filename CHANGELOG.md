@@ -2,6 +2,27 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-06-08
+
+### feat: claude Code wire compatibility for the OpenAI Responses provider ([PR #8](https://github.com/axdel/claude-bridge/pull/8))
+Faithful Claude Code wire translation for GPT-5.5: serialized tool loops, encrypted-reasoning continuity, stop/usage disambiguation, non-streaming aggregation, and Anthropic error envelopes.
+
+- [`98dddb7`](https://github.com/axdel/claude-bridge/commit/98dddb7) Translate provider errors to Anthropic error envelopes
+- [`65c81df`](https://github.com/axdel/claude-bridge/commit/65c81df) Aggregate Codex SSE stream for non-streaming requests
+- [`28aed6f`](https://github.com/axdel/claude-bridge/commit/28aed6f) Split oversized test files (QAL3 + QAL4)
+- [`2ebf018`](https://github.com/axdel/claude-bridge/commit/2ebf018) Harden OpenAIProvider tests (QAL2 construction + REQ2 concurrency)
+- [`1370998`](https://github.com/axdel/claude-bridge/commit/1370998) Make trace failures visible and refuse non-regular trace targets (OPS1/OPS2)
+- [`db15cc7`](https://github.com/axdel/claude-bridge/commit/db15cc7) Bound the SSE buffer to abort malformed provider streams (SCL-2)
+- [`aa1e0b8`](https://github.com/axdel/claude-bridge/commit/aa1e0b8) Sanitize translation-warning tokens (CWE-117) and trace warning strings
+- [`d12830f`](https://github.com/axdel/claude-bridge/commit/d12830f) Fix test_proxy type errors; doc: mutation flag + verification
+- [`d75298c`](https://github.com/axdel/claude-bridge/commit/d75298c) Add optional Moonshot/Kimi oracle verification workflow
+- [`260e0af`](https://github.com/axdel/claude-bridge/commit/260e0af) Redact unsupported server-tool/MCP content blocks instead of stringifying
+- [`bb41af1`](https://github.com/axdel/claude-bridge/commit/bb41af1) Disambiguate content_filter from token exhaustion in OpenAI stop/usage
+- [`570dfae`](https://github.com/axdel/claude-bridge/commit/570dfae) Provider-local reasoning continuity across tool turns
+- [`cf86cf4`](https://github.com/axdel/claude-bridge/commit/cf86cf4) Add redacted compatibility trace mode
+- [`c97cc28`](https://github.com/axdel/claude-bridge/commit/c97cc28) Map Anthropic tool_choice and parallel controls (T-002)
+- [`5849506`](https://github.com/axdel/claude-bridge/commit/5849506) Add Claude Code wire-contract fixtures (T-001)
+
 ## 2026-05-05
 
 ### v0.6.4 — Gemini Stability and Tool-Use Fixes

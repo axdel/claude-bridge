@@ -682,8 +682,9 @@ class TestTranslationRobustness:
         assert len(fco) == 1
         assert "https://example.com/img.png" in fco[0]["output"]
 
-    def test_unknown_content_block_type_converted_with_warning(self):
-        """Unknown block type falls back to input_text with a warning."""
+    def test_unknown_content_block_becomes_redacted_placeholder(self):
+        """An unsupported block degrades to a type-named placeholder that omits its
+        nested content, with a warning — no raw str(block) leakage (D-SRVTOOL-001)."""
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -691,7 +692,7 @@ class TestTranslationRobustness:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "exotic_block", "data": "something"},
+                        {"type": "exotic_block", "data": "SECRET_NESTED_DATA"},
                     ],
                 }
             ],
@@ -699,8 +700,12 @@ class TestTranslationRobustness:
         result, warnings = anthropic_to_openai(request)
         user_msg = [i for i in result["input"] if i.get("role") == "user"]
         assert len(user_msg) == 1
-        assert user_msg[0]["content"][0]["type"] == "input_text"
-        assert any("Unknown content block type" in w for w in warnings)
+        placeholder = user_msg[0]["content"][0]
+        assert placeholder["type"] == "input_text"
+        assert "exotic_block" in placeholder["text"]
+        # The nested content must not survive into the provider request.
+        assert "SECRET_NESTED_DATA" not in json.dumps(result)
+        assert any("exotic_block" in w for w in warnings)
 
     def test_empty_arguments_in_response_produces_empty_dict(self):
         """Empty string arguments parses to empty dict."""
