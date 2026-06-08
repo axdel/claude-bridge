@@ -581,6 +581,112 @@ class TestUsageShape:
 
 
 # ---------------------------------------------------------------------------
+# Unsupported / special content blocks (server-tool, MCP) — D-SRVTOOL-001
+# ---------------------------------------------------------------------------
+
+
+# Anthropic server-tool / MCP-connector blocks the bridge cannot route to OpenAI. Each
+# carries a SECRET_* sentinel in its nested content that must never reach the provider
+# request. Shapes follow the Anthropic server-tool / MCP content-block schemas.
+UNSUPPORTED_SERVER_TOOL_BLOCKS: list[dict] = [
+    {
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "web_search",
+        "input": {"query": "SECRET_SEARCH_QUERY"},
+    },
+    {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": [
+            {"type": "web_search_result", "title": "SECRET_TITLE", "url": "https://SECRET_URL"}
+        ],
+    },
+    {
+        "type": "mcp_tool_use",
+        "id": "mcptoolu_1",
+        "name": "fetch",
+        "server_name": "files",
+        "input": {"path": "SECRET_MCP_PATH"},
+    },
+    {
+        "type": "mcp_tool_result",
+        "tool_use_id": "mcptoolu_1",
+        "content": [{"type": "text", "text": "SECRET_MCP_OUTPUT"}],
+    },
+    {
+        "type": "code_execution_tool_result",
+        "tool_use_id": "ce_1",
+        "content": {"type": "code_execution_result", "stdout": "SECRET_STDOUT"},
+    },
+]
+
+# Sentinels embedded in the blocks above — none may appear in a translated request.
+UNSUPPORTED_BLOCK_SECRETS: tuple[str, ...] = (
+    "SECRET_SEARCH_QUERY",
+    "SECRET_TITLE",
+    "SECRET_URL",
+    "SECRET_MCP_PATH",
+    "SECRET_MCP_OUTPUT",
+    "SECRET_STDOUT",
+)
+
+
+class TestUnsupportedContentBlocks:
+    """Anthropic server-tool and MCP blocks have no OpenAI Responses route. They must
+    degrade to a redacted, type-named placeholder — never the raw block dict, which
+    would pollute the provider request with a Python repr AND leak the block's nested
+    tool inputs/outputs. See D-SRVTOOL-001."""
+
+    def _request_with(self, block: dict) -> dict:
+        return {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [block]}],
+        }
+
+    def test_unsupported_block_content_never_leaks_into_request(self):
+        # Oracle: the nested tool input/output sentinels are private content; a correct
+        # redaction emits none of them. Derived from the no-leak contract, not from
+        # running the translator.
+        for block in UNSUPPORTED_SERVER_TOOL_BLOCKS:
+            result, _ = anthropic_to_openai(self._request_with(block))
+            serialized = json.dumps(result)
+            for sentinel in UNSUPPORTED_BLOCK_SECRETS:
+                assert sentinel not in serialized, f"{block['type']} leaked {sentinel}"
+
+    def test_unsupported_block_becomes_typed_placeholder(self):
+        # The degraded block keeps the type name (so the turn is debuggable) but carries
+        # no nested content.
+        for block in UNSUPPORTED_SERVER_TOOL_BLOCKS:
+            result, _ = anthropic_to_openai(self._request_with(block))
+            user_items = [i for i in result["input"] if i.get("role") == "user"]
+            assert len(user_items) == 1
+            placeholder = user_items[0]["content"][0]
+            assert placeholder["type"] == "input_text"
+            assert block["type"] in placeholder["text"]
+            for sentinel in UNSUPPORTED_BLOCK_SECRETS:
+                assert sentinel not in placeholder["text"]
+
+    def test_unsupported_block_emits_warning_naming_type(self):
+        # A silent degradation hides a behavioral divergence; every degraded block must
+        # surface a warning that names the dropped type.
+        for block in UNSUPPORTED_SERVER_TOOL_BLOCKS:
+            _, warnings = anthropic_to_openai(self._request_with(block))
+            assert any(block["type"] in w for w in warnings), f"no warning for {block['type']}"
+
+    def test_known_blocks_remain_lossless(self):
+        # Regression: hardening the unknown path must not perturb text / tool_use /
+        # tool_result translation for Claude Code's client tools.
+        result, warnings = anthropic_to_openai(CLAUDE_CODE_TOOL_LOOP)
+        kinds = [_kind(i) for i in result["input"]]
+        assert "function_call" in kinds  # tool_use preserved
+        assert "function_call_output" in kinds  # tool_result preserved
+        # The canonical tool loop has no unsupported blocks → no degradation warnings.
+        assert not any("redacted placeholder" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
 # Streaming block-index monotonicity + finality
 # ---------------------------------------------------------------------------
 

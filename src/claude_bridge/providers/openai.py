@@ -182,7 +182,7 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
     - function_call_output: {type, call_id, output} — output is always a string, never null
     """
     warnings: list[str] = []
-    block_type = block.get("type")
+    block_type = block.get("type", "unknown")
 
     if block_type == "text":
         translated = {"type": "input_text", "text": block["text"]}
@@ -239,9 +239,16 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
             "output": output,
         }, warnings
 
-    # Unknown block type — pass through as input_text with warning
-    warnings.append(f"Unknown content block type '{block_type}', converted to input_text")
-    return {"type": "input_text", "text": str(block)}, warnings
+    # Unsupported / special block (server_tool_use, web_search_tool_result, mcp_tool_use,
+    # code_execution_tool_result, ...) — no OpenAI Responses route (D-SRVTOOL-001).
+    # Degrade to a type-named placeholder that NEVER echoes the block's nested content:
+    # a raw str(block) would both pollute the provider request with a Python dict repr
+    # AND leak the block's tool inputs/outputs.
+    warnings.append(
+        f"Unsupported content block type '{block_type}' replaced with a redacted "
+        "placeholder (no provider equivalent)"
+    )
+    return {"type": "input_text", "text": f"[unsupported content block: {block_type}]"}, warnings
 
 
 def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
@@ -449,10 +456,9 @@ def _coerce_token_count(value: object) -> int:
     Provider usage may carry floats or nulls; Anthropic's usage fields are integers
     that Claude Code's ``/context`` math divides by. Non-numeric values default to 0.
     """
-    try:
-        return max(0, int(value))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    return 0
 
 
 def _anthropic_usage(oai_usage: object) -> dict:
