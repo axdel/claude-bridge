@@ -564,6 +564,21 @@ def test_fallback_chain_empty_string(monkeypatch):
     assert chain == []
 
 
+def test_get_fallback_provider_warns_for_unknown_provider(monkeypatch):
+    """Unknown configured fallback provider names are diagnosable, not silent."""
+    import claude_bridge.config as config
+    from claude_bridge.log import configure_logging
+    from claude_bridge.proxy import _get_fallback_provider
+
+    stream = io.StringIO()
+    configure_logging(level="WARNING", stream=stream)
+    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "xai")
+
+    assert _get_fallback_provider() is None
+
+    assert "Fallback provider 'xai' is not registered" in stream.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Configurable timeout tests
 # ---------------------------------------------------------------------------
@@ -610,6 +625,39 @@ def test_get_timeout_ignores_zero_and_negative(monkeypatch):
     assert _get_timeout(60) == 60
 
 
+def test_max_request_body_warns_for_invalid_import_value(monkeypatch):
+    """Invalid import-time body limits are diagnosable and fall back safely."""
+    import importlib
+
+    import claude_bridge.config as config
+    import claude_bridge.proxy as proxy_mod
+    from claude_bridge.log import configure_logging
+
+    stream = io.StringIO()
+    configure_logging(level="WARNING", stream=stream)
+    monkeypatch.setenv(config.MAX_REQUEST_BODY_ENV, "0")
+
+    proxy_mod = importlib.reload(proxy_mod)
+
+    assert proxy_mod._MAX_REQUEST_BODY == config.DEFAULT_MAX_REQUEST_BODY
+    assert "Invalid MAX_REQUEST_BODY='0', using default 10485760B" in stream.getvalue()
+
+
+def test_get_timeout_warns_for_nonpositive_values(monkeypatch):
+    """Invalid positive syntax and nonpositive timeouts are both diagnosable."""
+    import claude_bridge.config as config
+    from claude_bridge.log import configure_logging
+    from claude_bridge.proxy import _get_timeout
+
+    stream = io.StringIO()
+    configure_logging(level="WARNING", stream=stream)
+    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
+
+    assert _get_timeout(120) == 120
+
+    assert "Invalid UPSTREAM_TIMEOUT='0', using default 120s" in stream.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Request body size limit tests
 # ---------------------------------------------------------------------------
@@ -648,6 +696,10 @@ class _BrokenProvider:
 
     name = "broken"
     endpoint = "http://127.0.0.1:1/unused"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+    )
 
     async def authenticate(self) -> dict[str, str]:
         return {}
@@ -1614,6 +1666,70 @@ async def test_forward_via_provider_unparseable_stream_returns_502(_codex_sse_mo
     status, _body = await _forward_via_provider(provider, _anthropic_request_bytes())
 
     assert status == 502
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_unparseable_stream_log_omits_raw_body_secret(
+    _codex_sse_mock,
+):
+    """Malformed provider SSE logs status/summary, never the raw provider payload."""
+    from claude_bridge.log import configure_logging
+    from claude_bridge.proxy import _forward_via_provider
+
+    stream = io.StringIO()
+    configure_logging(level="ERROR", stream=stream)
+    url, payload = _codex_sse_mock
+    payload["bytes"] = b"PLACEHOLDER_SECRET_BAD_SSE_BODY"
+    provider = _provider_at(f"{url}/v1/responses")
+
+    status, _body = await _forward_via_provider(provider, _anthropic_request_bytes())
+
+    assert status == 502
+    logs = stream.getvalue()
+    assert "Provider stream carried no message_start" in logs
+    assert "unparseable provider error body (31B)" in logs
+    assert "PLACEHOLDER_SECRET_BAD_SSE_BODY" not in logs
+
+
+class _FailingAuthProvider:
+    """Fake provider whose auth preflight fails before a provider request."""
+
+    name = "failing-auth"
+    endpoint = "http://127.0.0.1:1/unreachable"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="json",
+    )
+
+    async def authenticate(self) -> dict[str, str]:
+        raise ValueError("missing provider token")
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        return {"unused": anthropic_req}, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return provider_resp
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        if False:
+            yield {}
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_preflight_exception_returns_502():
+    """Provider auth/translation preflight failures return Anthropic-shaped 502."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    status, body = await _forward_via_provider(
+        _FailingAuthProvider(),
+        _anthropic_request_bytes(),
+    )
+
+    assert status == 502
+    assert json.loads(body) == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "Provider preflight failed"},
+    }
 
 
 class _JsonSyncProvider:

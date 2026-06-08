@@ -21,6 +21,8 @@ from typing import Literal, Protocol, runtime_checkable
 
 StreamRequestMode = Literal["body_parameter", "url"]
 SyncResponseMode = Literal["json", "sse"]
+_STREAM_REQUEST_MODES = frozenset({"body_parameter", "url"})
+_SYNC_RESPONSE_MODES = frozenset({"json", "sse"})
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,15 @@ class ProviderCapabilities:
     stream_request_mode: StreamRequestMode
     sync_response_mode: SyncResponseMode
 
+    def __post_init__(self) -> None:
+        """Validate mode values at runtime for dynamically authored providers."""
+        if self.stream_request_mode not in _STREAM_REQUEST_MODES:
+            msg = f"Unknown stream_request_mode: {self.stream_request_mode!r}"
+            raise ValueError(msg)
+        if self.sync_response_mode not in _SYNC_RESPONSE_MODES:
+            msg = f"Unknown sync_response_mode: {self.sync_response_mode!r}"
+            raise ValueError(msg)
+
 
 @runtime_checkable
 class Provider(Protocol):
@@ -42,10 +53,7 @@ class Provider(Protocol):
 
     name: str
     endpoint: str
-    capabilities = ProviderCapabilities(
-        stream_request_mode="body_parameter",
-        sync_response_mode="sse",
-    )
+    capabilities: ProviderCapabilities
 
     async def authenticate(self) -> dict[str, str]:
         """Return headers required to authenticate with this provider."""

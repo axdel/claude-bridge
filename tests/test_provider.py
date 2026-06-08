@@ -22,6 +22,17 @@ def test_provider_capabilities_are_frozen_protocol_owned_values():
         capabilities.stream_request_mode = "url"  # type: ignore[misc]
 
 
+def test_provider_capabilities_reject_unknown_modes():
+    """Invalid provider capability modes fail at declaration time."""
+    from claude_bridge.provider import ProviderCapabilities
+
+    with pytest.raises(ValueError, match="stream_request_mode"):
+        ProviderCapabilities(stream_request_mode="query", sync_response_mode="sse")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="sync_response_mode"):
+        ProviderCapabilities(stream_request_mode="url", sync_response_mode="xml")  # type: ignore[arg-type]
+
+
 def test_openai_declares_body_parameter_streaming_and_sse_sync_response():
     """OpenAI exposes the proxy-visible transport modes it requires."""
     from claude_bridge.provider import ProviderCapabilities

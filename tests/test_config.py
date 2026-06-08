@@ -15,11 +15,14 @@ def test_upstream_timeout_defaults_and_env_override(monkeypatch):
     assert config.upstream_timeout(60) == 30
     assert config.upstream_timeout(120) == 30
 
+    invalid_values: list[str] = []
     monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "not-a-number")
-    assert config.upstream_timeout(120) == 120
+    assert config.upstream_timeout(120, on_invalid=invalid_values.append) == 120
+    assert invalid_values == ["not-a-number"]
 
     monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
-    assert config.upstream_timeout(120) == 120
+    assert config.upstream_timeout(120, on_invalid=invalid_values.append) == 120
+    assert invalid_values == ["not-a-number", "0"]
 
 
 def test_max_request_body_default_and_override(monkeypatch):
@@ -31,6 +34,15 @@ def test_max_request_body_default_and_override(monkeypatch):
 
     monkeypatch.setenv(config.MAX_REQUEST_BODY_ENV, "2048")
     assert config.max_request_body() == 2048
+
+    invalid_values: list[str] = []
+    monkeypatch.setenv(config.MAX_REQUEST_BODY_ENV, "not-a-number")
+    assert config.max_request_body(on_invalid=invalid_values.append) == 10_485_760
+    assert invalid_values == ["not-a-number"]
+
+    monkeypatch.setenv(config.MAX_REQUEST_BODY_ENV, "0")
+    assert config.max_request_body(on_invalid=invalid_values.append) == 10_485_760
+    assert invalid_values == ["not-a-number", "0"]
 
 
 def test_fallback_chain_default_blank_and_csv(monkeypatch):

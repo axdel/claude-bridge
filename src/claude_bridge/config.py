@@ -71,13 +71,31 @@ def upstream_timeout(
             on_invalid(raw)
         return default
     if value <= 0:
+        if on_invalid is not None:
+            on_invalid(raw)
         return default
     return value
 
 
-def max_request_body() -> int:
-    """Return the import-time request body limit in bytes."""
-    return int(os.environ.get(MAX_REQUEST_BODY_ENV, DEFAULT_MAX_REQUEST_BODY))
+def max_request_body(
+    *,
+    on_invalid: Callable[[str], None] | None = None,
+) -> int:
+    """Return the positive request body limit in bytes, or the default when invalid."""
+    raw = os.environ.get(MAX_REQUEST_BODY_ENV)
+    if raw is None:
+        return DEFAULT_MAX_REQUEST_BODY
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        if on_invalid is not None:
+            on_invalid(raw)
+        return DEFAULT_MAX_REQUEST_BODY
+    if value <= 0:
+        if on_invalid is not None:
+            on_invalid(raw)
+        return DEFAULT_MAX_REQUEST_BODY
+    return value
 
 
 def fallback_chain() -> list[str]:

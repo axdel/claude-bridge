@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import time as _time
 import urllib.error
@@ -16,14 +17,25 @@ import urllib.request
 
 import claude_bridge.config as config
 from claude_bridge.log import get_logger, is_trace_enabled, request_id_var, trace_event
-from claude_bridge.provider import PROVIDERS, Provider
+from claude_bridge.provider import PROVIDERS, Provider, ProviderCapabilities
 from claude_bridge.router import Router
 from claude_bridge.stats import BridgeStats
 from claude_bridge.stream import format_anthropic_sse
 
 logger = get_logger("proxy")
 
-_MAX_REQUEST_BODY = config.max_request_body()
+
+def _warn_invalid_max_request_body(raw: str) -> None:
+    """Log invalid import-time request body limit configuration."""
+    logger.warning(
+        "Invalid MAX_REQUEST_BODY=%r, using default %dB",
+        raw,
+        config.DEFAULT_MAX_REQUEST_BODY,
+    )
+
+
+_MAX_REQUEST_BODY = config.max_request_body(on_invalid=_warn_invalid_max_request_body)
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def _get_timeout(default: int) -> int:
@@ -118,7 +130,7 @@ async def start_proxy(
         if provider_cls is None:
             msg = f"Unknown provider '{provider_name}'. Available: {list(PROVIDERS)}"
             raise ValueError(msg)
-        provider = provider_cls(**(provider_kwargs or {}))
+        provider = _validate_provider(provider_cls(**(provider_kwargs or {})))
 
     router = Router()
     stats = BridgeStats()
@@ -642,6 +654,22 @@ def _get_fallback_chain() -> list[str]:
     return config.fallback_chain()
 
 
+def _provider_capabilities(provider: Provider) -> ProviderCapabilities:
+    """Return validated provider capabilities or raise a provider-named error."""
+    provider_name = getattr(provider, "name", type(provider).__name__)
+    capabilities = getattr(provider, "capabilities", None)
+    if not isinstance(capabilities, ProviderCapabilities):
+        msg = f"Provider '{provider_name}' declares invalid capabilities"
+        raise ValueError(msg)
+    return capabilities
+
+
+def _validate_provider(provider: Provider) -> Provider:
+    """Validate proxy-visible provider contract fields before caching or serving."""
+    _provider_capabilities(provider)
+    return provider
+
+
 def _get_cached_provider(name: str) -> Provider | None:
     """Return a cached provider instance, creating it on first access."""
     if name in _provider_cache:
@@ -649,7 +677,7 @@ def _get_cached_provider(name: str) -> Provider | None:
     provider_cls = PROVIDERS.get(name)
     if provider_cls is None:
         return None
-    instance = provider_cls()
+    instance = _validate_provider(provider_cls())
     _provider_cache[name] = instance
     return instance
 
@@ -657,7 +685,14 @@ def _get_cached_provider(name: str) -> Provider | None:
 def _get_fallback_provider() -> Provider | None:
     """Return the first available provider from the fallback chain."""
     for name in _get_fallback_chain():
-        provider = _get_cached_provider(name)
+        if name not in PROVIDERS:
+            logger.warning("Fallback provider %r is not registered", name)
+            continue
+        try:
+            provider = _get_cached_provider(name)
+        except ValueError as exc:
+            logger.error("Fallback provider %r unavailable: %s", name, exc)
+            continue
         if provider is not None:
             return provider
     return None
@@ -706,6 +741,14 @@ def _provider_error_message(raw_body: bytes) -> str:
     return raw_body.decode("utf-8", errors="replace")[:500]
 
 
+def _safe_log_excerpt(value: object, *, limit: int = 200) -> str:
+    """Return a bounded single-line excerpt for provider-controlled diagnostics."""
+    cleaned = _CONTROL_CHARS.sub(" ", str(value)).strip()
+    if len(cleaned) > limit:
+        return cleaned[:limit] + "..."
+    return cleaned
+
+
 def _provider_error_log_summary(raw_body: bytes) -> str:
     """Return an operator-safe provider error summary without raw body fallback."""
     try:
@@ -714,13 +757,18 @@ def _provider_error_log_summary(raw_body: bytes) -> str:
         return f"unparseable provider error body ({len(raw_body)}B)"
     error = parsed.get("error") if isinstance(parsed, dict) else None
     if isinstance(error, dict):
-        message = error.get("message") or error.get("type")
-        if message:
-            return str(message)[:500]
+        details = []
+        for key in ("type", "code", "message"):
+            value = error.get(key)
+            if value:
+                details.append(f"{key}={_safe_log_excerpt(value)}")
+        if details:
+            return f"provider error ({', '.join(details)}, body={len(raw_body)}B)"
     if isinstance(error, str):
-        return error[:500]
+        return f"provider error (error={_safe_log_excerpt(error)}, body={len(raw_body)}B)"
     if isinstance(parsed, dict) and parsed.get("message"):
-        return str(parsed["message"])[:500]
+        message = _safe_log_excerpt(parsed["message"])
+        return f"provider error (message={message}, body={len(raw_body)}B)"
     return f"provider error body without message ({len(raw_body)}B)"
 
 
@@ -732,9 +780,16 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     responses use ``translate_stream`` and fold the translated Anthropic events into
     one Messages response so Codex/OpenAI delta-only content is preserved.
     """
-    request_dict = json.loads(body)
-    auth_headers = await provider.authenticate()
-    translated, warnings = provider.translate_request(request_dict)
+    try:
+        request_dict = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return 400, _anthropic_error_body(400, "Malformed JSON request")
+    try:
+        auth_headers = await provider.authenticate()
+        translated, warnings = provider.translate_request(request_dict)
+    except Exception:
+        logger.exception("Provider preflight failed")
+        return 502, _anthropic_error_body(502, "Provider preflight failed")
     if not isinstance(translated, dict):
         logger.warning(
             "Provider %s translate_request returned %s, expected dict",
@@ -766,7 +821,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
             status_code, _provider_error_message(raw_response)
         )
 
-    if provider.capabilities.sync_response_mode == "json":
+    if _provider_capabilities(provider).sync_response_mode == "json":
         try:
             provider_response = json.loads(raw_response)
             anthropic_response = provider.translate_response(provider_response)
@@ -791,7 +846,10 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
 
     anthropic_response = _aggregate_stream_to_message(events)
     if anthropic_response is None:
-        logger.error("Provider stream carried no message_start: %s", raw_response[:200])
+        logger.error(
+            "Provider stream carried no message_start: %s",
+            _provider_error_log_summary(raw_response),
+        )
         return 502, _anthropic_error_body(502, "could not parse provider response")
 
     _trace_provider_response(anthropic_response)
@@ -989,10 +1047,19 @@ async def _stream_via_provider(
     writer: asyncio.StreamWriter,
 ) -> None:
     """Translate request, stream from provider, translate SSE events back to Anthropic format."""
-    request_dict = json.loads(body)
-    # Authenticate first — some providers need auth context before translation
-    auth_headers = await provider.authenticate()
-    translated, warnings = provider.translate_request(request_dict)
+    try:
+        request_dict = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        _write_response(writer, 400, _anthropic_error_body(400, "Malformed JSON request"))
+        return
+    try:
+        # Authenticate first — some providers need auth context before translation
+        auth_headers = await provider.authenticate()
+        translated, warnings = provider.translate_request(request_dict)
+    except Exception:
+        logger.exception("Provider preflight failed")
+        _write_response(writer, 502, _anthropic_error_body(502, "Provider preflight failed"))
+        return
     if not isinstance(translated, dict):
         logger.warning(
             "Provider %s translate_request returned %s, expected dict",
@@ -1016,7 +1083,7 @@ async def _stream_via_provider(
     _emit_translation_warnings(warnings, translated)
 
     # Enable streaming on the translated request when the provider declares body selection.
-    if provider.capabilities.stream_request_mode == "body_parameter":
+    if _provider_capabilities(provider).stream_request_mode == "body_parameter":
         translated["stream"] = True
 
     def _open_stream():

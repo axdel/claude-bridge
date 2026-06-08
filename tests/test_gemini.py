@@ -75,6 +75,23 @@ class TestGeminiAuth:
         assert oauth_provider._model == "gemini-3.1-pro-preview"
         assert "gemini-3.1-pro-preview" in api_key_provider.endpoint
 
+    def test_unknown_model_translation_uses_provider_selected_model(self, monkeypatch):
+        import claude_bridge.config as config
+        from claude_bridge.providers.gemini import GeminiProvider
+
+        monkeypatch.setenv(config.GEMINI_MODEL_ENV, "gemini-3.1-pro-preview")
+        provider = GeminiProvider(auth_mode="api_key", api_key="test-key-placeholder")
+
+        translated, _warnings = provider.translate_request(
+            {
+                "model": "claude-unknown-999",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
+        )
+
+        assert translated["model"] == "gemini-3.1-pro-preview"
+
 
 # --- Request translation tests ---
 

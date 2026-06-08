@@ -28,7 +28,6 @@ MODEL_MAP: dict[str, str] = {
     "claude-sonnet-4-6": "gemini-2.5-flash",
     "claude-haiku-4-5-20251001": "gemini-2.5-flash",
 }
-DEFAULT_MODEL = config.gemini_api_key_model()
 
 _STRIPPED_KEYS = ("output_config",)
 
@@ -221,11 +220,16 @@ def _clean_schema(schema: dict) -> dict:
     return cleaned
 
 
-def anthropic_to_gemini(request: dict) -> tuple[dict, list[str]]:
+def anthropic_to_gemini(
+    request: dict,
+    *,
+    default_model: str | None = None,
+) -> tuple[dict, list[str]]:
     """Translate an Anthropic Messages API request to a Gemini generateContent request.
 
     Returns (translated_request, warnings). Pure function — no I/O.
     """
+    resolved_default_model = default_model or config.gemini_api_key_model()
     warnings: list[str] = []
 
     for key in _STRIPPED_KEYS:
@@ -236,7 +240,7 @@ def anthropic_to_gemini(request: dict) -> tuple[dict, list[str]]:
         warnings.append("Stripped 'thinking' config (no Gemini equivalent)")
 
     model = request.get("model", "")
-    result: dict = {"model": MODEL_MAP.get(model, DEFAULT_MODEL)}
+    result: dict = {"model": MODEL_MAP.get(model, resolved_default_model)}
 
     # System prompt → system_instruction
     system = request.get("system")
@@ -778,9 +782,6 @@ def _unwrap_code_assist_response(envelope: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-_OAUTH_DEFAULT_MODEL = config.gemini_oauth_model()
-
-
 class GeminiProvider:
     """Google Gemini provider implementing the Provider protocol.
 
@@ -844,7 +845,7 @@ class GeminiProvider:
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
         """Translate Anthropic Messages request to Gemini format."""
-        result, warnings = anthropic_to_gemini(anthropic_req)
+        result, warnings = anthropic_to_gemini(anthropic_req, default_model=self._model)
         # Gemini controls streaming via URL, not body — strip the field
         result.pop("stream", None)
         if self.auth_mode == "gemini_oauth":
