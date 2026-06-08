@@ -6,10 +6,9 @@ import argparse
 import asyncio
 import os
 
-# Import providers so they register themselves in the PROVIDERS dict.
+# Import implemented providers so they register themselves in the PROVIDERS dict.
 import claude_bridge.providers.gemini
-import claude_bridge.providers.openai
-import claude_bridge.providers.xai  # noqa: F401
+import claude_bridge.providers.openai  # noqa: F401
 from claude_bridge.log import configure_logging, get_logger
 from claude_bridge.proxy import start_proxy
 

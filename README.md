@@ -274,7 +274,7 @@ src/claude_bridge/
     ├── __init__.py   # Provider registration notes
     ├── openai.py     # OpenAI: API key + Codex OAuth + Responses API translation
     ├── gemini.py     # Gemini: API key + Gemini CLI OAuth + generateContent translation
-    └── xai.py        # xAI Grok: registered stub, not implemented
+    └── xai.py        # xAI Grok: unregistered placeholder, not implemented
 ```
 
 ### Adding a New Provider
@@ -340,7 +340,7 @@ tracked registry instead of duplicating decision rows.
 - Failover is blocked during active tool-use turns (by design — prevents broken tool state)
 - Rate limit headers (`x-ratelimit-*`, `retry-after`) forwarded on sync responses only — streaming responses cannot include HTTP headers after SSE begins
 - Retry applies to sync HTTP calls only — streaming connections are not retried (SSE state replay is too complex)
-- xAI is registered only as an extensibility stub; `xai` is not a usable provider yet
+- xAI remains an unregistered extensibility placeholder; `xai` is not a runtime provider until implemented
 
 ## Running Tests
 

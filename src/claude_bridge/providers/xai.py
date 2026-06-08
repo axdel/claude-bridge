@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from claude_bridge.provider import PROVIDERS
-
 
 class XAIProvider:
     """xAI Grok provider — stub for extensibility proof."""
@@ -33,6 +31,3 @@ class XAIProvider:
     def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw xAI byte chunks to Anthropic-format SSE events."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
-
-
-PROVIDERS["xai"] = XAIProvider

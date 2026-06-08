@@ -500,6 +500,30 @@ def test_provider_cache_unknown_returns_none():
     assert _get_cached_provider("nonexistent") is None
 
 
+@pytest.mark.asyncio
+async def test_xai_stub_is_not_registered_for_cache_fallback_or_direct_mode(monkeypatch):
+    """The discoverable xAI stub is not a routable runtime provider."""
+    import importlib
+
+    from claude_bridge.proxy import _get_cached_provider, _get_fallback_provider, _provider_cache
+
+    PROVIDERS.pop("xai", None)
+    _provider_cache.pop("xai", None)
+    monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "xai")
+
+    try:
+        xai_module = importlib.import_module("claude_bridge.providers.xai")
+        importlib.reload(xai_module)
+        assert "xai" not in PROVIDERS
+        assert _get_cached_provider("xai") is None
+        assert _get_fallback_provider() is None
+        with pytest.raises(ValueError, match=r"Unknown provider 'xai'\. Available:"):
+            await start_proxy(host="127.0.0.1", port=_find_free_port(), provider_name="xai")
+    finally:
+        PROVIDERS.pop("xai", None)
+        _provider_cache.pop("xai", None)
+
+
 def test_fallback_chain_from_env(monkeypatch):
     """LLM_BRIDGE_FALLBACK env var controls fallback order."""
     from claude_bridge.proxy import _get_fallback_chain
