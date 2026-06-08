@@ -1006,8 +1006,8 @@ async def _stream_via_provider(
         return
     _emit_translation_warnings(warnings, translated)
 
-    # Enable streaming on the translated request (skip for providers that use URL-based streaming)
-    if not getattr(provider, "stream_via_url", False):
+    # Enable streaming on the translated request when the provider declares body selection.
+    if provider.capabilities.stream_request_mode == "body_parameter":
         translated["stream"] = True
 
     def _open_stream():

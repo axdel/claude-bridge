@@ -794,7 +794,6 @@ class GeminiProvider:
         stream_request_mode="url",
         sync_response_mode="sse",
     )
-    stream_via_url = True
 
     def __init__(
         self,

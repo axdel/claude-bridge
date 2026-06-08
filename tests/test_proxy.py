@@ -14,7 +14,7 @@ from threading import Thread
 
 import pytest
 
-from claude_bridge.provider import PROVIDERS
+from claude_bridge.provider import PROVIDERS, ProviderCapabilities, StreamRequestMode
 from claude_bridge.proxy import start_proxy
 
 
@@ -68,6 +68,12 @@ async def proxy_url(upstream_url: str):
 
 def _http_post(url: str, body: dict, headers: dict | None = None) -> tuple[int, dict]:
     """Stdlib HTTP POST helper — returns (status_code, json_body)."""
+    status, raw_body = _http_post_raw(url, body, headers)
+    return status, json.loads(raw_body)
+
+
+def _http_post_raw(url: str, body: dict, headers: dict | None = None) -> tuple[int, bytes]:
+    """Stdlib HTTP POST helper — returns (status_code, raw_body)."""
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -75,9 +81,9 @@ def _http_post(url: str, body: dict, headers: dict | None = None) -> tuple[int, 
         req.add_header(key, value)
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, json.loads(resp.read())
+            return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
+        return exc.code, exc.read()
 
 
 def _http_get(url: str) -> int:
@@ -346,6 +352,10 @@ class _FakeOpenAIProvider:
     """Test provider that talks to a local mock OpenAI server."""
 
     name = "openai"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+    )
 
     def __init__(self, endpoint: str) -> None:
         self.endpoint = endpoint
@@ -861,6 +871,134 @@ async def test_normal_body_passes_size_check(proxy_url: str):
         {"x-api-key": "test-key"},
     )
     assert status == 200
+
+
+# --- Streaming provider request mode tests ---
+
+
+class _CaptureStreamRequestHandler(BaseHTTPRequestHandler):
+    """Captures one provider streaming request body and returns a minimal SSE stream."""
+
+    captured_body: dict | None = None
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        type(self).captured_body = json.loads(self.rfile.read(length))
+        payload = _sse_bytes(
+            [
+                (
+                    "message_start",
+                    {
+                        "message": {
+                            "id": "msg_test_stream_mode",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": "test-model",
+                            "usage": {"input_tokens": 1, "output_tokens": 0},
+                        }
+                    },
+                ),
+                ("message_stop", {}),
+            ]
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _StreamModeProvider:
+    """Provider fake whose capabilities define the streaming request shape."""
+
+    name = "stream-mode"
+
+    def __init__(self, endpoint: str, stream_request_mode: StreamRequestMode) -> None:
+        self.endpoint = endpoint
+        self.capabilities = ProviderCapabilities(
+            stream_request_mode=stream_request_mode,
+            sync_response_mode="sse",
+        )
+
+    async def authenticate(self) -> dict[str, str]:
+        return {}
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        return {"model": anthropic_req["model"], "input": []}, ["capability warning"]
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return {}
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        async for _chunk in raw_chunks:
+            yield {"event": "message_stop", "data": {"type": "message_stop"}}
+
+
+async def _send_streaming_request_to_provider(provider: _StreamModeProvider) -> None:
+    from claude_bridge.proxy import _make_handler
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    port = _find_free_port()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats())
+    server = await asyncio.start_server(handler, "127.0.0.1", port)
+    try:
+        request_body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        status, _raw_body = await asyncio.to_thread(
+            _http_post_raw,
+            f"http://127.0.0.1:{port}/v1/messages",
+            request_body,
+        )
+        assert status == 200
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.fixture()
+def _capture_stream_request_url():
+    _CaptureStreamRequestHandler.captured_body = None
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _CaptureStreamRequestHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}/v1/responses", _CaptureStreamRequestHandler
+    server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stream_body_parameter_provider_receives_body_stream_true(
+    _capture_stream_request_url,
+):
+    """Body-parameter streaming providers receive ``stream: true`` in the body."""
+    endpoint, handler = _capture_stream_request_url
+    provider = _StreamModeProvider(endpoint, "body_parameter")
+
+    await _send_streaming_request_to_provider(provider)
+
+    assert handler.captured_body == {"model": "claude-sonnet-4-6", "input": [], "stream": True}
+
+
+@pytest.mark.asyncio
+async def test_stream_url_provider_omits_body_stream_without_legacy_attr(
+    _capture_stream_request_url,
+):
+    """URL-mode streaming providers omit body-level ``stream`` via capabilities only."""
+    endpoint, handler = _capture_stream_request_url
+    provider = _StreamModeProvider(endpoint, "url")
+
+    await _send_streaming_request_to_provider(provider)
+
+    assert handler.captured_body == {"model": "claude-sonnet-4-6", "input": []}
 
 
 # --- Streaming error path tests ---
