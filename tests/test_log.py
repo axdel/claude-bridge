@@ -140,3 +140,47 @@ class TestTraceSink:
         monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(a_directory))
         # No exception escapes even though opening a directory for append fails.
         trace_event("inbound_request", {"model": "gpt-5.5"})
+
+
+class TestTraceFailureVisibility:
+    """A broken trace target must be visible to an operator running at INFO — one
+    WARNING — and must never flood the log thereafter (subsequent failures at DEBUG).
+    See OPS1 (non-regular target refused before a blocking open) and OPS2 (one-time
+    WARNING instead of an always-silent DEBUG)."""
+
+    def test_non_regular_target_warns_and_does_not_write(self, tmp_path, monkeypatch):
+        import claude_bridge.log as log_mod
+
+        monkeypatch.setattr(log_mod, "_trace_failure_warned", False, raising=False)
+        a_directory = tmp_path / "trace_dir"
+        a_directory.mkdir()
+        monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(a_directory))
+        stream = io.StringIO()
+        configure_logging(level="INFO", stream=stream)
+
+        trace_event("inbound_request", {"model": "gpt-5.5"})
+
+        output = stream.getvalue()
+        # OPS1: the pre-check path names "not a regular file", distinct from a write
+        # failure, and surfaces at WARNING so it is visible at the default INFO level.
+        assert "WARNING" in output
+        assert "not a regular file" in output
+
+    def test_write_failure_warns_once_then_falls_back_to_debug(self, tmp_path, monkeypatch):
+        import claude_bridge.log as log_mod
+
+        monkeypatch.setattr(log_mod, "_trace_failure_warned", False, raising=False)
+        # Parent directory does not exist → open() raises FileNotFoundError every call.
+        target = tmp_path / "missing_dir" / "trace.jsonl"
+        monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
+        stream = io.StringIO()
+        configure_logging(level="INFO", stream=stream)
+
+        trace_event("inbound_request", {"model": "gpt-5.5"})
+        trace_event("inbound_request", {"model": "gpt-5.5"})
+
+        output = stream.getvalue()
+        # OPS2: exactly one WARNING reaches the INFO-level operator; the second failure
+        # is logged at DEBUG (filtered here), so a persistently broken target can't spam.
+        assert output.count("WARNING") == 1
+        assert "trace write" in output
