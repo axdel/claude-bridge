@@ -15,7 +15,7 @@ import time as _time
 import urllib.error
 import urllib.request
 
-from claude_bridge.log import get_logger, request_id_var
+from claude_bridge.log import get_logger, is_trace_enabled, request_id_var, trace_event
 from claude_bridge.provider import PROVIDERS, Provider
 from claude_bridge.router import Router
 from claude_bridge.stats import BridgeStats
@@ -267,6 +267,192 @@ def _is_streaming(body: bytes) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Redacted compatibility trace — structural summaries + self-guarding hooks.
+#
+# The summarizers below are the redaction allowlist: each constructs a dict of
+# explicitly named structural fields (counts, type names, tool names, lengths,
+# token totals, stop reasons). They NEVER copy prompt text, tool arguments,
+# tool results, reasoning payloads, request headers, or credentials into the
+# trace. Redaction is enforced by construction here, not by discipline at the
+# call sites. The hooks self-guard on ``is_trace_enabled()`` so the host
+# functions carry zero added complexity and zero overhead when tracing is off.
+# ---------------------------------------------------------------------------
+
+
+def _block_type_counts(blocks: object) -> dict[str, int]:
+    """Count content blocks by their ``type`` field — structure only, no content."""
+    counts: dict[str, int] = {}
+    if not isinstance(blocks, list):
+        return counts
+    for block in blocks:
+        if isinstance(block, dict):
+            block_type = str(block.get("type", "unknown"))
+            counts[block_type] = counts.get(block_type, 0) + 1
+    return counts
+
+
+def _summarize_anthropic_request(request: dict) -> dict:
+    """Structural-only summary of an inbound Anthropic request.
+
+    Emits model, stream flag, message/tool counts, tool names, top-level block
+    type counts, the tool_choice *type*, and the system prompt *length* — never
+    any prompt text, tool argument, or tool result.
+    """
+    messages = request.get("messages")
+    message_list = messages if isinstance(messages, list) else []
+    block_types: dict[str, int] = {}
+    for message in message_list:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            block_types["text"] = block_types.get("text", 0) + 1
+        else:
+            for block_type, count in _block_type_counts(content).items():
+                block_types[block_type] = block_types.get(block_type, 0) + count
+    tools = request.get("tools") or []
+    tool_names = sorted(str(tool.get("name", "")) for tool in tools if isinstance(tool, dict))
+    tool_choice = request.get("tool_choice")
+    system = request.get("system")
+    return {
+        "model": str(request.get("model", "")),
+        "stream": bool(request.get("stream")),
+        "message_count": len(message_list),
+        "system_chars": len(json.dumps(system)) if system is not None else 0,
+        "block_types": block_types,
+        "tool_count": len(tools),
+        "tool_names": tool_names,
+        "tool_choice": tool_choice.get("type") if isinstance(tool_choice, dict) else tool_choice,
+    }
+
+
+def _summarize_provider_request(translated: dict, warnings: list[str]) -> dict:
+    """Structural-only summary of a translated provider request.
+
+    Emits model, stream flag, input item count, tool count/names, the resolved
+    tool_choice, reasoning effort, and the translation warnings — both the count
+    and the sanitized warning strings, which name what was stripped — never any
+    translated input content. The warning strings are neutralized at construction
+    (see ``_safe_token``), so they are safe to persist to the trace.
+    """
+    tools = translated.get("tools") or []
+    tool_names = sorted(str(tool.get("name", "")) for tool in tools if isinstance(tool, dict))
+    tool_choice = translated.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        tool_choice = f"{tool_choice.get('type')}:{tool_choice.get('name')}"
+    reasoning = translated.get("reasoning")
+    summary = {
+        "model": str(translated.get("model", "")),
+        "stream": bool(translated.get("stream")),
+        "input_items": len(translated.get("input") or []),
+        "tool_count": len(tools),
+        "tool_names": tool_names,
+        "tool_choice": tool_choice,
+        "reasoning_effort": reasoning.get("effort") if isinstance(reasoning, dict) else None,
+        "warning_count": len(warnings),
+        "warnings": list(warnings),
+    }
+    if "parallel_tool_calls" in translated:
+        summary["parallel_tool_calls"] = bool(translated.get("parallel_tool_calls"))
+    return summary
+
+
+def _summarize_anthropic_response(response: dict) -> dict:
+    """Structural-only summary of an outbound Anthropic response.
+
+    Emits model, stop_reason, block type counts, and token usage — never the
+    response text or tool_use arguments.
+    """
+    usage = response.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    return {
+        "model": str(response.get("model", "")),
+        "stop_reason": response.get("stop_reason"),
+        "block_types": _block_type_counts(response.get("content")),
+        "input_tokens": usage.get("input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+    }
+
+
+def _summarize_stream_event(event: dict) -> dict:
+    """Structural-only summary of one translated Anthropic SSE event.
+
+    Emits the event name, block index, block/delta *type*, stop_reason, and
+    output token total — never the streamed text or partial tool-argument JSON.
+    """
+    data = event.get("data")
+    data = data if isinstance(data, dict) else {}
+    summary: dict = {"sse": event.get("event", "")}
+    if "index" in data:
+        summary["index"] = data.get("index")
+    content_block = data.get("content_block")
+    if isinstance(content_block, dict):
+        summary["block_type"] = content_block.get("type")
+    delta = data.get("delta")
+    if isinstance(delta, dict):
+        if "type" in delta:
+            summary["delta_type"] = delta.get("type")
+        if "stop_reason" in delta:
+            summary["stop_reason"] = delta.get("stop_reason")
+    usage = data.get("usage")
+    if isinstance(usage, dict) and "output_tokens" in usage:
+        summary["output_tokens"] = usage.get("output_tokens")
+    return summary
+
+
+def _trace_inbound_request(body: bytes) -> None:
+    """Trace the structural shape of an inbound Anthropic request, if enabled."""
+    if not is_trace_enabled():
+        return
+    try:
+        trace_event("inbound_request", _summarize_anthropic_request(json.loads(body)))
+    except Exception:
+        logger.debug("inbound trace failed", exc_info=True)
+
+
+def _trace_provider_request(translated: dict, warnings: list[str]) -> None:
+    """Trace the structural shape of a translated provider request, if enabled."""
+    if not is_trace_enabled():
+        return
+    try:
+        trace_event("provider_request", _summarize_provider_request(translated, warnings))
+    except Exception:
+        logger.debug("provider request trace failed", exc_info=True)
+
+
+def _emit_translation_warnings(warnings: list[str], translated: dict) -> None:
+    """Surface translation warnings to every observer — the human log and the
+    structural trace — from a single place.
+
+    Both the streaming and non-streaming request paths route their warnings here so
+    the logged warnings and the traced warnings can never drift out of lockstep.
+    """
+    for warning in warnings:
+        logger.warning("Translation: %s", warning)
+    _trace_provider_request(translated, warnings)
+
+
+def _trace_provider_response(response: dict) -> None:
+    """Trace the structural shape of a translated provider response, if enabled."""
+    if not is_trace_enabled():
+        return
+    try:
+        trace_event("provider_response", _summarize_anthropic_response(response))
+    except Exception:
+        logger.debug("provider response trace failed", exc_info=True)
+
+
+def _trace_stream_event(event: dict) -> None:
+    """Trace the structural shape of one translated SSE event, if enabled."""
+    if not is_trace_enabled():
+        return
+    try:
+        trace_event("stream_event", _summarize_stream_event(event))
+    except Exception:
+        logger.debug("stream event trace failed", exc_info=True)
+
+
 async def _process_request(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -370,6 +556,7 @@ async def _route_request(
     request_start: float,
 ) -> None:
     """Route a /v1/messages request to the appropriate backend."""
+    _trace_inbound_request(body)
     if provider is not None:
         mode = "stream" if streaming else "sync"
         logger.info("-> DIRECT %s (%s) model=%s", provider.name, mode, request_model)
@@ -489,11 +676,56 @@ def _get_fallback_provider() -> Provider | None:
     return None
 
 
+# HTTP status → Anthropic error type (docs.anthropic.com/en/api/errors). Anything
+# unmapped falls back to ``api_error`` so a novel upstream status never crashes.
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+    500: "api_error",
+    529: "overloaded_error",
+}
+
+
+def _anthropic_error_body(status_code: int, message: str) -> bytes:
+    """Build an Anthropic-shaped error envelope for a status code and message."""
+    error_type = _ANTHROPIC_ERROR_TYPES.get(status_code, "api_error")
+    return json.dumps(
+        {"type": "error", "error": {"type": error_type, "message": message}}
+    ).encode()
+
+
+def _provider_error_message(raw_body: bytes) -> str:
+    """Extract a human-readable message from an upstream provider error body.
+
+    Understands the OpenAI ``{"error": {"message": ...}}`` shape and degrades to the
+    decoded body (truncated) when the payload is not the expected JSON.
+    """
+    try:
+        parsed = json.loads(raw_body)
+    except (json.JSONDecodeError, ValueError):
+        return raw_body.decode("utf-8", errors="replace")[:500]
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        return error.get("message") or error.get("type") or json.dumps(error)[:500]
+    if isinstance(error, str):
+        return error
+    if isinstance(parsed, dict) and parsed.get("message"):
+        return parsed["message"]
+    return raw_body.decode("utf-8", errors="replace")[:500]
+
+
 async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, bytes]:
     """Authenticate, translate, forward to provider, translate back.
 
-    The Codex endpoint always streams, so we read the SSE stream and extract
-    the final response from the ``response.completed`` event.
+    The Codex endpoint always streams (even for non-streaming clients), so we read
+    the whole SSE stream, translate it through the streaming path, and fold the
+    Anthropic events into one Messages response — the ``response.completed`` event
+    carries an empty ``output``, so the deltas are the only source of content.
     """
     request_dict = json.loads(body)
     auth_headers = await provider.authenticate()
@@ -504,18 +736,8 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
             provider.name,
             type(translated).__name__,
         )
-        error = json.dumps(
-            {
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": "Provider translation failed",
-                },
-            }
-        ).encode()
-        return 502, error
-    for w in warnings:
-        logger.warning("Translation: %s", w)
+        return 502, _anthropic_error_body(502, "Provider translation failed")
+    _emit_translation_warnings(warnings, translated)
 
     # Open a streaming connection and collect the full response
     def _do_provider_request():
@@ -533,32 +755,130 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     logger.info("Provider response: %d (%dB)", status_code, len(raw_response))
     if status_code != 200:
         logger.error("Provider error: %s", raw_response[:500])
-        return status_code, raw_response
+        return status_code, _anthropic_error_body(
+            status_code, _provider_error_message(raw_response)
+        )
 
-    # Parse SSE stream to find the response.completed event with the full response
-    response_dict = _extract_completed_response(raw_response)
-    if response_dict is None:
-        # Fallback: try plain JSON parse
-        try:
-            response_dict = json.loads(raw_response)
-        except (json.JSONDecodeError, ValueError):
-            return 502, json.dumps({"error": "could not parse provider response"}).encode()
+    # The Codex backend always streams (even for non-streaming clients) and its
+    # response.completed.output is empty — the text/reasoning/tool-calls live only
+    # in the delta events. So run the SAME stream translation as the streaming path
+    # (which also captures reasoning continuity) and fold the Anthropic SSE events
+    # into a single Messages response, rather than reading the empty completed output.
+    async def _single_chunk():
+        yield raw_response
 
-    anthropic_response = provider.translate_response(response_dict)
+    try:
+        events = [event async for event in provider.translate_stream(_single_chunk())]
+    except Exception:
+        logger.exception("Provider stream translation failed")
+        return 502, _anthropic_error_body(502, "could not parse provider response")
+
+    anthropic_response = _aggregate_stream_to_message(events)
+    if anthropic_response is None:
+        logger.error("Provider stream carried no message_start: %s", raw_response[:200])
+        return 502, _anthropic_error_body(502, "could not parse provider response")
+
+    _trace_provider_response(anthropic_response)
     return 200, json.dumps(anthropic_response).encode()
 
 
-def _extract_completed_response(raw_sse: bytes) -> dict | None:
-    """Extract the full response dict from a ``response.completed`` SSE event."""
-    for line in raw_sse.decode("utf-8", errors="replace").split("\n"):
-        if line.startswith("data: "):
-            try:
-                event_data = json.loads(line[6:])
-                if event_data.get("type") == "response.completed":
-                    return event_data.get("response")
-            except (json.JSONDecodeError, ValueError):
-                continue
-    return None
+class _MessageAccumulator:
+    """Folds Anthropic SSE event payloads into a single Messages response.
+
+    Owns the in-progress message, its content blocks (keyed by index, kept in
+    arrival order), and the per-block tool-argument JSON buffers. Each ``on_*``
+    method consumes one event's ``data`` payload; ``build`` produces the final
+    response or ``None`` if no ``message_start`` was ever seen.
+    """
+
+    def __init__(self) -> None:
+        self._message: dict | None = None
+        self._blocks: dict[int, dict] = {}
+        self._tool_json: dict[int, str] = {}
+        self._order: list[int] = []
+
+    def on_message_start(self, data: dict) -> None:
+        msg = data.get("message", {})
+        self._message = {
+            "id": msg.get("id", "msg_bridge_unknown"),
+            "type": "message",
+            "role": "assistant",
+            "model": msg.get("model", ""),
+            "stop_reason": None,
+            "content": [],
+            "usage": dict(msg.get("usage", {"input_tokens": 0, "output_tokens": 0})),
+        }
+
+    def on_content_block_start(self, data: dict) -> None:
+        index = data.get("index", 0)
+        block = dict(data.get("content_block", {}))
+        self._blocks[index] = block
+        self._order.append(index)
+        if block.get("type") == "tool_use":
+            self._tool_json[index] = ""
+
+    def on_content_block_delta(self, data: dict) -> None:
+        block = self._blocks.get(data.get("index", 0))
+        if block is None:
+            return
+        delta = data.get("delta", {})
+        if delta.get("type") == "text_delta":
+            block["text"] = block.get("text", "") + delta.get("text", "")
+        elif delta.get("type") == "input_json_delta":
+            index = data.get("index", 0)
+            self._tool_json[index] = self._tool_json.get(index, "") + delta.get("partial_json", "")
+
+    def on_content_block_stop(self, data: dict) -> None:
+        index = data.get("index", 0)
+        block = self._blocks.get(index)
+        if block is None or block.get("type") != "tool_use":
+            return
+        raw_args = self._tool_json.get(index, "")
+        try:
+            block["input"] = json.loads(raw_args) if raw_args else {}
+        except (json.JSONDecodeError, ValueError):
+            block["input"] = {"_raw": raw_args}
+
+    def on_message_delta(self, data: dict) -> None:
+        if self._message is None:
+            return
+        delta = data.get("delta", {})
+        if "stop_reason" in delta:
+            self._message["stop_reason"] = delta["stop_reason"]
+        if data.get("usage"):
+            self._message["usage"] = data["usage"]
+
+    def build(self) -> dict | None:
+        if self._message is None:
+            return None
+        self._message["content"] = [self._blocks[index] for index in self._order]
+        return self._message
+
+
+def _aggregate_stream_to_message(events: list[dict]) -> dict | None:
+    """Fold a sequence of Anthropic SSE events into a single Messages response.
+
+    The inverse of the streaming translation: ``message_start`` seeds the message,
+    ``content_block_*`` build the text/tool_use blocks in arrival order, and
+    ``message_delta`` carries the final stop_reason and usage — producing the same
+    shape ``openai_to_anthropic`` does. Returns ``None`` when no ``message_start``
+    was seen (malformed/empty upstream — the caller maps this to 502).
+
+    Pure function — no I/O.
+    """
+    accumulator = _MessageAccumulator()
+    handlers = {
+        "message_start": accumulator.on_message_start,
+        "content_block_start": accumulator.on_content_block_start,
+        "content_block_delta": accumulator.on_content_block_delta,
+        "content_block_stop": accumulator.on_content_block_stop,
+        "message_delta": accumulator.on_message_delta,
+    }
+    for event in events:
+        handler = handlers.get(event.get("event", ""))
+        if handler is not None:
+            handler(event.get("data", {}))
+    return accumulator.build()
 
 
 def _forward_request(
@@ -677,8 +997,7 @@ async def _stream_via_provider(
             ).encode(),
         )
         return
-    for w in warnings:
-        logger.warning("Translation: %s", w)
+    _emit_translation_warnings(warnings, translated)
 
     # Enable streaming on the translated request (skip for providers that use URL-based streaming)
     if not getattr(provider, "stream_via_url", False):
@@ -703,13 +1022,15 @@ async def _stream_via_provider(
     try:
         resp = await asyncio.to_thread(_open_stream)
     except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")[:500]
-        logger.error("Provider HTTP %d: %s", exc.code, err_body)
-        _write_response(writer, exc.code, json.dumps({"error": err_body}).encode())
+        err_body = exc.read()
+        logger.error("Provider HTTP %d: %s", exc.code, err_body[:500])
+        _write_response(
+            writer, exc.code, _anthropic_error_body(exc.code, _provider_error_message(err_body))
+        )
         return
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.error("Provider connection error: %s", exc)
-        _write_response(writer, 502, json.dumps({"error": "provider unavailable"}).encode())
+        _write_response(writer, 502, _anthropic_error_body(502, "provider unavailable"))
         return
 
     _write_sse_headers(writer)
@@ -727,6 +1048,7 @@ async def _stream_via_provider(
 
     try:
         async for anthropic_event in provider.translate_stream(_raw_chunks()):
+            _trace_stream_event(anthropic_event)
             sse_bytes = format_anthropic_sse(anthropic_event["event"], anthropic_event["data"])
             event_name = anthropic_event["event"]
             if event_name not in _QUIET_SSE_EVENTS:

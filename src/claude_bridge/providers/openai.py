@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -131,6 +132,36 @@ _STRIPPED_KEYS = ("output_config",)
 # Reasoning mode: "passthrough" preserves thinking blocks, "drop" strips them.
 _REASONING_MODE = os.environ.get("REASONING_MODE", "passthrough").lower()
 
+# Upper bound on the per-provider encrypted-reasoning cache (one entry per in-flight
+# tool call). Bounds memory under long agentic sessions; oldest entries evict first.
+_REASONING_CACHE_MAX = 256
+
+# Upper bound on the undrained SSE buffer (one incomplete event). A well-formed
+# stream drains on every "\n\n", so the buffer holds at most a single partial event.
+# A provider that streams without event terminators would otherwise grow the buffer
+# without limit (OOM) and make repeated concatenation quadratic; exceeding this cap
+# means the stream is malformed, so we abort fast instead of accumulating.
+_MAX_SSE_BUFFER = 4 * 1024 * 1024
+
+# Upper bound on a user-controlled token (block/tool_choice ``type``) embedded in a
+# translation warning. Caps log/trace line length against a hostile oversized type.
+_SAFE_TOKEN_MAX = 64
+
+
+def _safe_token(value: object) -> str:
+    """Neutralize an attacker-controlled token for safe embedding in a log line or trace.
+
+    A block / tool_choice ``type`` comes straight from the client request and is
+    interpolated into a translation warning that reaches the human log and the
+    structural trace. Strips non-printable characters (newline, carriage return,
+    tab, ANSI escapes — CWE-117 log injection) and caps the result at
+    ``_SAFE_TOKEN_MAX`` so a hostile type cannot forge log records or flood the trace.
+    """
+    cleaned = "".join(ch for ch in str(value) if ch.isprintable())
+    if len(cleaned) > _SAFE_TOKEN_MAX:
+        return cleaned[:_SAFE_TOKEN_MAX] + "..."
+    return cleaned
+
 
 def _to_openai_id(anthropic_id: str) -> str:
     """Convert Anthropic tool ID to OpenAI Responses API format.
@@ -177,7 +208,7 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
     - function_call_output: {type, call_id, output} — output is always a string, never null
     """
     warnings: list[str] = []
-    block_type = block.get("type")
+    block_type = block.get("type", "unknown")
 
     if block_type == "text":
         translated = {"type": "input_text", "text": block["text"]}
@@ -234,9 +265,17 @@ def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
             "output": output,
         }, warnings
 
-    # Unknown block type — pass through as input_text with warning
-    warnings.append(f"Unknown content block type '{block_type}', converted to input_text")
-    return {"type": "input_text", "text": str(block)}, warnings
+    # Unsupported / special block (server_tool_use, web_search_tool_result, mcp_tool_use,
+    # code_execution_tool_result, ...) — no OpenAI Responses route (D-SRVTOOL-001).
+    # Degrade to a type-named placeholder that NEVER echoes the block's nested content:
+    # a raw str(block) would both pollute the provider request with a Python dict repr
+    # AND leak the block's tool inputs/outputs.
+    safe_type = _safe_token(block_type)
+    warnings.append(
+        f"Unsupported content block type '{safe_type}' replaced with a redacted "
+        "placeholder (no provider equivalent)"
+    )
+    return {"type": "input_text", "text": f"[unsupported content block: {safe_type}]"}, warnings
 
 
 def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
@@ -303,6 +342,35 @@ def _has_cache_control(request: dict) -> bool:
     return False
 
 
+def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
+    """Map an Anthropic ``tool_choice`` to OpenAI Responses request fields.
+
+    Returns ``(fields, warnings)`` where ``fields`` carries the keys to merge into
+    the translated request: ``tool_choice`` (``"auto"``/``"none"``/``"required"`` or a
+    forced ``{"type": "function", "name": ...}`` object) and ``parallel_tool_calls``
+    when Anthropic's ``disable_parallel_tool_use`` is set. Unsupported choice types
+    are omitted with a warning rather than guessed.
+    """
+    fields: dict = {}
+    warnings: list[str] = []
+    choice_type = tool_choice.get("type")
+    if choice_type == "auto":
+        fields["tool_choice"] = "auto"
+    elif choice_type == "none":
+        fields["tool_choice"] = "none"
+    elif choice_type == "any":
+        fields["tool_choice"] = "required"
+    elif choice_type == "tool":
+        fields["tool_choice"] = {"type": "function", "name": tool_choice["name"]}
+    else:
+        warnings.append(
+            f"Unsupported tool_choice type '{_safe_token(choice_type)}', omitting tool_choice"
+        )
+    if tool_choice.get("disable_parallel_tool_use"):
+        fields["parallel_tool_calls"] = False
+    return fields, warnings
+
+
 def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     """Translate an Anthropic Messages API request to an OpenAI Responses API request.
 
@@ -329,12 +397,19 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     model = request.get("model", "")
     translated_model = MODEL_MAP.get(model, DEFAULT_MODEL)
 
-    # Build result — Codex endpoint requires stream: true
+    # Build result — Codex endpoint requires stream: true.
+    # include=reasoning.encrypted_content: with store:false the model is stateless,
+    # so it returns each reasoning item's encrypted continuation blob. The provider
+    # echoes these back before their function_calls on the next turn (see
+    # _associate_reasoning_with_calls / OpenAIProvider._inject_reasoning); without it
+    # gpt-5-class models reject the follow-up with "function_call was provided without
+    # its required reasoning item".
     result: dict = {
         "model": translated_model,
         "reasoning": {"effort": "xhigh"},
         "store": False,
         "stream": True,
+        "include": ["reasoning.encrypted_content"],
     }
 
     # System prompt → instructions (required by Codex endpoint)
@@ -365,6 +440,13 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
             for tool in request["tools"]
         ]
 
+    # tool_choice / parallel controls — preserve Claude Code's requested tool policy
+    tool_choice = request.get("tool_choice")
+    if tool_choice is not None:
+        tc_fields, tc_warnings = _translate_tool_choice(tool_choice)
+        result.update(tc_fields)
+        warnings.extend(tc_warnings)
+
     # Messages → input
     input_items: list[dict] = []
     for message in request.get("messages", []):
@@ -382,25 +464,87 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     return result, warnings
 
 
+# OpenAI Responses ``incomplete_details.reason`` that signals a moderation block, not
+# token-budget exhaustion. Disambiguating the two is the whole point of T-006: mapping
+# a content-filtered turn to ``max_tokens`` makes Claude Code auto-compact a context
+# nowhere near full and retry endlessly.
+_CONTENT_FILTER_REASON = "content_filter"
+
+# Surfaced to Claude Code when a turn is content-filtered with no model text, so the turn
+# renders as a visible refusal rather than a blank assistant message. Mirrors the Gemini
+# provider's ``_SAFETY_REFUSAL``.
+_CONTENT_FILTER_REFUSAL = (
+    "I cannot complete this response because it was blocked by content safety filters. "
+    "Please rephrase your request."
+)
+
+
+def _coerce_token_count(value: object) -> int:
+    """Coerce a provider token count to a non-negative int.
+
+    Provider usage may carry floats or nulls; Anthropic's usage fields are integers
+    that Claude Code's ``/context`` math divides by. Non-numeric values default to 0.
+    """
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    return 0
+
+
+def _anthropic_usage(oai_usage: object) -> dict:
+    """Project OpenAI Responses usage onto Anthropic's flat integer shape.
+
+    OpenAI ``input_tokens`` already includes cached tokens and ``output_tokens`` already
+    includes reasoning tokens (both are subsets, per the Responses contract), so each maps
+    straight to Anthropic's corresponding total. Cached tokens are deliberately NOT split
+    into ``cache_read_input_tokens`` — Anthropic's totals are non-overlapping, so doing so
+    would double-count. Missing or non-numeric fields default to 0. See D-USAGE-001.
+    """
+    usage = oai_usage if isinstance(oai_usage, dict) else {}
+    return {
+        "input_tokens": _coerce_token_count(usage.get("input_tokens", 0)),
+        "output_tokens": _coerce_token_count(usage.get("output_tokens", 0)),
+    }
+
+
+def _incomplete_reason(response: dict) -> str:
+    """Return ``incomplete_details.reason`` from a Responses object, or ``""`` if absent.
+
+    GPT-5 sometimes returns ``status: "incomplete"`` with a null ``incomplete_details``;
+    that absence reads as token exhaustion (the conservative default).
+    """
+    details = response.get("incomplete_details")
+    return details.get("reason", "") if isinstance(details, dict) else ""
+
+
+def _stop_reason(status: str, has_tool_calls: bool, incomplete_reason: str) -> str:
+    """Map an OpenAI Responses terminal status to an Anthropic ``stop_reason``.
+
+    Tool calls win — Claude Code must run the tool rather than compact. A content-filtered
+    completion ends the turn cleanly (``end_turn``); any other ``incomplete`` is treated as
+    output-token exhaustion (``max_tokens``), the signal Claude Code auto-compacts on.
+    """
+    if has_tool_calls:
+        return "tool_use"
+    if status == "incomplete":
+        return "end_turn" if incomplete_reason == _CONTENT_FILTER_REASON else "max_tokens"
+    return "end_turn"
+
+
 def openai_to_anthropic(response: dict) -> dict:
     """Translate an OpenAI Responses API response to an Anthropic Messages API response.
 
     Pure function — no I/O.
     """
-    # Map status → stop_reason
+    # Map status → stop_reason (disambiguating content_filter from token exhaustion)
     status = response.get("status", "completed")
     output_items = response.get("output", [])
     has_tool_calls = any(i.get("type") == "function_call" for i in output_items)
-    if has_tool_calls:
-        stop_reason = "tool_use"
-    elif status == "incomplete":
-        stop_reason = "max_tokens"
-    else:
-        stop_reason = "end_turn"
+    incomplete_reason = _incomplete_reason(response)
+    stop_reason = _stop_reason(status, has_tool_calls, incomplete_reason)
 
     # Translate output items → content blocks
     content: list[dict] = []
-    for item in response.get("output", []):
+    for item in output_items:
         item_type = item.get("type")
 
         if item_type == "message":
@@ -408,6 +552,10 @@ def openai_to_anthropic(response: dict) -> dict:
             for block in item.get("content", []):
                 if block.get("type") == "output_text":
                     content.append({"type": "text", "text": block["text"]})
+
+        elif item_type == "refusal":
+            # A model refusal carries human-readable text — surface it, don't drop it.
+            content.append({"type": "text", "text": item.get("refusal", "")})
 
         elif item_type == "function_call":
             raw_args = item.get("arguments", "{}")
@@ -426,12 +574,13 @@ def openai_to_anthropic(response: dict) -> dict:
                 }
             )
 
-    # Map usage
-    oai_usage = response.get("usage") or {}
-    usage = {
-        "input_tokens": oai_usage.get("input_tokens", 0),
-        "output_tokens": oai_usage.get("output_tokens", 0),
-    }
+    # Content-filtered turn with no model text → synthesize a visible refusal so the
+    # turn never renders as a blank assistant message.
+    has_text = any(b.get("type") == "text" and b.get("text") for b in content)
+    if incomplete_reason == _CONTENT_FILTER_REASON and not has_text:
+        content.append({"type": "text", "text": _CONTENT_FILTER_REFUSAL})
+
+    usage = _anthropic_usage(response.get("usage"))
 
     return {
         "id": f"msg_bridge_{response.get('id', 'unknown')}",
@@ -442,6 +591,38 @@ def openai_to_anthropic(response: dict) -> dict:
         "content": content,
         "usage": usage,
     }
+
+
+def _associate_reasoning_with_calls(output: list[dict]) -> dict[str, dict]:
+    """Map each tool call's id to the reasoning item that immediately precedes it.
+
+    Walks the Responses ``output`` once: a reasoning item carrying
+    ``encrypted_content`` becomes the pending continuation state for the next
+    function_call; once paired (or interrupted by any other item) it is consumed.
+    Keys use the call's ``call_id`` (falling back to ``id``) normalized to ``fc_``
+    form — the same identity ``openai_to_anthropic`` exposes to Claude Code — so the
+    next request's function_calls look up by the matching key.
+
+    Pure function — no I/O, no state.
+    """
+    associations: dict[str, dict] = {}
+    pending: dict | None = None
+    for item in output:
+        if not isinstance(item, dict):
+            pending = None
+            continue
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            pending = item if item.get("encrypted_content") else None
+        elif item_type == "function_call":
+            if pending is not None:
+                key = _to_openai_id(item.get("call_id") or item.get("id", ""))
+                if key:
+                    associations[key] = pending
+            pending = None
+        else:
+            pending = None
+    return associations
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +647,7 @@ def _sse_response_created(data: dict) -> list[dict]:
                     "model": resp.get("model", ""),
                     "stop_reason": None,
                     "usage": {
-                        "input_tokens": usage.get("input_tokens", 0),
+                        "input_tokens": _coerce_token_count(usage.get("input_tokens", 0)),
                         "output_tokens": 0,
                     },
                 },
@@ -501,33 +682,62 @@ def _sse_output_item_added(data: dict) -> list[dict]:
     ]
 
 
+def _synthesize_refusal_block(text: str) -> list[dict]:
+    """Build start/delta/stop SSE events for a synthetic refusal text block.
+
+    Emitted when a streamed turn is content-filtered with no model text, so the stream
+    does not end on an empty assistant message. The placeholder index 0 is reassigned to
+    the next sequential Anthropic block index by ``_remap_block_index``.
+    """
+    return [
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            },
+        },
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+    ]
+
+
 def _sse_response_completed(data: dict) -> list[dict]:
-    """Translate response.completed → message_delta + message_stop."""
+    """Translate response.completed → [refusal block?] + message_delta + message_stop.
+
+    A content-filtered turn is prefixed with a synthesized refusal text block and ends
+    with ``end_turn``; any other ``incomplete`` maps to ``max_tokens``.
+    """
     resp = data.get("response", {})
-    usage = resp.get("usage") or {}
     status = resp.get("status", "completed")
     output = resp.get("output", [])
     has_tool_calls = any(i.get("type") == "function_call" for i in output)
-    if has_tool_calls:
-        stop_reason = "tool_use"
-    elif status == "incomplete":
-        stop_reason = "max_tokens"
-    else:
-        stop_reason = "end_turn"
-    return [
+    incomplete_reason = _incomplete_reason(resp)
+    stop_reason = _stop_reason(status, has_tool_calls, incomplete_reason)
+
+    events: list[dict] = []
+    if incomplete_reason == _CONTENT_FILTER_REASON:
+        events.extend(_synthesize_refusal_block(_CONTENT_FILTER_REFUSAL))
+    events.append(
         {
             "event": "message_delta",
             "data": {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason},
-                "usage": {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                },
+                "usage": _anthropic_usage(resp.get("usage")),
             },
-        },
-        {"event": "message_stop", "data": {"type": "message_stop"}},
-    ]
+        }
+    )
+    events.append({"event": "message_stop", "data": {"type": "message_stop"}})
+    return events
 
 
 # Events that are informational — no Anthropic equivalent.
@@ -684,6 +894,11 @@ class OpenAIProvider:
             self.endpoint = _API_KEY_ENDPOINT
         else:
             self.endpoint = _CODEX_ENDPOINT
+        # Encrypted reasoning blobs keyed by fc_ call id, captured from responses and
+        # re-injected before their function_calls on the next request. In-memory only —
+        # opaque, never persisted, never logged, never returned to Claude Code.
+        self._reasoning_by_call_id: dict[str, dict] = {}
+        self._reasoning_lock = threading.Lock()
 
     async def authenticate(self) -> dict[str, str]:
         """Return Authorization header with a valid bearer token."""
@@ -698,13 +913,64 @@ class OpenAIProvider:
         token = await get_bearer_token(self._auth_path)
         return {"Authorization": f"Bearer {token}"}
 
+    def _stash_reasoning(self, associations: dict[str, dict]) -> None:
+        """Store captured reasoning blobs, refreshing recency and evicting the oldest
+        entries once the cache exceeds its bound."""
+        if not associations:
+            return
+        with self._reasoning_lock:
+            for call_id, reasoning in associations.items():
+                self._reasoning_by_call_id.pop(call_id, None)
+                self._reasoning_by_call_id[call_id] = reasoning
+            while len(self._reasoning_by_call_id) > _REASONING_CACHE_MAX:
+                oldest = next(iter(self._reasoning_by_call_id))
+                del self._reasoning_by_call_id[oldest]
+
+    def _inject_reasoning(self, translated: dict) -> None:
+        """Insert each cached reasoning item immediately before the function_call it
+        belongs to, in-place on ``translated['input']``. Each reasoning item is inserted
+        at most once (a duplicate item id would be rejected), so parallel calls sharing
+        one reasoning item get a single preceding copy."""
+        input_items = translated.get("input")
+        if not isinstance(input_items, list):
+            return
+        with self._reasoning_lock:
+            if not self._reasoning_by_call_id:
+                return
+            cache = dict(self._reasoning_by_call_id)
+        new_input: list[dict] = []
+        inserted: set = set()
+        for item in input_items:
+            if item.get("type") == "function_call":
+                key = _to_openai_id(item.get("call_id") or item.get("id", ""))
+                reasoning = cache.get(key)
+                if reasoning is not None:
+                    dedup_key = reasoning.get("id") or id(reasoning)
+                    if dedup_key not in inserted:
+                        new_input.append(reasoning)
+                        inserted.add(dedup_key)
+            new_input.append(item)
+        translated["input"] = new_input
+
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
-        """Translate Anthropic Messages request to OpenAI Responses request."""
-        return anthropic_to_openai(anthropic_req)
+        """Translate Anthropic Messages request to OpenAI Responses request, echoing any
+        captured encrypted reasoning back before its function_calls."""
+        result, warnings = anthropic_to_openai(anthropic_req)
+        self._inject_reasoning(result)
+        return result, warnings
 
     def translate_response(self, provider_resp: dict) -> dict:
-        """Translate OpenAI Responses response to Anthropic Messages response."""
+        """Translate OpenAI Responses response to Anthropic Messages response, capturing
+        each function_call's preceding encrypted reasoning for the next request."""
+        self._stash_reasoning(_associate_reasoning_with_calls(provider_resp.get("output", [])))
         return openai_to_anthropic(provider_resp)
+
+    def _capture_stream_reasoning(self, parsed_event: dict) -> None:
+        """Capture encrypted reasoning from a streamed response.completed event."""
+        if parsed_event.get("event") != "response.completed":
+            return
+        response_obj = (parsed_event.get("data") or {}).get("response") or {}
+        self._stash_reasoning(_associate_reasoning_with_calls(response_obj.get("output", [])))
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw provider byte chunks to Anthropic SSE events.
@@ -726,13 +992,20 @@ class OpenAIProvider:
                 event_bytes = buffer[:event_end]
                 buffer = buffer[event_end:]
                 for parsed_event in parse_sse_events(event_bytes):
+                    self._capture_stream_reasoning(parsed_event)
                     for translated in translate_openai_sse_event(parsed_event):
                         translated, block_index, has_tool_calls = _remap_block_index(
                             translated, index_map, block_index, has_tool_calls
                         )
                         yield translated
+            if len(buffer) > _MAX_SSE_BUFFER:
+                raise RuntimeError(
+                    f"Provider SSE stream exceeded {_MAX_SSE_BUFFER} bytes without an "
+                    "event terminator; aborting malformed stream"
+                )
         if buffer.strip():
             for parsed_event in parse_sse_events(buffer):
+                self._capture_stream_reasoning(parsed_event)
                 for translated in translate_openai_sse_event(parsed_event):
                     translated, block_index, has_tool_calls = _remap_block_index(
                         translated, index_map, block_index, has_tool_calls
