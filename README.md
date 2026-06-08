@@ -17,7 +17,7 @@ We built a full development protocol on top of Claude Code — a finite state ma
 driving multi-agent workflows. Hundreds of hours of investment in `.claude/` configuration, hooks, CLAUDE.md conventions,
 and muscle memory.
 
-Then one day Claude is overloaded. Or rate-limited. Or you just want to see how GPT-5.4
+Then one day Claude is overloaded. Or rate-limited. Or you just want to see how GPT-5.5
 handles the same task with the same tools.
 
 **Without Claude Bridge:** your entire setup is useless. Claude Code only talks to Anthropic.
@@ -25,11 +25,12 @@ handles the same task with the same tools.
 **With Claude Bridge:** one command, same setup, different model.
 
 ```bash
-claude-codex    # your Claude Code + GPT-5.4
+claude-codex    # your Claude Code + GPT-5.5
 ```
 
-Everything works — tools, hooks, skills, streaming, multi-turn tool conversations — because
-the bridge translates the Anthropic Messages API to the provider's native format on-the-fly.
+Core Claude Code flows work — tools, hooks, skills, streaming, multi-turn tool
+conversations — because the bridge translates the Anthropic Messages API to the
+provider's native format on-the-fly.
 
 ## How It Works
 
@@ -38,25 +39,28 @@ Claude Code  -->  Claude Bridge (localhost:9999)  -->  Anthropic (passthrough)
                            |
                      circuit breaker
                            |
-                     Provider adapter  -->  OpenAI / Grok / Gemini / ...
+                     Provider adapter  -->  OpenAI / Gemini / ...
 ```
 
 1. Claude Code sends an Anthropic Messages API request to `localhost:9999`
 2. The bridge translates it to the target provider's format (e.g., OpenAI Responses API)
-3. The provider responds (streaming SSE or sync JSON)
+3. The provider responds with SSE; non-streaming Claude clients get an aggregated message
 4. The bridge translates the response back to Anthropic format
-5. Claude Code receives it as if Anthropic answered — tools, streaming, everything works
+5. Claude Code receives it as if Anthropic answered — tools, streaming, and normal text flows work
 
-Full fidelity: `tool_use` ↔ `function_call`, `tool_result` ↔ `function_call_output`,
-streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`).
+Core fidelity: `tool_use` ↔ `function_call`, `tool_result` ↔ `function_call_output`,
+streaming SSE events mapped to Anthropic SSE, and tool IDs translated (`toolu_` ↔ `fc_`).
+Unsupported server-tool/MCP/code-execution blocks degrade to redacted placeholders instead
+of leaking provider-incompatible content.
 
 ## Features
 
 - **Zero dependencies** — stdlib-only Python, no `pip install`
-- **Standard API key auth** — set `OPENAI_API_KEY` or `GEMINI_API_KEY` for official APIs
+- **Direct API key auth** — set `OPENAI_API_KEY` or `GEMINI_API_KEY` for official APIs
 - **Subscription OAuth** — no API key? Falls back to Codex OAuth (OpenAI) or Gemini CLI OAuth (Google) automatically
-- **Reasoning passthrough** — thinking blocks preserved by default, not silently stripped
-- **Auto-failover** — circuit breaker routes to fallback on Anthropic 429/500/502/503
+- **OpenAI reasoning continuity** — encrypted reasoning blobs are cached in memory and echoed across tool turns
+- **Reasoning passthrough controls** — OpenAI can preserve or drop thinking blocks; Gemini strips them with a warning
+- **Auto-failover** — circuit breaker routes Anthropic 429/500/502/503 to the first available fallback provider
 - **Retry with backoff** — transient HTTP errors retried once with 0.5s exponential backoff
 - **Mid-turn failover guard** — blocks provider switch during active tool-use turns
 - **Direct mode** — skip Anthropic entirely, always use a specific provider
@@ -64,16 +68,17 @@ streaming SSE events mapped one-to-one, tool IDs translated (`toolu_` ↔ `fc_`)
 - **Structured logging** — request IDs, provider/model identity, log levels (`LOG_LEVEL=DEBUG`)
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
-- **Multi-provider** — adding a provider = one file, zero proxy changes
-- **202 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **Compatibility trace** — optional redacted structural trace for wire-contract debugging
+- **Multi-provider** — adding a provider = one provider file plus registration import
+- **321 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
 ### Accounts
 
 - **Anthropic account** — for Claude Code ([console.anthropic.com](https://console.anthropic.com/))
-- **ChatGPT Plus** ($20/mo) — for the OpenAI/Codex provider (provides OAuth access)
-- **Google AI Studio** (free) — for the Gemini provider ([aistudio.google.com/apikey](https://aistudio.google.com/apikey))
+- **OpenAI access** — either `OPENAI_API_KEY` for the standard Responses API or ChatGPT Plus for Codex OAuth
+- **Gemini access** — either `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey) or Google One AI Premium for Gemini CLI OAuth
 
 ### Software (macOS)
 
@@ -86,17 +91,18 @@ claude --version
 codex --version
 gemini --version
 
-# Authenticate with your subscriptions
-codex login                        # ChatGPT Plus ($20/mo)
-gemini login                       # Google One AI Premium ($20/mo)
+# Optional: authenticate with subscriptions when not using API keys
+codex login                        # ChatGPT Plus OAuth path
+gemini login                       # Google One AI Premium OAuth path
 cat ~/.codex/auth.json             # should show access_token
 cat ~/.gemini/oauth_creds.json     # should show access_token
 ```
 
 > **macOS only** for now (brew dependencies). Linux support is untested.
 > **No `pip install` needed** — the bridge is stdlib-only Python.
-> Codex CLI is for the OpenAI provider, Gemini CLI is for the Gemini provider.
-> Both use your existing subscriptions — no separate API keys needed.
+> Codex CLI is for the OpenAI OAuth path, Gemini CLI is for the Gemini OAuth path.
+> If you set `OPENAI_API_KEY` or `GEMINI_API_KEY`, the matching direct provider mode uses
+> the official API instead.
 
 ## Install
 
@@ -118,8 +124,8 @@ which claude-codex claude-gemini || echo 'Add to PATH: echo "export PATH=\$HOME/
 ### One command (recommended)
 
 ```bash
-claude-codex     # use OpenAI GPT-5.4 (ChatGPT Plus subscription)
-claude-gemini    # use Google Gemini 3 Flash (Google One AI Premium subscription)
+claude-codex     # use OpenAI GPT-5.5 (ChatGPT Plus subscription or OPENAI_API_KEY)
+claude-gemini    # use Gemini 3 Flash OAuth by default, or API key mode with GEMINI_API_KEY
 ```
 
 You'll see:
@@ -130,7 +136,7 @@ You'll see:
 | (__| | (_| | |_| | (_| |  __/|___||(_| (_) | (_| |  __/>  <
  \___|_|\__,_|\__,_|\__,_|\___|     \___\___/ \__,_|\___/_/\_\
 
- port:9472  pid:12345  model:gpt-5.5
+ port:9472  pid:12345  model:gpt-5.5  version:0.7.0
  by axdel  github.com/axdel/claude-bridge
 ```
 
@@ -143,20 +149,22 @@ or
 | (__| | (_| | |_| | (_| |  __/|___| (_| |  __/ | | | | | | | | | |
  \___|_|\__,_|\__,_|\__,_|\___|     \__, |\___|_| |_| |_|_|_| |_|_|
                                     |___/
- port:9738  pid:59952  model:gemini-3-flash-preview
+ port:9738  pid:59952  model:gemini-3-flash-preview  version:0.7.0
  by axdel  github.com/axdel/claude-bridge
 ```
 
 > Claude Code's banner still says "Sonnet 4.6" — it doesn't know about the bridge.
-> The actual model answering is the one shown in the bridge banner.
+> For `claude-codex`, the actual model is the GPT-5.5 model shown in the bridge banner.
+> For `claude-gemini`, the banner shows the `GEMINI_MODEL` launcher value; API-key mode
+> defaults to `gemini-2.5-pro` unless you set `GEMINI_MODEL`.
 
 The bridge starts on a random port, launches Claude Code through it, and cleans up on exit.
 
 ### Options
 
 ```bash
-claude-codex              # OpenAI/Codex (GPT-5.4)
-claude-gemini             # Google Gemini (gemini-3-flash-preview)
+claude-codex              # OpenAI/Codex (GPT-5.5)
+claude-gemini             # Google Gemini OAuth (gemini-3-flash-preview)
 claude-codex --debug      # show bridge translation logs
 claude-gemini --debug     # same for Gemini
 claude-codex -- -p opus   # pass flags through to claude
@@ -204,9 +212,11 @@ claude
 ./start.sh    # 429/500/502/503 -> circuit breaker -> fallback provider
 ```
 
-**Fallback chain** — control the failover order:
+**Fallback selection** — choose the ordered list of registered fallback providers.
+The bridge uses the first registered provider in the list; it does not cascade across
+later providers after a provider-side failure.
 ```bash
-LLM_BRIDGE_FALLBACK=openai,xai ./start.sh
+LLM_BRIDGE_FALLBACK=gemini,openai ./start.sh
 ```
 
 ## Metrics
@@ -236,32 +246,35 @@ curl -s localhost:9999/stats | python3 -m json.tool
 
 | Env Var | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | _(none)_ | OpenAI API key — uses standard Responses API when set |
-| `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — get from [AI Studio](https://aistudio.google.com/apikey). When unset, falls back to Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) |
-| `GEMINI_MODEL` | `gemini-3-flash-preview` | Default Gemini model for OAuth. Override to `gemini-2.5-pro`, `gemini-3.1-pro-preview`, etc. API key mode defaults to `gemini-2.5-pro` |
-| `REASONING_MODE` | `passthrough` | `passthrough` preserves thinking blocks, `drop` strips them |
+| `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
+| `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — direct Gemini mode uses the public API when set; otherwise it uses Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) |
+| `GEMINI_MODEL` | `gemini-3-flash-preview` OAuth / `gemini-2.5-pro` API key | Gemini model override. OAuth defaults to Gemini 3 Flash; API-key mode defaults to Gemini 2.5 Pro |
+| `REASONING_MODE` | `passthrough` | OpenAI thinking-block handling: `passthrough` preserves tagged thinking text, `drop` strips it. Gemini strips thinking blocks because it has no equivalent |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `UPSTREAM_TIMEOUT` | `60`/`120` | Upstream request timeout in seconds (60s sync, 120s streaming) |
 | `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10MB) |
-| `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback provider chain |
+| `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback preference list; the first registered provider is used |
 | `LLM_BRIDGE_PORT` | `9999` | Default proxy port |
 | `ANTHROPIC_REAL_URL` | `https://api.anthropic.com` | Real Anthropic endpoint (passthrough) |
+| `CLAUDE_BRIDGE_TRACE_PATH` | _(none)_ | Optional redacted JSONL structural trace path for wire-compatibility debugging |
 
 ## Architecture
 
 ```
 src/claude_bridge/
+├── __main__.py       # CLI entry, provider imports, auth mode detection
 ├── proxy.py          # HTTP server, routing, streaming, /stats, /health, retry
-├── provider.py       # Provider protocol (abstract interface)
+├── provider.py       # Provider protocol and PROVIDERS registry
 ├── router.py         # Circuit breaker (CLOSED/OPEN/HALF_OPEN)
 ├── stats.py          # Thread-safe metrics counters
-├── log.py            # Structured logging with request IDs
+├── log.py            # Structured logging, request IDs, redacted trace sink
 ├── auth.py           # JWT decode, token expiry
 ├── stream.py         # SSE parsing/formatting utilities
 └── providers/
-    ├── openai.py     # OpenAI Codex: OAuth + Anthropic <-> Responses API
-    ├── gemini.py     # Google Gemini: API key + Anthropic <-> generateContent API
-    └── xai.py        # xAI Grok: stub
+    ├── __init__.py   # Provider registration notes
+    ├── openai.py     # OpenAI: API key + Codex OAuth + Responses API translation
+    ├── gemini.py     # Gemini: API key + Gemini CLI OAuth + generateContent translation
+    └── xai.py        # xAI Grok: registered stub, not implemented
 ```
 
 ### Adding a New Provider
@@ -275,7 +288,7 @@ src/claude_bridge/
 3. Register: `PROVIDERS["yourprovider"] = YourProvider`
 4. Import in `__main__.py`
 5. Use: `./start.sh --provider yourprovider`
-6. Optionally copy `claude-codex` -> `claude-yourprovider` (change `--provider`)
+6. Optionally copy `claude-codex` -> `claude-yourprovider` (change `--provider` and banner model)
 
 ### OpenAI Translation Map
 
@@ -303,7 +316,7 @@ src/claude_bridge/
 | `messages[].content[type=tool_use]` | `contents[].parts[].functionCall` |
 | `messages[].content[type=tool_result]` | `contents[].parts[].functionResponse` |
 | `tools[].input_schema` | `tools[0].function_declarations[].parameters` |
-| Tool ID: `toolu_xxx` | Tool ID: `call_gemini_xxx` (with thoughtSignature encoding) |
+| Tool ID: `toolu_xxx` | Tool ID: `toolu_gemini_xxx` (legacy `call_gemini_xxx` accepted; thoughtSignature encoded) |
 | SSE: `content_block_delta` | SSE: `data:` chunks (complete JSON per chunk) |
 | `stop_reason: tool_use` | `finishReason: STOP` + functionCall in parts |
 
@@ -314,13 +327,14 @@ src/claude_bridge/
 ## Known Limitations
 
 - Claude Code's startup banner always shows "Sonnet 4.6" regardless of actual model
-- `thinking` blocks are passed through as tagged text (no native OpenAI equivalent) — set `REASONING_MODE=drop` to strip
+- OpenAI `thinking` blocks are passed through as tagged text by default — set `REASONING_MODE=drop` to strip them; Gemini strips thinking blocks with a warning
 - `output_config` and `cache_control` hints are stripped with a warning
 - Token estimation is approximate (~bytes/3.5), not exact tokenization
 - Streaming stats don't include token counts (only latency)
 - Failover is blocked during active tool-use turns (by design — prevents broken tool state)
 - Rate limit headers (`x-ratelimit-*`, `retry-after`) forwarded on sync responses only — streaming responses cannot include HTTP headers after SSE begins
 - Retry applies to sync HTTP calls only — streaming connections are not retried (SSE state replay is too complex)
+- xAI is registered only as an extensibility stub; `xai` is not a usable provider yet
 
 ## Running Tests
 
@@ -434,7 +448,7 @@ suite.
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 297 | Minimal | Some |
+| Tests | 321 | Minimal | Some |
 
 ## Terms of Service Considerations
 
