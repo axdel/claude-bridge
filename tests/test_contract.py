@@ -1153,6 +1153,60 @@ class TestReasoningContinuity:
         assert all(item.get("type") != "reasoning" for item in oldest["input"])
         assert any(item.get("type") == "reasoning" for item in newest["input"])
 
+    def test_reasoning_cache_is_thread_safe_under_concurrent_eviction(self):
+        # T-005 claims _reasoning_by_call_id is concurrency-safe via _reasoning_lock.
+        # The eviction loop reads `oldest = next(iter(...))` then `del`s that key.
+        # Without the lock two threads read the same oldest key and the second `del`
+        # raises KeyError. The GIL does NOT close this window — it spans two bytecodes,
+        # and a thread switch landing between them double-deletes. We force that switch
+        # with a near-zero switch interval, pin the cache at the bound so every stash
+        # runs the eviction critical section, and align all workers on a barrier so
+        # they collide there simultaneously.
+        import sys
+        import threading
+
+        from claude_bridge.providers.openai import _REASONING_CACHE_MAX
+
+        provider = _provider()
+        # Pre-fill to the bound: now every concurrent stash adds one and immediately
+        # evicts one, so the critical section runs on every single operation.
+        provider._stash_reasoning(
+            {f"seed_{i}": {"id": f"rs_seed_{i}"} for i in range(_REASONING_CACHE_MAX)}
+        )
+
+        worker_count = 16
+        errors: list[Exception] = []
+        ready = threading.Barrier(worker_count)
+
+        def stash_many(worker: int) -> None:
+            ready.wait()  # all workers hit the eviction loop together
+            try:
+                for n in range(200):
+                    provider.translate_response(
+                        _response_with(
+                            [
+                                _reasoning_item(f"rs_{worker}_{n}", f"ENC_{worker}_{n}"),
+                                _function_call_item(f"fc_{worker}_{n}"),
+                            ]
+                        )
+                    )
+            except Exception as exc:  # a lost-lock eviction race surfaces here
+                errors.append(exc)
+
+        original_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)  # force preemption between next(iter()) and del
+        try:
+            threads = [threading.Thread(target=stash_many, args=(w,)) for w in range(worker_count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            sys.setswitchinterval(original_interval)
+
+        assert errors == [], f"concurrent stash raised: {errors}"
+        assert len(provider._reasoning_by_call_id) <= _REASONING_CACHE_MAX
+
     def test_streaming_completed_event_captures_reasoning(self):
         import asyncio
 

@@ -380,7 +380,7 @@ class TestTranslateStream:
         """Multiple SSE events in one chunk are all translated."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         created_event = _make_sse_event(
             "response.created",
@@ -421,7 +421,7 @@ class TestTranslateStream:
         """An SSE event split across two byte chunks is correctly buffered."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         full_event = _make_sse_event(
             "response.output_text.delta",
@@ -451,7 +451,7 @@ class TestTranslateStream:
         """CRLF line endings in SSE are normalized and parsed correctly."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         event_bytes = (
             b"event: response.output_text.delta\r\n"
@@ -471,7 +471,7 @@ class TestTranslateStream:
         """Events with no Anthropic equivalent are silently skipped."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         # response.output_item.added for a non-function_call item produces no output
         event_bytes = _make_sse_event(
@@ -494,7 +494,7 @@ class TestTranslateStream:
         """Empty byte chunks don't produce events or errors."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         text_event = _make_sse_event(
             "response.output_text.delta",
@@ -519,7 +519,7 @@ class TestTranslateStream:
         index follows the real text block (1), not a duplicate of it (0)."""
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
 
         part_added = _make_sse_event(
             "response.content_part.added",

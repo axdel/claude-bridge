@@ -261,7 +261,7 @@ class _FakeOpenAIProvider:
     async def translate_stream(self, raw_chunks):
         from claude_bridge.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider = OpenAIProvider()
         async for event in provider.translate_stream(raw_chunks):
             yield event
 
