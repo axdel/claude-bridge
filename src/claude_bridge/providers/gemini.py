@@ -31,6 +31,17 @@ DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
 
 _STRIPPED_KEYS = ("output_config",)
 
+# Upper bound on user-controlled tokens embedded in warnings/placeholders.
+_SAFE_TOKEN_MAX = 64
+
+
+def _safe_token(value: object) -> str:
+    """Return a printable, length-bounded token safe for warnings and traces."""
+    cleaned = "".join(ch for ch in str(value) if ch.isprintable())
+    if len(cleaned) > _SAFE_TOKEN_MAX:
+        return cleaned[:_SAFE_TOKEN_MAX] + "..."
+    return cleaned
+
 
 # ---------------------------------------------------------------------------
 # ID encoding — round-trip Gemini tool call IDs + optional thoughtSignature
@@ -103,8 +114,12 @@ def _translate_block(
     if block_type == "tool_result":
         return _translate_tool_result(block, tool_id_to_name)
 
-    warnings.append(f"Unknown content block type '{block_type}', converted to text")
-    return {"text": str(block)}
+    safe_type = _safe_token(block_type)
+    warnings.append(
+        f"Unsupported content block type '{safe_type}' replaced with a redacted "
+        "placeholder (no provider equivalent)"
+    )
+    return {"text": f"[unsupported content block: {safe_type}]"}
 
 
 def _translate_tool_result(block: dict, tool_id_to_name: dict[str, str]) -> dict:
@@ -377,6 +392,148 @@ def _sse_tool_use_block(index: int, tool_id: str, name: str) -> list[dict]:
     ]
 
 
+def _sse_text_block_start(index: int) -> dict:
+    """Build an Anthropic content_block_start event for text."""
+    return {
+        "event": "content_block_start",
+        "data": {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "text", "text": ""},
+        },
+    }
+
+
+def _sse_block_stop(index: int) -> dict:
+    """Build an Anthropic content_block_stop event."""
+    return {
+        "event": "content_block_stop",
+        "data": {"type": "content_block_stop", "index": index},
+    }
+
+
+def _sse_message_start(response_id: str, model: str, usage: dict) -> dict:
+    """Build an Anthropic message_start event from Gemini response metadata."""
+    return {
+        "event": "message_start",
+        "data": {
+            "type": "message_start",
+            "message": {
+                "id": f"msg_bridge_{response_id}",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "usage": {
+                    "input_tokens": usage.get("promptTokenCount", 0),
+                    "output_tokens": 0,
+                },
+            },
+        },
+    }
+
+
+def _close_text_block(events: list[dict], state: dict, block_index: int, *, advance: bool) -> int:
+    """Close an open text block and optionally advance to the next block index."""
+    if not state.get("text_block_open"):
+        return block_index
+    events.append(_sse_block_stop(block_index))
+    state["text_block_open"] = False
+    return block_index + 1 if advance else block_index
+
+
+def _append_text_part(events: list[dict], state: dict, block_index: int, text: str) -> None:
+    """Append Gemini text as Anthropic text-block events."""
+    if not state.get("text_block_open"):
+        state["text_block_open"] = True
+        events.append(_sse_text_block_start(block_index))
+    events.append(_sse_text_delta(block_index, text))
+
+
+def _append_tool_call_part(events: list[dict], part: dict, state: dict, block_index: int) -> int:
+    """Append a Gemini functionCall as Anthropic tool_use events."""
+    block_index = _close_text_block(events, state, block_index, advance=True)
+    state["has_tool_calls"] = True
+    function_call = part["functionCall"]
+    gemini_id = function_call.get("id", f"gemini_{block_index}")
+    tool_id = _encode_tool_id(gemini_id, part.get("thoughtSignature"))
+    events.extend(_sse_tool_use_block(block_index, tool_id, function_call["name"]))
+    events.append(
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": json.dumps(function_call.get("args", {})),
+                },
+            },
+        }
+    )
+    events.append(_sse_block_stop(block_index))
+    return block_index + 1
+
+
+def _append_part_events(events: list[dict], part: dict, state: dict, block_index: int) -> int:
+    """Append Anthropic events for one Gemini part and return the next block index."""
+    if "text" in part and not part.get("thought") and part["text"]:
+        _append_text_part(events, state, block_index, part["text"])
+        return block_index
+    if "functionCall" in part:
+        return _append_tool_call_part(events, part, state, block_index)
+    return block_index
+
+
+def _gemini_stop_reason(finish_reason: str, has_tools: bool) -> str:
+    """Map Gemini finishReason to Anthropic stop_reason."""
+    if finish_reason == "MAX_TOKENS":
+        return "max_tokens"
+    if has_tools:
+        return "tool_use"
+    return "end_turn"
+
+
+def _append_safety_refusal(events: list[dict]) -> None:
+    """Append a synthetic refusal text block for Gemini SAFETY-only responses."""
+    events.append(_sse_text_block_start(0))
+    events.append(_sse_text_delta(0, _SAFETY_REFUSAL))
+    events.append(_sse_block_stop(0))
+
+
+def _append_finish_events(
+    events: list[dict],
+    finish_reason: str,
+    usage: dict,
+    state: dict,
+    block_index: int,
+) -> None:
+    """Append terminal Anthropic message events for a Gemini finish reason."""
+    _close_text_block(events, state, block_index, advance=False)
+    if finish_reason == "SAFETY" and block_index == 0:
+        _append_safety_refusal(events)
+    events.append(
+        {
+            "event": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": _gemini_stop_reason(
+                        finish_reason,
+                        bool(state.get("has_tool_calls", False)),
+                    )
+                },
+                "usage": {
+                    "input_tokens": usage.get("promptTokenCount", 0),
+                    "output_tokens": usage.get("candidatesTokenCount", 0),
+                },
+            },
+        }
+    )
+    events.append({"event": "message_stop", "data": {"type": "message_stop"}})
+
+
 def translate_gemini_sse_chunk(chunk: dict, state: dict) -> list[dict]:
     """Translate one Gemini SSE chunk to Anthropic SSE events.
 
@@ -390,148 +547,22 @@ def translate_gemini_sse_chunk(chunk: dict, state: dict) -> list[dict]:
     finish_reason = candidate.get("finishReason")
     usage = chunk.get("usageMetadata", {})
 
-    # Emit message_start on first chunk
     if not state.get("started"):
         state["started"] = True
-        resp_id = chunk.get("responseId", "unknown")
+        response_id = chunk.get("responseId", "unknown")
         model = chunk.get("modelVersion", "")
-        state["response_id"] = resp_id
+        state["response_id"] = response_id
         state["model"] = model
-        events.append(
-            {
-                "event": "message_start",
-                "data": {
-                    "type": "message_start",
-                    "message": {
-                        "id": f"msg_bridge_{resp_id}",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": model,
-                        "stop_reason": None,
-                        "usage": {
-                            "input_tokens": usage.get("promptTokenCount", 0),
-                            "output_tokens": 0,
-                        },
-                    },
-                },
-            }
-        )
+        events.append(_sse_message_start(response_id, model, usage))
         events.append({"event": "ping", "data": {"type": "ping"}})
 
-    block_idx = state.get("block_index", 0)
-
+    block_index = state.get("block_index", 0)
     for part in parts:
-        if "text" in part and not part.get("thought") and part["text"]:
-            # Start a text block if this is new
-            if not state.get("text_block_open"):
-                state["text_block_open"] = True
-                events.append(
-                    {
-                        "event": "content_block_start",
-                        "data": {
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {"type": "text", "text": ""},
-                        },
-                    }
-                )
-            events.append(_sse_text_delta(block_idx, part["text"]))
+        block_index = _append_part_events(events, part, state, block_index)
+    state["block_index"] = block_index
 
-        elif "functionCall" in part:
-            # Close any open text block first
-            if state.get("text_block_open"):
-                events.append(
-                    {
-                        "event": "content_block_stop",
-                        "data": {"type": "content_block_stop", "index": block_idx},
-                    }
-                )
-                state["text_block_open"] = False
-                block_idx += 1
-
-            state["has_tool_calls"] = True
-            fc = part["functionCall"]
-            gemini_id = fc.get("id", f"gemini_{block_idx}")
-            sig = part.get("thoughtSignature")
-            tool_id = _encode_tool_id(gemini_id, sig)
-            events.extend(_sse_tool_use_block(block_idx, tool_id, fc["name"]))
-            # Emit the full arguments as a single delta
-            args_json = json.dumps(fc.get("args", {}))
-            events.append(
-                {
-                    "event": "content_block_delta",
-                    "data": {
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "input_json_delta", "partial_json": args_json},
-                    },
-                }
-            )
-            events.append(
-                {
-                    "event": "content_block_stop",
-                    "data": {"type": "content_block_stop", "index": block_idx},
-                }
-            )
-            block_idx += 1
-
-    state["block_index"] = block_idx
-
-    # Handle finish
     if finish_reason:
-        # Close any open text block
-        if state.get("text_block_open"):
-            events.append(
-                {
-                    "event": "content_block_stop",
-                    "data": {"type": "content_block_stop", "index": block_idx},
-                }
-            )
-            state["text_block_open"] = False
-
-        # SAFETY with no content → synthesize refusal
-        if finish_reason == "SAFETY" and block_idx == 0:
-            events.append(
-                {
-                    "event": "content_block_start",
-                    "data": {
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                }
-            )
-            events.append(_sse_text_delta(0, _SAFETY_REFUSAL))
-            events.append(
-                {
-                    "event": "content_block_stop",
-                    "data": {"type": "content_block_stop", "index": 0},
-                }
-            )
-
-        has_tools = state.get("has_tool_calls", False)
-        if finish_reason == "MAX_TOKENS":
-            stop_reason = "max_tokens"
-        elif has_tools:
-            stop_reason = "tool_use"
-        else:
-            stop_reason = "end_turn"
-
-        events.append(
-            {
-                "event": "message_delta",
-                "data": {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason},
-                    "usage": {
-                        "input_tokens": usage.get("promptTokenCount", 0),
-                        "output_tokens": usage.get("candidatesTokenCount", 0),
-                    },
-                },
-            }
-        )
-        events.append({"event": "message_stop", "data": {"type": "message_stop"}})
+        _append_finish_events(events, finish_reason, usage, state, block_index)
 
     return events
 
