@@ -19,8 +19,8 @@ _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 
 _GEMINI_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
-_GEMINI_CLIENT_SECRET = "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"  # noqa: S105  # gitleaks:allow (intentionally public — Google desktop app credential, same as Gemini CLI source)
-_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105
+_GEMINI_CLIENT_SECRET = "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"  # noqa: S105  # nosec B105  # gitleaks:allow (intentionally public — Google desktop app credential, same as Gemini CLI source)
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105  # nosec B105
 _DEFAULT_GEMINI_AUTH_PATH = Path.home() / ".gemini" / "oauth_creds.json"
 
 MODEL_MAP: dict[str, str] = {
@@ -670,7 +670,7 @@ async def refresh_gemini_token(refresh_token: str, auth_path: Path | None = None
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310  # nosec B310
                 token_data: dict = json.loads(resp.read())
         except (
             urllib.error.HTTPError,
@@ -735,7 +735,7 @@ def _get_code_assist_project(auth_headers: dict[str, str]) -> str:
     for key, value in auth_headers.items():
         req.add_header(key, value)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310  # nosec B310
             data = json.loads(resp.read())
             project = data.get("cloudaicompanionProject", "")
             if not project:

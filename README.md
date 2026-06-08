@@ -373,6 +373,18 @@ Disabling the filter runs the full selected test set per mutant — accurate, sl
 
 Target: ≥85% kill rate on changed source files (zero survivors for auth code).
 
+### Security audits
+
+Dev-only security audit tools are available through `uv`:
+
+```bash
+uv run bandit -r src
+uv run pip-audit
+```
+
+Bandit suppressions are applied only at intentional stdlib/OAuth call sites; new
+findings should be reviewed rather than globally skipped.
+
 ## Verifying Against an Anthropic-Compatible Reference (optional)
 
 The contract tests pin the bridge against the Anthropic Messages and OpenAI

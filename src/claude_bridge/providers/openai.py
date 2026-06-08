@@ -18,7 +18,7 @@ from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.stream import parse_sse_events
 
 _CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-_TOKEN_URL = "https://auth.openai.com/oauth/token"  # noqa: S105
+_TOKEN_URL = "https://auth.openai.com/oauth/token"  # noqa: S105  # nosec B105
 _DEFAULT_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 
 
@@ -87,7 +87,7 @@ async def refresh_access_token(refresh_token: str, auth_path: Path | None = None
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310  # nosec B310
                 token_data: dict = json.loads(resp.read())
         except (
             urllib.error.HTTPError,

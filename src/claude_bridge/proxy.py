@@ -753,7 +753,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
-        with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:  # noqa: S310  # nosec B310
             return resp.status, resp.read()
 
     status_code, raw_response = await asyncio.to_thread(_retry_request, _do_provider_request)
@@ -911,7 +911,7 @@ def _forward_request(
     last_exc: Exception | None = None
     for attempt in range(2):
         try:
-            with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:  # noqa: S310  # nosec B310
                 return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
         except urllib.error.HTTPError as exc:
             rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
@@ -961,7 +961,7 @@ async def _stream_passthrough(
         for key in _FORWARD_HEADERS:
             if key in client_headers:
                 req.add_header(key, client_headers[key])
-        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310
+        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310  # nosec B310
 
     try:
         resp = await asyncio.to_thread(_open_stream)
@@ -1027,7 +1027,7 @@ async def _stream_via_provider(
         req.add_header("Content-Type", "application/json")
         for key, value in auth_headers.items():
             req.add_header(key, value)
-        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310
+        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310  # nosec B310
 
     logger.debug(
         "Sending to provider: model=%s items=%d",
