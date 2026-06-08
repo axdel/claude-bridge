@@ -14,7 +14,7 @@ from pathlib import Path
 
 import claude_bridge.config as config
 from claude_bridge.auth import is_token_expired
-from claude_bridge.provider import PROVIDERS
+from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.stream import parse_sse_events
 
 _CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -880,6 +880,10 @@ class OpenAIProvider:
     """
 
     name = "openai"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+    )
 
     def __init__(
         self,

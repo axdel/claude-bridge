@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import claude_bridge.config as config
-from claude_bridge.provider import PROVIDERS
+from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
@@ -790,6 +790,10 @@ class GeminiProvider:
     """
 
     name = "gemini"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="url",
+        sync_response_mode="sse",
+    )
     stream_via_url = True
 
     def __init__(

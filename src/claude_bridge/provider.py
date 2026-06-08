@@ -7,16 +7,34 @@ it only uses this interface.
 To add a new provider:
 
 1. Create ``providers/<name>.py`` with a class implementing ``Provider``
-2. ``translate_request``: Anthropic Messages -> your API format
-3. ``translate_response``: your API format -> Anthropic Messages
-4. ``translate_stream``: raw response bytes -> Anthropic SSE events
-5. Register: ``PROVIDERS["<name>"] = YourProviderClass``
+2. Declare ``capabilities`` for proxy-visible transport behavior
+3. ``translate_request``: Anthropic Messages -> your API format
+4. ``translate_response``: your API format -> Anthropic Messages
+5. ``translate_stream``: raw response bytes -> Anthropic SSE events
+6. Register: ``PROVIDERS["<name>"] = YourProviderClass``
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Literal, Protocol, runtime_checkable
+
+StreamRequestMode = Literal["body_parameter", "url"]
+SyncResponseMode = Literal["json", "sse"]
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """Provider-declared transport behavior for proxy orchestration.
+
+    ``stream_request_mode`` declares whether streaming is selected by request body
+    or endpoint URL. ``sync_response_mode`` declares the response format returned
+    for non-streaming client requests.
+    """
+
+    stream_request_mode: StreamRequestMode
+    sync_response_mode: SyncResponseMode
 
 
 @runtime_checkable
@@ -25,6 +43,10 @@ class Provider(Protocol):
 
     name: str
     endpoint: str
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+    )
 
     async def authenticate(self) -> dict[str, str]:
         """Return headers required to authenticate with this provider."""
