@@ -727,10 +727,10 @@ def _provider_error_log_summary(raw_body: bytes) -> str:
 async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, bytes]:
     """Authenticate, translate, forward to provider, translate back.
 
-    The Codex endpoint always streams (even for non-streaming clients), so we read
-    the whole SSE stream, translate it through the streaming path, and fold the
-    Anthropic events into one Messages response — the ``response.completed`` event
-    carries an empty ``output``, so the deltas are the only source of content.
+    Providers declare whether non-streaming client requests receive provider JSON
+    or provider SSE. JSON responses use ``translate_response`` directly; SSE
+    responses use ``translate_stream`` and fold the translated Anthropic events into
+    one Messages response so Codex/OpenAI delta-only content is preserved.
     """
     request_dict = json.loads(body)
     auth_headers = await provider.authenticate()
@@ -766,11 +766,20 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
             status_code, _provider_error_message(raw_response)
         )
 
-    # The Codex backend always streams (even for non-streaming clients) and its
-    # response.completed.output is empty — the text/reasoning/tool-calls live only
-    # in the delta events. So run the SAME stream translation as the streaming path
-    # (which also captures reasoning continuity) and fold the Anthropic SSE events
-    # into a single Messages response, rather than reading the empty completed output.
+    if provider.capabilities.sync_response_mode == "json":
+        try:
+            provider_response = json.loads(raw_response)
+            anthropic_response = provider.translate_response(provider_response)
+        except Exception:
+            logger.exception("Provider JSON response translation failed")
+            return 502, _anthropic_error_body(502, "could not parse provider response")
+        _trace_provider_response(anthropic_response)
+        return 200, json.dumps(anthropic_response).encode()
+
+    # SSE-sync providers such as Codex/OpenAI return streamed deltas even for
+    # non-streaming clients. Their completed output can be empty, so run the same
+    # stream translation as the streaming path (which also captures reasoning
+    # continuity) and fold the Anthropic SSE events into one Messages response.
     async def _single_chunk():
         yield raw_response
 

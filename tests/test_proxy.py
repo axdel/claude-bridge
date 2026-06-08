@@ -1616,6 +1616,206 @@ async def test_forward_via_provider_unparseable_stream_returns_502(_codex_sse_mo
     assert status == 502
 
 
+class _JsonSyncProvider:
+    """Fake provider whose non-streaming response contract is JSON."""
+
+    name = "json-sync"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="json",
+    )
+
+    def __init__(self, endpoint: str, *, fail_translate: bool = False) -> None:
+        self.endpoint = endpoint
+        self.fail_translate = fail_translate
+        self.translated_responses: list[dict] = []
+        self.stream_calls = 0
+
+    async def authenticate(self) -> dict[str, str]:
+        return {"Authorization": "Bearer json-token"}
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        return {"provider_prompt": anthropic_req["messages"][0]["content"]}, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        self.translated_responses.append(provider_resp)
+        if self.fail_translate:
+            raise ValueError("translator exploded")
+        return {
+            "id": f"msg_json_{provider_resp['id']}",
+            "type": "message",
+            "role": "assistant",
+            "model": provider_resp["model"],
+            "stop_reason": provider_resp["finish_reason"],
+            "content": [{"type": "text", "text": provider_resp["text"]}],
+            "usage": {
+                "input_tokens": provider_resp["usage"]["prompt_tokens"],
+                "output_tokens": provider_resp["usage"]["completion_tokens"],
+            },
+        }
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        self.stream_calls += 1
+        if False:
+            yield {}
+
+
+class _ProviderJsonHandler(BaseHTTPRequestHandler):
+    """Returns the configured provider response body with HTTP 200."""
+
+    payload = json.dumps(
+        {
+            "id": "provider-123",
+            "model": "json-model",
+            "text": "hello from json mode",
+            "finish_reason": "end_turn",
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+        }
+    ).encode()
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.payload)))
+        self.end_headers()
+        self.wfile.write(self.payload)
+
+    def log_message(self, format, *args):
+        pass
+
+
+@pytest.fixture()
+def _json_provider_mock():
+    """Local provider endpoint for sync JSON forwarding tests."""
+    old_payload = _ProviderJsonHandler.payload
+    _ProviderJsonHandler.payload = json.dumps(
+        {
+            "id": "provider-123",
+            "model": "json-model",
+            "text": "hello from json mode",
+            "finish_reason": "end_turn",
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+        }
+    ).encode()
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _ProviderJsonHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}/json-response"
+    _ProviderJsonHandler.payload = old_payload
+    server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_json_sync_calls_translate_response(_json_provider_mock):
+    """JSON-sync providers parse the body and use translate_response, not SSE folding."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    provider = _JsonSyncProvider(_json_provider_mock)
+
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes("hello json"))
+
+    assert status == 200
+    response = json.loads(body)
+    assert response == {
+        "id": "msg_json_provider-123",
+        "type": "message",
+        "role": "assistant",
+        "model": "json-model",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "hello from json mode"}],
+        "usage": {"input_tokens": 11, "output_tokens": 7},
+    }
+    assert provider.translated_responses == [
+        {
+            "id": "provider-123",
+            "model": "json-model",
+            "text": "hello from json mode",
+            "finish_reason": "end_turn",
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+        }
+    ]
+    assert provider.stream_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_json_sync_malformed_json_returns_502(_json_provider_mock):
+    """Malformed JSON provider bodies become Anthropic-shaped 502 envelopes."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    _ProviderJsonHandler.payload = b"not json at all"
+    provider = _JsonSyncProvider(_json_provider_mock)
+
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+
+    assert status == 502
+    response = json.loads(body)
+    assert response == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "could not parse provider response"},
+    }
+    assert provider.translated_responses == []
+    assert provider.stream_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_json_sync_translate_failure_returns_502(
+    _json_provider_mock,
+):
+    """Provider translate_response failures become Anthropic-shaped 502 envelopes."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    provider = _JsonSyncProvider(_json_provider_mock, fail_translate=True)
+
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+
+    assert status == 502
+    response = json.loads(body)
+    assert response == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "could not parse provider response"},
+    }
+    assert provider.translated_responses == [
+        {
+            "id": "provider-123",
+            "model": "json-model",
+            "text": "hello from json mode",
+            "finish_reason": "end_turn",
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+        }
+    ]
+    assert provider.stream_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_sse_sync_does_not_call_translate_response(_codex_sse_mock):
+    """SSE-sync providers keep the translate_stream aggregation path."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    class _SseOnlyProvider(_FakeOpenAIProvider):
+        def translate_response(self, provider_resp: dict) -> dict:
+            raise AssertionError("SSE sync path must not call translate_response")
+
+    url, payload = _codex_sse_mock
+    payload["bytes"] = _codex_tool_sse()
+    provider = _SseOnlyProvider(endpoint=f"{url}/v1/responses")
+
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+
+    assert status == 200
+    response = json.loads(body)
+    assert response["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_weather1",
+            "name": "get_weather",
+            "input": {"city": "NYC"},
+        }
+    ]
+    assert response["stop_reason"] == "tool_use"
+
+
 # ---------------------------------------------------------------------------
 # Provider error translation: upstream OpenAI errors → Anthropic error envelope
 # (so a Codex 400 context_length_exceeded reaches Claude Code cleanly, not as a
