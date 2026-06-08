@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import socket
 import urllib.error
@@ -838,7 +839,12 @@ class _Mock500StreamHandler(BaseHTTPRequestHandler):
     """Returns 500 for streaming requests."""
 
     def do_POST(self):
-        payload = json.dumps({"error": "server error"}).encode()
+        payload = json.dumps(
+            {
+                "error": {"message": "provider stream failed", "type": "server_error"},
+                "debug_body": "PLACEHOLDER_SECRET_STREAM_RAW_BODY",
+            }
+        ).encode()
         self.send_response(500)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -872,8 +878,13 @@ def _register_provider_at(url: str):
 
 
 @pytest.mark.asyncio
-async def test_stream_via_provider_http_error_returns_error():
-    """Provider returning HTTP 500 during streaming sends error to client."""
+async def test_stream_via_provider_http_error_log_omits_raw_body_secret():
+    """Streaming provider errors log status/message, never the raw provider body."""
+    from claude_bridge.log import configure_logging
+
+    stream = io.StringIO()
+    configure_logging(level="ERROR", stream=stream)
+
     port = _find_free_port()
     server = HTTPServer(("127.0.0.1", port), _Mock500StreamHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
@@ -903,6 +914,13 @@ async def test_stream_via_provider_http_error_returns_error():
             # The provider error is translated to an Anthropic error envelope.
             assert data["type"] == "error"
             assert data["error"]["type"] == "api_error"
+            assert data["error"]["message"] == "provider stream failed"
+
+            logs = stream.getvalue()
+            assert "Provider HTTP 500" in logs
+            assert "provider stream failed" in logs
+            assert "PLACEHOLDER_SECRET_STREAM_RAW_BODY" not in logs
+            assert "debug_body" not in logs
         finally:
             proxy_server.close()
             await proxy_server.wait_closed()
@@ -1490,6 +1508,67 @@ def test_provider_error_message_non_json_falls_back_to_body():
     from claude_bridge.proxy import _provider_error_message
 
     assert _provider_error_message(b"502 Bad Gateway") == "502 Bad Gateway"
+
+
+def test_provider_error_log_summary_non_json_omits_raw_body_secret():
+    """Malformed provider bodies log only metadata, never raw body text."""
+    from claude_bridge.proxy import _provider_error_log_summary
+
+    summary = _provider_error_log_summary(b"PLACEHOLDER_SECRET_MALFORMED_RAW_BODY")
+
+    assert summary == "unparseable provider error body (37B)"
+    assert "PLACEHOLDER_SECRET_MALFORMED_RAW_BODY" not in summary
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_error_log_omits_raw_body_secret():
+    """Sync provider errors log status/message, never the raw provider body."""
+    from claude_bridge.log import configure_logging
+    from claude_bridge.proxy import _forward_via_provider
+
+    safe_message = "Input tokens exceed the configured limit of 400000 tokens."
+    secret_marker = "PLACEHOLDER_SECRET_SYNC_RAW_BODY"
+
+    class _SecretErrorHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            payload = json.dumps(
+                {
+                    "error": {"message": safe_message, "type": "invalid_request_error"},
+                    "debug_body": secret_marker,
+                }
+            ).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    stream = io.StringIO()
+    configure_logging(level="ERROR", stream=stream)
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _SecretErrorHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        provider = _provider_at(f"http://127.0.0.1:{port}/v1/responses")
+        status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    finally:
+        server.shutdown()
+
+    assert status == 400
+    response = json.loads(body)
+    assert response["error"]["message"] == safe_message
+
+    logs = stream.getvalue()
+    assert "Provider HTTP 400" in logs
+    assert safe_message in logs
+    assert secret_marker not in logs
+    assert "debug_body" not in logs
 
 
 class _MockOverflowHandler(BaseHTTPRequestHandler):

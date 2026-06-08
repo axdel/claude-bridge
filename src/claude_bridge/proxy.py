@@ -719,6 +719,24 @@ def _provider_error_message(raw_body: bytes) -> str:
     return raw_body.decode("utf-8", errors="replace")[:500]
 
 
+def _provider_error_log_summary(raw_body: bytes) -> str:
+    """Return an operator-safe provider error summary without raw body fallback."""
+    try:
+        parsed = json.loads(raw_body)
+    except (json.JSONDecodeError, ValueError):
+        return f"unparseable provider error body ({len(raw_body)}B)"
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("type")
+        if message:
+            return str(message)[:500]
+    if isinstance(error, str):
+        return error[:500]
+    if isinstance(parsed, dict) and parsed.get("message"):
+        return str(parsed["message"])[:500]
+    return f"provider error body without message ({len(raw_body)}B)"
+
+
 async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, bytes]:
     """Authenticate, translate, forward to provider, translate back.
 
@@ -754,7 +772,9 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
     status_code, raw_response = await asyncio.to_thread(_retry_request, _do_provider_request)
     logger.info("Provider response: %d (%dB)", status_code, len(raw_response))
     if status_code != 200:
-        logger.error("Provider error: %s", raw_response[:500])
+        logger.error(
+            "Provider HTTP %d: %s", status_code, _provider_error_log_summary(raw_response)
+        )
         return status_code, _anthropic_error_body(
             status_code, _provider_error_message(raw_response)
         )
@@ -1023,7 +1043,7 @@ async def _stream_via_provider(
         resp = await asyncio.to_thread(_open_stream)
     except urllib.error.HTTPError as exc:
         err_body = exc.read()
-        logger.error("Provider HTTP %d: %s", exc.code, err_body[:500])
+        logger.error("Provider HTTP %d: %s", exc.code, _provider_error_log_summary(err_body))
         _write_response(
             writer, exc.code, _anthropic_error_body(exc.code, _provider_error_message(err_body))
         )
