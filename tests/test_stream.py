@@ -637,3 +637,36 @@ class TestSSEFormatRoundTrip:
         assert len(parsed) == 1
         assert parsed[0]["event"] == "content_block_delta"
         assert parsed[0]["data"]["delta"]["text"] == "hello"
+
+
+class TestStreamBufferBounding:
+    """A provider that streams without "\n\n" event terminators must not grow the
+    SSE buffer without bound (OOM) or hang — translate_stream caps the undrained
+    buffer and aborts fast. See SCL-2."""
+
+    @pytest.mark.asyncio
+    async def test_aborts_when_unterminated_buffer_exceeds_cap(self, monkeypatch):
+        from claude_bridge.providers import openai as openai_mod
+
+        monkeypatch.setattr(openai_mod, "_MAX_SSE_BUFFER", 64)
+        provider = openai_mod.OpenAIProvider()
+        # Five 32-byte chunks with no "\n\n" → 160 bytes accumulated, never a complete
+        # event. Oracle: the cap contract aborts a malformed stream rather than
+        # buffering it without limit.
+        chunks = [b"x" * 32] * 5
+
+        with pytest.raises(RuntimeError, match="malformed"):
+            async for _ in provider.translate_stream(_chunks_from(chunks)):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_does_not_abort_at_exact_cap(self, monkeypatch):
+        from claude_bridge.providers import openai as openai_mod
+
+        monkeypatch.setattr(openai_mod, "_MAX_SSE_BUFFER", 64)
+        provider = openai_mod.OpenAIProvider()
+        # Exactly cap bytes, still unterminated: the bound is exclusive, so this must
+        # NOT abort — kills the > vs >= off-by-one on the cap check. Garbage bytes
+        # parse to zero events at the tail; the assertion is the absence of a raise.
+        events = [e async for e in provider.translate_stream(_chunks_from([b"x" * 64]))]
+        assert events == []

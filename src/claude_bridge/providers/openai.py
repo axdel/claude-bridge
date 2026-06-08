@@ -136,6 +136,13 @@ _REASONING_MODE = os.environ.get("REASONING_MODE", "passthrough").lower()
 # tool call). Bounds memory under long agentic sessions; oldest entries evict first.
 _REASONING_CACHE_MAX = 256
 
+# Upper bound on the undrained SSE buffer (one incomplete event). A well-formed
+# stream drains on every "\n\n", so the buffer holds at most a single partial event.
+# A provider that streams without event terminators would otherwise grow the buffer
+# without limit (OOM) and make repeated concatenation quadratic; exceeding this cap
+# means the stream is malformed, so we abort fast instead of accumulating.
+_MAX_SSE_BUFFER = 4 * 1024 * 1024
+
 # Upper bound on a user-controlled token (block/tool_choice ``type``) embedded in a
 # translation warning. Caps log/trace line length against a hostile oversized type.
 _SAFE_TOKEN_MAX = 64
@@ -991,6 +998,11 @@ class OpenAIProvider:
                             translated, index_map, block_index, has_tool_calls
                         )
                         yield translated
+            if len(buffer) > _MAX_SSE_BUFFER:
+                raise RuntimeError(
+                    f"Provider SSE stream exceeded {_MAX_SSE_BUFFER} bytes without an "
+                    "event terminator; aborting malformed stream"
+                )
         if buffer.strip():
             for parsed_event in parse_sse_events(buffer):
                 self._capture_stream_reasoning(parsed_event)
