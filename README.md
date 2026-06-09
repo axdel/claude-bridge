@@ -60,6 +60,7 @@ of leaking provider-incompatible content.
 - **Subscription OAuth** — no API key? Falls back to Codex OAuth (OpenAI) or Gemini CLI OAuth (Google) automatically
 - **OpenAI reasoning continuity** — encrypted reasoning blobs are cached in memory and echoed across tool turns
 - **Reasoning passthrough controls** — OpenAI can preserve or drop thinking blocks; Gemini strips them with a warning
+- **Non-text input** — image and document (PDF) blocks forward to OpenAI as `input_image`/`input_file`, including media nested in `tool_result`; unsupported media degrades to a redacted placeholder with a warning (never echoes the payload)
 - **Auto-failover** — circuit breaker routes Anthropic 429/500/502/503 to the first available fallback provider
 - **Retry with backoff** — transient HTTP errors retried once with 0.5s exponential backoff
 - **Mid-turn failover guard** — blocks provider switch during active tool-use turns
@@ -71,7 +72,7 @@ of leaking provider-incompatible content.
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
 - **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
 - **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
-- **343 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **398 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -302,8 +303,11 @@ Unimplemented placeholders should stay unregistered and unimported, like the cur
 |---|---|
 | `system` (str/blocks) | `instructions` |
 | `messages[].content[type=text]` | `input[].content[type=input_text]` |
+| `messages[].content[type=image]` | `input[].content[type=input_image]` (`data:` URL; MIME allowlist) |
+| `messages[].content[type=document]` | `input[].content[type=input_file]` (filename + `file_data`; `application/pdf` only) |
 | `messages[].content[type=tool_use]` | `input[type=function_call]` (top-level) |
 | `messages[].content[type=tool_result]` | `input[type=function_call_output]` (top-level) |
+| `tool_result` media (image/document) | `output[]` content-part array where supported, else redacted string |
 | `tools[].input_schema` | `tools[].parameters` |
 | Tool ID: `toolu_xxx` / `call_xxx` | Tool ID: `fc_xxx` |
 | SSE: `content_block_delta` | SSE: `response.output_text.delta` |
@@ -329,6 +333,10 @@ Unimplemented placeholders should stay unregistered and unimported, like the cur
 > Uses Gemini's **generateContent API** via the Code Assist endpoint for OAuth
 > (subscription) or the public API for API key auth. `$schema`, `propertyNames`,
 > and other unsupported JSON Schema keywords are automatically stripped from tool definitions.
+>
+> Non-text input (image/document) is **not** forwarded to Gemini — media degrades to a
+> text placeholder. OpenAI is the supported media path; Gemini media support is not
+> implemented (see [`DECISIONS.md`](DECISIONS.md) D-SCOPE-001).
 
 ## Decision Records
 
@@ -347,6 +355,10 @@ tracked registry instead of duplicating decision rows.
 - Rate limit headers (`x-ratelimit-*`, `retry-after`) forwarded on sync responses only — streaming responses cannot include HTTP headers after SSE begins
 - Retry applies to sync HTTP calls only — streaming connections are not retried (SSE state replay is too complex)
 - xAI remains an unregistered extensibility placeholder; `xai` is not a runtime provider until implemented
+- Image/document input forwards to **OpenAI only**; Gemini degrades media to a text placeholder (D-SCOPE-001)
+- Document forwarding is limited to `application/pdf`; other document MIME types degrade to a redacted placeholder
+- On the Codex OAuth (chatgpt.com) backend, tool-returned media (images/PDFs inside `tool_result`) is redacted to a text placeholder with a warning — tool-output content arrays are enabled only for the API-key backend (D-MODALITY-001)
+- Media input size is bounded only by the overall request-body cap (`MAX_REQUEST_BODY`), not a separate per-media limit (D-MEDIA-001)
 
 ## Running Tests
 
