@@ -450,6 +450,7 @@ def _summarize_anthropic_request(request: dict) -> dict:
     messages = request.get("messages")
     message_list = messages if isinstance(messages, list) else []
     block_types: dict[str, int] = {}
+    media_descriptors: list[dict] = []
     for message in message_list:
         if not isinstance(message, dict):
             continue
@@ -459,6 +460,7 @@ def _summarize_anthropic_request(request: dict) -> dict:
         else:
             for block_type, count in _block_type_counts(content).items():
                 block_types[block_type] = block_types.get(block_type, 0) + count
+        media_descriptors.extend(_media_descriptor(block) for block in _iter_media_blocks(content))
     tools = request.get("tools") or []
     tool_names = sorted(str(tool.get("name", "")) for tool in tools if isinstance(tool, dict))
     tool_choice = request.get("tool_choice")
@@ -472,7 +474,7 @@ def _summarize_anthropic_request(request: dict) -> dict:
         "tool_count": len(tools),
         "tool_names": tool_names,
         "tool_choice": tool_choice.get("type") if isinstance(tool_choice, dict) else tool_choice,
-        "media": _request_media_descriptors(request),
+        "media": media_descriptors,
     }
 
 
@@ -916,6 +918,23 @@ def _provider_error_log_summary(raw_body: bytes) -> str:
     return f"provider error body without message ({len(raw_body)}B)"
 
 
+def _build_provider_request(
+    endpoint: str, translated: dict, auth_headers: dict
+) -> urllib.request.Request:
+    """Build the POST request for a provider call: JSON body, content type, auth headers.
+
+    Shared by the buffered (``_forward_via_provider``) and streaming
+    (``_stream_via_provider``) paths, which diverge only in how they open the
+    returned request — read-and-close versus keep-open for incremental reads.
+    """
+    data = json.dumps(translated).encode()
+    req = urllib.request.Request(endpoint, data=data, method="POST")  # noqa: S310
+    req.add_header("Content-Type", "application/json")
+    for key, value in auth_headers.items():
+        req.add_header(key, value)
+    return req
+
+
 async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, bytes]:
     """Authenticate, translate, forward to provider, translate back.
 
@@ -945,13 +964,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
 
     # Open a streaming connection and collect the full response
     def _do_provider_request():
-        data = json.dumps(translated).encode()
-        req = urllib.request.Request(  # noqa: S310
-            provider.endpoint, data=data, method="POST"
-        )
-        req.add_header("Content-Type", "application/json")
-        for key, value in auth_headers.items():
-            req.add_header(key, value)
+        req = _build_provider_request(provider.endpoint, translated, auth_headers)
         with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:  # noqa: S310  # nosec B310
             return resp.status, resp.read()
 
@@ -1233,13 +1246,7 @@ async def _stream_via_provider(
         translated["stream"] = True
 
     def _open_stream():
-        data = json.dumps(translated).encode()
-        req = urllib.request.Request(  # noqa: S310
-            provider.endpoint, data=data, method="POST"
-        )
-        req.add_header("Content-Type", "application/json")
-        for key, value in auth_headers.items():
-            req.add_header(key, value)
+        req = _build_provider_request(provider.endpoint, translated, auth_headers)
         return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310  # nosec B310
 
     logger.debug(
