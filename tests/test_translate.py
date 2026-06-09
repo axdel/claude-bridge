@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from claude_bridge.provider import ProviderCapabilities
 from claude_bridge.providers.openai import (
     DEFAULT_MODEL,
     MODEL_MAP,
@@ -11,6 +12,16 @@ from claude_bridge.providers.openai import (
     openai_to_anthropic,
 )
 from claude_bridge.proxy import estimate_input_tokens
+
+# A provider/auth mode that declares the full image+document input surface.
+# Built locally (not imported) so these behavior tests stay independent of any
+# single provider's class-attribute capabilities, which evolve in later tasks.
+_FULL_MEDIA_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+    supports_tool_output_content_parts=True,
+)
 
 # ---------------------------------------------------------------------------
 # anthropic_to_openai — text-only requests
@@ -728,6 +739,129 @@ class TestTranslationRobustness:
         assert block["type"] == "tool_use"
         # Empty string → json.loads fails → fallback to _raw
         assert block["input"] == {"_raw": ""}
+
+
+# ---------------------------------------------------------------------------
+# Top-level (message-path) image + document translation — the core fix
+# ---------------------------------------------------------------------------
+
+
+class TestTopLevelMediaTranslation:
+    """A top-level image/document block on the message path becomes a real
+    Responses content part when the provider declares the modality, and degrades
+    observably (warning + bounded placeholder, no payload leak) when it does not.
+
+    These drive the public ``anthropic_to_openai`` with raw Anthropic dicts, so
+    they exercise the new ``_translate_image_block`` / ``_translate_document_block``
+    helpers through the real message-path wiring — independently of the exact-shape
+    assertions in test_contract.py.
+    """
+
+    @staticmethod
+    def _user_parts(result: dict) -> list[dict]:
+        user = [i for i in result["input"] if i.get("role") == "user"]
+        assert len(user) == 1
+        return user[0]["content"]
+
+    def test_toplevel_image_becomes_input_image_data_url_when_capable(self):
+        """A pasted base64 image is forwarded as an input_image data URL.
+
+        Oracle: the data-URL grammar is RFC 2397 — ``data:<media-type>;base64,<data>``
+        — derived from the spec, not from running the translator.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "iVBORw0KGgo=",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_image"
+        assert part["image_url"] == "data:image/png;base64,iVBORw0KGgo="
+        assert warnings == []
+
+    def test_toplevel_document_becomes_input_file_with_title_filename(self):
+        """A base64 PDF document becomes an input_file whose filename is the block title.
+
+        Oracle: Responses input_file shape ``{type, filename, file_data}`` with a
+        ``data:`` URL — from the OpenAI Responses spec, not the implementation.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "title": "spec.pdf",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0xLjQK",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_file"
+        assert part["filename"] == "spec.pdf"
+        assert part["file_data"] == "data:application/pdf;base64,JVBERi0xLjQK"
+        assert warnings == []
+
+    def test_toplevel_image_without_modality_degrades_without_base64_leak(self):
+        """When the provider does not declare the image modality, a top-level image
+        degrades to a bounded text placeholder with a warning, and the base64 payload
+        never reaches the provider request.
+
+        Oracle: the degradation contract (warn + placeholder, no payload echo) — a
+        KNOWN modality the backend lacks, distinct from an unknown block type.
+        """
+        secret_b64 = "SUPERSECRETBASE64PAYLOAD=="
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": secret_b64,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        # Default capabilities are text-only — image is a known modality the
+        # provider does not support, so it must degrade rather than forward.
+        result, warnings = anthropic_to_openai(request)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_text"
+        assert secret_b64 not in json.dumps(result)
+        assert any("image" in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------

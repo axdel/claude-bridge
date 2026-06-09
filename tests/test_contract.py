@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 
+from claude_bridge.provider import ProviderCapabilities
 from claude_bridge.providers.openai import (
     OpenAIProvider,
     _safe_token,
@@ -26,6 +27,29 @@ from claude_bridge.providers.openai import (
     openai_to_anthropic,
 )
 from claude_bridge.proxy import estimate_input_tokens
+
+# A provider that declares the full media surface — used to assert the forward path.
+_FULL_MEDIA_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+    supports_tool_output_content_parts=True,
+)
+
+
+def _user_media_request(*blocks: dict) -> dict:
+    """Wrap one or more content blocks in a minimal single-user-message request."""
+    return {
+        "model": "claude-opus-4-6",
+        "messages": [{"role": "user", "content": list(blocks)}],
+    }
+
+
+def _user_content_parts(result: dict) -> list[dict]:
+    """Return the translated content parts of the single user message."""
+    user_message = next(item for item in result["input"] if item.get("role") == "user")
+    return user_message["content"]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures — realistic Claude Code traffic shapes
@@ -203,6 +227,115 @@ class TestSystemContextContract:
     def test_absent_system_gets_default_instructions(self):
         result, _ = anthropic_to_openai({"model": "claude-opus-4-6", "messages": []})
         assert result["instructions"] == "You are a helpful assistant."
+
+
+# ---------------------------------------------------------------------------
+# media content translation (top-level image / document)
+# ---------------------------------------------------------------------------
+
+
+class TestMediaContentContract:
+    """A pasted image/PDF must reach gpt-5.5 as a real Responses content part when the
+    provider declares the modality, and degrade to a redacted placeholder (never
+    echoing base64) otherwise. Expected shapes are the OpenAI Responses spec:
+    ``input_image.image_url`` is a STRING data URL; ``input_file`` carries
+    ``filename``+``file_data`` (base64) or ``file_url``."""
+
+    def test_base64_image_becomes_input_image_data_url(self):
+        block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+        }
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        part = _user_content_parts(result)[0]
+        assert part == {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        # Media parts are nested content, never top-level items.
+        assert "_toplevel" not in part
+
+    def test_url_image_becomes_input_image_with_url(self):
+        block = {"type": "image", "source": {"type": "url", "url": "https://example.com/c.png"}}
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        assert _user_content_parts(result)[0] == {
+            "type": "input_image",
+            "image_url": "https://example.com/c.png",
+        }
+
+    def test_base64_document_becomes_input_file_with_filename(self):
+        block = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBER"},
+            "title": "spec.pdf",
+        }
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        assert _user_content_parts(result)[0] == {
+            "type": "input_file",
+            "filename": "spec.pdf",
+            "file_data": "data:application/pdf;base64,JVBER",
+        }
+
+    def test_document_without_title_uses_default_filename(self):
+        # input_file requires a filename; a titleless document falls back to document.pdf.
+        block = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBER"},
+        }
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        assert _user_content_parts(result)[0]["filename"] == "document.pdf"
+
+    def test_url_document_becomes_input_file_with_url(self):
+        block = {"type": "document", "source": {"type": "url", "url": "https://example.com/d.pdf"}}
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        assert _user_content_parts(result)[0] == {
+            "type": "input_file",
+            "file_url": "https://example.com/d.pdf",
+        }
+
+    def test_image_modality_absent_degrades_without_leaking_base64(self):
+        # Default text-only capabilities: the image must NOT be forwarded. The
+        # placeholder is text, a warning is raised, and the base64 payload must not
+        # appear anywhere in the request body.
+        block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "SECRETBASE64"},
+        }
+        result, warnings = anthropic_to_openai(_user_media_request(block))
+        part = _user_content_parts(result)[0]
+        assert part["type"] == "input_text"
+        assert "SECRETBASE64" not in json.dumps(result)
+        assert any("image" in w for w in warnings)
+
+    def test_unsupported_image_mime_degrades_without_leaking_base64(self):
+        # image/svg+xml is outside the Responses input_image allowlist → degrade
+        # rather than forward bytes the backend would reject; never echo the payload.
+        block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/svg+xml", "data": "SECRETSVG"},
+        }
+        result, warnings = anthropic_to_openai(
+            _user_media_request(block), _FULL_MEDIA_CAPABILITIES
+        )
+        part = _user_content_parts(result)[0]
+        assert part["type"] == "input_text"
+        assert "SECRETSVG" not in json.dumps(result)
+        assert any("image" in w for w in warnings)
+
+    def test_media_blocks_preserve_surrounding_text_order(self):
+        # Ordering oracle: text, image, text must stay in declared order.
+        result, _ = anthropic_to_openai(
+            _user_media_request(
+                {"type": "text", "text": "before"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                },
+                {"type": "text", "text": "after"},
+            ),
+            _FULL_MEDIA_CAPABILITIES,
+        )
+        parts = _user_content_parts(result)
+        assert [p["type"] for p in parts] == ["input_text", "input_image", "input_text"]
+        assert parts[0]["text"] == "before"
+        assert parts[2]["text"] == "after"
 
 
 # ---------------------------------------------------------------------------

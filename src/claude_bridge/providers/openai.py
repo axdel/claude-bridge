@@ -14,6 +14,7 @@ from pathlib import Path
 
 import claude_bridge.config as config
 from claude_bridge.auth import is_token_expired
+from claude_bridge.content import MediaSource, parse_media_source
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.stream import parse_sse_events
 
@@ -148,6 +149,22 @@ _MAX_SSE_BUFFER = 4 * 1024 * 1024
 # translation warning. Caps log/trace line length against a hostile oversized type.
 _SAFE_TOKEN_MAX = 64
 
+# Image MIME types the Responses API ``input_image`` part accepts. A base64 image
+# whose media_type is outside this set degrades to a placeholder rather than risking
+# an upstream 400 — the set is the contract, not a guess.
+_IMAGE_MIME_ALLOWLIST = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+
+# Fallback filename for a document with no Anthropic ``title`` — the Responses
+# ``input_file`` part requires a filename.
+_DEFAULT_DOCUMENT_FILENAME = "document.pdf"
+
+# Conservative default for callers that don't pass a provider's capabilities (e.g.
+# direct translation in tests): text-only input, string tool output — the pre-media
+# behavior. The real path threads ``OpenAIProvider.capabilities`` from translate_request.
+_TEXT_ONLY_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter", sync_response_mode="sse"
+)
+
 
 def _safe_token(value: object) -> str:
     """Neutralize an attacker-controlled token for safe embedding in a log line or trace.
@@ -196,90 +213,173 @@ def _to_anthropic_id(openai_id: str) -> str:
     return "toolu_" + openai_id
 
 
-def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
+def _translate_content_block(
+    block: dict, capabilities: ProviderCapabilities
+) -> tuple[dict, list[str]]:
     """Translate a single Anthropic content block to OpenAI Responses API format.
 
-    Returns (translated_block, warnings). For tool_use / tool_result blocks,
-    the translated block has a special ``_toplevel`` key set to True, signaling
-    the caller to emit it as a top-level input item rather than nesting it
-    inside a message's content array.
+    Returns ``(translated_block, warnings)``. For tool_use / tool_result blocks the
+    translated block has a special ``_toplevel`` key set to True, signaling the caller
+    to emit it as a top-level input item rather than nesting it inside a message's
+    content array. Media blocks (image/document) become real Responses content parts
+    when ``capabilities.input_modalities`` allows, and degrade to a redacted
+    placeholder (never echoing base64) otherwise.
 
-    OpenAI Responses API field names (from official docs + CLASP proxy):
-    - function_call: {type, id, call_id, name, arguments} — BOTH id and call_id required
-    - function_call_output: {type, call_id, output} — output is always a string, never null
+    Thin dispatcher: each block type delegates to a dedicated helper so this function
+    stays well under the CCN ceiling as block types grow.
     """
-    warnings: list[str] = []
     block_type = block.get("type", "unknown")
-
     if block_type == "text":
-        translated = {"type": "input_text", "text": block["text"]}
-        return translated, warnings
-
+        return {"type": "input_text", "text": block["text"]}, []
     if block_type == "thinking":
-        if _REASONING_MODE == "drop":
-            warnings.append("Stripped thinking block (reasoning_mode=drop)")
-            return {"type": "input_text", "text": ""}, warnings
-        # Passthrough: preserve as tagged text
-        thinking_text = block.get("thinking", "")
-        return {
-            "type": "input_text",
-            "text": f"[thinking]\n{thinking_text}\n[/thinking]",
-        }, warnings
-
+        return _translate_thinking_block(block)
+    if block_type == "image":
+        return _translate_image_block(parse_media_source(block), capabilities)
+    if block_type == "document":
+        return _translate_document_block(parse_media_source(block), capabilities)
     if block_type == "tool_use":
-        # Anthropic uses toolu_xxx or call_xxx; OpenAI requires fc_xxx prefix
-        fc_id = _to_openai_id(block["id"])
-        return {
-            "_toplevel": True,
-            "type": "function_call",
-            "id": fc_id,
-            "call_id": fc_id,
-            "name": block["name"],
-            "arguments": json.dumps(block["input"]),
-        }, warnings
-
+        return _translate_tool_use_block(block), []
     if block_type == "tool_result":
-        content = block.get("content", "")
-        if isinstance(content, list):
-            parts = []
-            for b in content:
-                if b.get("type") == "text":
-                    parts.append(b.get("text", ""))
-                elif b.get("type") == "image":
-                    source = b.get("source", {})
-                    if source.get("type") == "base64":
-                        media = source.get("media_type", "application/octet-stream")
-                        data = source.get("data", "")
-                        parts.append(f"[image: data:{media};base64,{data}]")
-                    elif source.get("type") == "url":
-                        parts.append(f"[image: {source.get('url', '')}]")
-            content = "\n".join(parts)
-        output = str(content) if content else ""
-        if block.get("is_error"):
-            output = f"[Error] {output}"
-        # tool_use_id from Anthropic needs fc_ prefix for OpenAI
-        fc_id = _to_openai_id(block["tool_use_id"])
-        return {
-            "_toplevel": True,
-            "type": "function_call_output",
-            "call_id": fc_id,
-            "output": output,
-        }, warnings
+        return _translate_tool_result_block(block), []
+    return _translate_unsupported_block(block_type)
 
-    # Unsupported / special block (server_tool_use, web_search_tool_result, mcp_tool_use,
-    # code_execution_tool_result, ...) — no OpenAI Responses route (D-SRVTOOL-001).
-    # Degrade to a type-named placeholder that NEVER echoes the block's nested content:
-    # a raw str(block) would both pollute the provider request with a Python dict repr
-    # AND leak the block's tool inputs/outputs.
+
+def _translate_thinking_block(block: dict) -> tuple[dict, list[str]]:
+    """Translate an Anthropic thinking block per the configured reasoning mode."""
+    if _REASONING_MODE == "drop":
+        return {"type": "input_text", "text": ""}, [
+            "Stripped thinking block (reasoning_mode=drop)"
+        ]
+    thinking_text = block.get("thinking", "")
+    return {"type": "input_text", "text": f"[thinking]\n{thinking_text}\n[/thinking]"}, []
+
+
+def _media_placeholder(kind: str, reason: str) -> tuple[dict, list[str]]:
+    """Build a redacted placeholder + warning for media that can't be forwarded.
+
+    ``reason`` must name only a safe token (media_type, source kind, modality) — never
+    the base64 payload, which must never reach the placeholder text or the warning.
+    """
+    safe_reason = _safe_token(reason)
+    return (
+        {"type": "input_text", "text": f"[unsupported {kind}: {safe_reason}]"},
+        [f"{kind} input degraded to placeholder: {safe_reason}"],
+    )
+
+
+def _translate_image_block(
+    source: MediaSource, capabilities: ProviderCapabilities
+) -> tuple[dict, list[str]]:
+    """Forward an image as a Responses ``input_image`` part, or degrade if unforwardable.
+
+    Spec: ``input_image.image_url`` is a STRING — a ``data:`` URL for base64 or the
+    source URL directly. Base64 outside the MIME allowlist, or a file/unknown source
+    (no bytes), degrades to a redacted placeholder (never echoes the payload).
+    """
+    if "image" not in capabilities.input_modalities:
+        return _media_placeholder("image", "not supported by this provider/auth mode")
+    if source.source_kind == "url":
+        return {"type": "input_image", "image_url": source.url}, []
+    if source.source_kind == "base64":
+        if source.media_type not in _IMAGE_MIME_ALLOWLIST:
+            return _media_placeholder("image", source.media_type)
+        return {
+            "type": "input_image",
+            "image_url": f"data:{source.media_type};base64,{source.data}",
+        }, []
+    return _media_placeholder("image", source.source_kind)
+
+
+def _translate_document_block(
+    source: MediaSource, capabilities: ProviderCapabilities
+) -> tuple[dict, list[str]]:
+    """Forward a document as a Responses ``input_file`` part, or degrade if unforwardable.
+
+    Spec: ``input_file`` carries ``filename``+``file_data`` (a ``data:`` URL) for base64,
+    or ``file_url`` for a URL source. A file/unknown source (no bytes) degrades to a
+    redacted placeholder.
+    """
+    if "document" not in capabilities.input_modalities:
+        return _media_placeholder("document", "not supported by this provider/auth mode")
+    if source.source_kind == "url":
+        return {"type": "input_file", "file_url": source.url}, []
+    if source.source_kind == "base64":
+        return {
+            "type": "input_file",
+            "filename": source.filename or _DEFAULT_DOCUMENT_FILENAME,
+            "file_data": f"data:{source.media_type};base64,{source.data}",
+        }, []
+    return _media_placeholder("document", source.source_kind)
+
+
+def _translate_tool_use_block(block: dict) -> dict:
+    """Translate an Anthropic tool_use block to a top-level function_call item.
+
+    Anthropic uses ``toolu_xxx``/``call_xxx``; OpenAI Responses requires ``fc_xxx``,
+    and both ``id`` and ``call_id`` are required.
+    """
+    fc_id = _to_openai_id(block["id"])
+    return {
+        "_toplevel": True,
+        "type": "function_call",
+        "id": fc_id,
+        "call_id": fc_id,
+        "name": block["name"],
+        "arguments": json.dumps(block["input"]),
+    }
+
+
+def _translate_tool_result_block(block: dict) -> dict:
+    """Translate an Anthropic tool_result block to a top-level function_call_output item.
+
+    Nested content is flattened to a string; image parts are inlined as a data/URL
+    marker (string form). A capability-gated content-part array is added in T-005.
+    """
+    content = block.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif b.get("type") == "image":
+                source = b.get("source", {})
+                if source.get("type") == "base64":
+                    media = source.get("media_type", "application/octet-stream")
+                    data = source.get("data", "")
+                    parts.append(f"[image: data:{media};base64,{data}]")
+                elif source.get("type") == "url":
+                    parts.append(f"[image: {source.get('url', '')}]")
+        content = "\n".join(parts)
+    output = str(content) if content else ""
+    if block.get("is_error"):
+        output = f"[Error] {output}"
+    fc_id = _to_openai_id(block["tool_use_id"])
+    return {
+        "_toplevel": True,
+        "type": "function_call_output",
+        "call_id": fc_id,
+        "output": output,
+    }
+
+
+def _translate_unsupported_block(block_type: str) -> tuple[dict, list[str]]:
+    """Degrade an unsupported block to a redacted, type-named placeholder.
+
+    Unsupported / special blocks (server_tool_use, web_search_tool_result, ...) have no
+    OpenAI Responses route (D-SRVTOOL-001). The placeholder NEVER echoes the block's
+    nested content: a raw str(block) would pollute the request AND leak tool inputs.
+    """
     safe_type = _safe_token(block_type)
-    warnings.append(
+    warning = (
         f"Unsupported content block type '{safe_type}' replaced with a redacted "
         "placeholder (no provider equivalent)"
     )
-    return {"type": "input_text", "text": f"[unsupported content block: {safe_type}]"}, warnings
+    return {"type": "input_text", "text": f"[unsupported content block: {safe_type}]"}, [warning]
 
 
-def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
+def _translate_message(
+    message: dict, capabilities: ProviderCapabilities
+) -> tuple[list[dict], list[str]]:
     """Translate one Anthropic message to a list of OpenAI Responses API input items.
 
     Anthropic puts everything in messages with content blocks. The Responses API
@@ -301,7 +401,7 @@ def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
     toplevel_items: list[dict] = []
 
     for block in content:
-        translated, block_warnings = _translate_content_block(block)
+        translated, block_warnings = _translate_content_block(block, capabilities)
         warnings.extend(block_warnings)
 
         if translated.pop("_toplevel", False):
@@ -372,11 +472,16 @@ def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
     return fields, warnings
 
 
-def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
+def anthropic_to_openai(
+    request: dict, capabilities: ProviderCapabilities = _TEXT_ONLY_CAPABILITIES
+) -> tuple[dict, list[str]]:
     """Translate an Anthropic Messages API request to an OpenAI Responses API request.
 
-    Returns ``(translated_request, warnings)`` where warnings lists any
-    features that were stripped because they have no OpenAI equivalent.
+    Returns ``(translated_request, warnings)`` where warnings lists any features that
+    were stripped or degraded because they have no OpenAI equivalent. ``capabilities``
+    declares which input modalities to forward; it defaults to text-only so direct
+    callers keep the pre-media behavior, while the provider passes its real
+    capabilities via ``translate_request``.
 
     Pure function — no I/O.
     """
@@ -451,7 +556,7 @@ def anthropic_to_openai(request: dict) -> tuple[dict, list[str]]:
     # Messages → input
     input_items: list[dict] = []
     for message in request.get("messages", []):
-        items, msg_warnings = _translate_message(message)
+        items, msg_warnings = _translate_message(message, capabilities)
         input_items.extend(items)
         warnings.extend(msg_warnings)
 
@@ -960,7 +1065,7 @@ class OpenAIProvider:
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
         """Translate Anthropic Messages request to OpenAI Responses request, echoing any
         captured encrypted reasoning back before its function_calls."""
-        result, warnings = anthropic_to_openai(anthropic_req)
+        result, warnings = anthropic_to_openai(anthropic_req, self.capabilities)
         self._inject_reasoning(result)
         return result, warnings
 
