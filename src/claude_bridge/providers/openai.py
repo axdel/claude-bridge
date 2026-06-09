@@ -165,6 +165,24 @@ _TEXT_ONLY_CAPABILITIES = ProviderCapabilities(
     stream_request_mode="body_parameter", sync_response_mode="sse"
 )
 
+# Per-backend capabilities (D-MODALITY-001). api.openai.com documents image+document
+# input and array-form tool output. chatgpt.com (Codex) returned HTTP 200 for input_image
+# and input_file in the T-001 probe, but array-form function_call_output was NOT probed,
+# so tool-output arrays stay disabled there (media degrades observably) until a tool-loop
+# probe confirms support. Selected per auth mode on the instance in ``__init__``.
+_API_KEY_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+    supports_tool_output_content_parts=True,
+)
+_CODEX_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+    supports_tool_output_content_parts=False,
+)
+
 
 def _safe_token(value: object) -> str:
     """Neutralize an attacker-controlled token for safe embedding in a log line or trace.
@@ -1060,10 +1078,16 @@ class OpenAIProvider:
         self.auth_mode = auth_mode
         self._api_key = api_key
         self._auth_path = auth_path
+        # Endpoint and input-content capabilities both vary by backend. The instance
+        # attribute shadows the conservative class default so the proxy and
+        # translate_request (which hold an instance) forward the modalities this
+        # backend actually supports (D-MODALITY-001).
         if auth_mode == "api_key":
             self.endpoint = _API_KEY_ENDPOINT
+            self.capabilities = _API_KEY_CAPABILITIES
         else:
             self.endpoint = _CODEX_ENDPOINT
+            self.capabilities = _CODEX_CAPABILITIES
         # Encrypted reasoning blobs keyed by fc_ call id, captured from responses and
         # re-injected before their function_calls on the next request. In-memory only —
         # opaque, never persisted, never logged, never returned to Claude Code.
