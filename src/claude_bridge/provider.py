@@ -27,23 +27,29 @@ _SYNC_RESPONSE_MODES = frozenset({"json", "sse"})
 
 @dataclass(frozen=True)
 class ProviderCapabilities:
-    """Provider-declared transport behavior for proxy orchestration.
+    """Provider-declared transport and accounting behavior for proxy orchestration.
 
     ``stream_request_mode`` declares whether streaming is selected by request body
     or endpoint URL. ``sync_response_mode`` declares the response format returned
-    for non-streaming client requests.
+    for non-streaming client requests. ``token_count_multiplier`` lets providers
+    tune reported usage totals for local compatibility without changing provider
+    wire parsing.
     """
 
     stream_request_mode: StreamRequestMode
     sync_response_mode: SyncResponseMode
+    token_count_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
-        """Validate mode values at runtime for dynamically authored providers."""
+        """Validate mode and accounting values at runtime for dynamic providers."""
         if self.stream_request_mode not in _STREAM_REQUEST_MODES:
             msg = f"Unknown stream_request_mode: {self.stream_request_mode!r}"
             raise ValueError(msg)
         if self.sync_response_mode not in _SYNC_RESPONSE_MODES:
             msg = f"Unknown sync_response_mode: {self.sync_response_mode!r}"
+            raise ValueError(msg)
+        if self.token_count_multiplier <= 0:
+            msg = f"Invalid token_count_multiplier: {self.token_count_multiplier!r}"
             raise ValueError(msg)
 
 

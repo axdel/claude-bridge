@@ -462,7 +462,7 @@ class TestOpenaiToAnthropicTextOnly:
         assert result["model"] == "gpt-5.5"
         assert result["stop_reason"] == "end_turn"
         assert result["content"] == [{"type": "text", "text": "Hello back!"}]
-        assert result["usage"] == {"input_tokens": 10, "output_tokens": 5}
+        assert result["usage"] == {"input_tokens": 12, "output_tokens": 6}
 
     def test_incomplete_status_maps_to_max_tokens(self):
         response = {
@@ -480,6 +480,7 @@ class TestOpenaiToAnthropicTextOnly:
         }
         result = openai_to_anthropic(response)
         assert result["stop_reason"] == "max_tokens"
+        assert result["usage"] == {"input_tokens": 6, "output_tokens": 120}
 
     def test_unknown_status_defaults_to_end_turn(self):
         response = {
@@ -534,6 +535,7 @@ class TestOpenaiToAnthropicToolUse:
         assert block["id"] == "toolu_abc"
         assert block["name"] == "Edit"
         assert block["input"] == {"path": "/tmp/f.py"}
+        assert result["usage"] == {"input_tokens": 24, "output_tokens": 18}
 
     def test_mixed_text_and_tool_use(self):
         response = {
@@ -559,6 +561,7 @@ class TestOpenaiToAnthropicToolUse:
         assert len(result["content"]) == 2
         assert result["content"][0]["type"] == "text"
         assert result["content"][1]["type"] == "tool_use"
+        assert result["usage"] == {"input_tokens": 12, "output_tokens": 24}
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +592,7 @@ class TestTranslationRobustness:
         block = result["content"][0]
         assert block["type"] == "tool_use"
         assert block["input"] == {"_raw": "not valid json {{{"}
+        assert result["usage"] == {"input_tokens": 1, "output_tokens": 1}
 
     def test_tool_result_with_list_content(self):
         """tool_result with list-of-blocks content joins text."""
@@ -728,6 +732,7 @@ class TestTranslationRobustness:
         assert block["type"] == "tool_use"
         # Empty string → json.loads fails → fallback to _raw
         assert block["input"] == {"_raw": ""}
+        assert result["usage"] == {"input_tokens": 1, "output_tokens": 1}
 
 
 # ---------------------------------------------------------------------------

@@ -127,6 +127,7 @@ MODEL_MAP: dict[str, str] = {
     "claude-haiku-4-5-20251001": "gpt-5.5",
 }
 DEFAULT_MODEL = "gpt-5.5"
+GPT_TOKEN_COUNT_MULTIPLIER = 1.2
 
 _STRIPPED_KEYS = ("output_config",)
 
@@ -491,19 +492,29 @@ def _coerce_token_count(value: object) -> int:
     return 0
 
 
-def _anthropic_usage(oai_usage: object) -> dict:
+def _scale_token_count(value: object, multiplier: float) -> int:
+    """Return a non-negative token count adjusted by the provider multiplier."""
+    return int(_coerce_token_count(value) * multiplier + 0.5)
+
+
+def _anthropic_usage(
+    oai_usage: object,
+    *,
+    token_count_multiplier: float = GPT_TOKEN_COUNT_MULTIPLIER,
+) -> dict:
     """Project OpenAI Responses usage onto Anthropic's flat integer shape.
 
     OpenAI ``input_tokens`` already includes cached tokens and ``output_tokens`` already
     includes reasoning tokens (both are subsets, per the Responses contract), so each maps
-    straight to Anthropic's corresponding total. Cached tokens are deliberately NOT split
-    into ``cache_read_input_tokens`` — Anthropic's totals are non-overlapping, so doing so
-    would double-count. Missing or non-numeric fields default to 0. See D-USAGE-001.
+    to Anthropic's corresponding total before applying the OpenAI compatibility multiplier.
+    Cached tokens are deliberately NOT split into ``cache_read_input_tokens`` — Anthropic's
+    totals are non-overlapping, so doing so would double-count. Missing or non-numeric
+    fields default to 0. See D-USAGE-001 and D-USAGE-003.
     """
     usage = oai_usage if isinstance(oai_usage, dict) else {}
     return {
-        "input_tokens": _coerce_token_count(usage.get("input_tokens", 0)),
-        "output_tokens": _coerce_token_count(usage.get("output_tokens", 0)),
+        "input_tokens": _scale_token_count(usage.get("input_tokens", 0), token_count_multiplier),
+        "output_tokens": _scale_token_count(usage.get("output_tokens", 0), token_count_multiplier),
     }
 
 
@@ -531,7 +542,11 @@ def _stop_reason(status: str, has_tool_calls: bool, incomplete_reason: str) -> s
     return "end_turn"
 
 
-def openai_to_anthropic(response: dict) -> dict:
+def openai_to_anthropic(
+    response: dict,
+    *,
+    token_count_multiplier: float = GPT_TOKEN_COUNT_MULTIPLIER,
+) -> dict:
     """Translate an OpenAI Responses API response to an Anthropic Messages API response.
 
     Pure function — no I/O.
@@ -581,7 +596,7 @@ def openai_to_anthropic(response: dict) -> dict:
     if incomplete_reason == _CONTENT_FILTER_REASON and not has_text:
         content.append({"type": "text", "text": _CONTENT_FILTER_REFUSAL})
 
-    usage = _anthropic_usage(response.get("usage"))
+    usage = _anthropic_usage(response.get("usage"), token_count_multiplier=token_count_multiplier)
 
     return {
         "id": f"msg_bridge_{response.get('id', 'unknown')}",
@@ -631,7 +646,7 @@ def _associate_reasoning_with_calls(output: list[dict]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _sse_response_created(data: dict) -> list[dict]:
+def _sse_response_created(data: dict, *, token_count_multiplier: float) -> list[dict]:
     """Translate response.created → message_start + ping."""
     resp = data.get("response", {})
     usage = resp.get("usage") or {}
@@ -648,7 +663,9 @@ def _sse_response_created(data: dict) -> list[dict]:
                     "model": resp.get("model", ""),
                     "stop_reason": None,
                     "usage": {
-                        "input_tokens": _coerce_token_count(usage.get("input_tokens", 0)),
+                        "input_tokens": _scale_token_count(
+                            usage.get("input_tokens", 0), token_count_multiplier
+                        ),
                         "output_tokens": 0,
                     },
                 },
@@ -711,7 +728,7 @@ def _synthesize_refusal_block(text: str) -> list[dict]:
     ]
 
 
-def _sse_response_completed(data: dict) -> list[dict]:
+def _sse_response_completed(data: dict, *, token_count_multiplier: float) -> list[dict]:
     """Translate response.completed → [refusal block?] + message_delta + message_stop.
 
     A content-filtered turn is prefixed with a synthesized refusal text block and ends
@@ -733,7 +750,9 @@ def _sse_response_completed(data: dict) -> list[dict]:
             "data": {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason},
-                "usage": _anthropic_usage(resp.get("usage")),
+                "usage": _anthropic_usage(
+                    resp.get("usage"), token_count_multiplier=token_count_multiplier
+                ),
             },
         }
     )
@@ -752,7 +771,11 @@ _SKIPPED_SSE_EVENTS = frozenset(
 )
 
 
-def translate_openai_sse_event(event: dict) -> list[dict]:
+def translate_openai_sse_event(
+    event: dict,
+    *,
+    token_count_multiplier: float = GPT_TOKEN_COUNT_MULTIPLIER,
+) -> list[dict]:
     """Translate one OpenAI Responses API SSE event to Anthropic SSE events.
 
     Dispatches to sub-handlers by event type. Returns a list of ``{event, data}``
@@ -762,7 +785,7 @@ def translate_openai_sse_event(event: dict) -> list[dict]:
     data = event.get("data", {})
 
     if event_type == "response.created":
-        return _sse_response_created(data)
+        return _sse_response_created(data, token_count_multiplier=token_count_multiplier)
 
     if event_type == "response.content_part.added":
         return [
@@ -821,7 +844,7 @@ def translate_openai_sse_event(event: dict) -> list[dict]:
         ]
 
     if event_type == "response.completed":
-        return _sse_response_completed(data)
+        return _sse_response_completed(data, token_count_multiplier=token_count_multiplier)
 
     if event_type in _SKIPPED_SSE_EVENTS:
         return []
@@ -883,6 +906,7 @@ class OpenAIProvider:
     capabilities = ProviderCapabilities(
         stream_request_mode="body_parameter",
         sync_response_mode="sse",
+        token_count_multiplier=GPT_TOKEN_COUNT_MULTIPLIER,
     )
 
     def __init__(
@@ -968,7 +992,10 @@ class OpenAIProvider:
         """Translate OpenAI Responses response to Anthropic Messages response, capturing
         each function_call's preceding encrypted reasoning for the next request."""
         self._stash_reasoning(_associate_reasoning_with_calls(provider_resp.get("output", [])))
-        return openai_to_anthropic(provider_resp)
+        return openai_to_anthropic(
+            provider_resp,
+            token_count_multiplier=self.capabilities.token_count_multiplier,
+        )
 
     def _capture_stream_reasoning(self, parsed_event: dict) -> None:
         """Capture encrypted reasoning from a streamed response.completed event."""
@@ -998,7 +1025,10 @@ class OpenAIProvider:
                 buffer = buffer[event_end:]
                 for parsed_event in parse_sse_events(event_bytes):
                     self._capture_stream_reasoning(parsed_event)
-                    for translated in translate_openai_sse_event(parsed_event):
+                    for translated in translate_openai_sse_event(
+                        parsed_event,
+                        token_count_multiplier=self.capabilities.token_count_multiplier,
+                    ):
                         translated, block_index, has_tool_calls = _remap_block_index(
                             translated, index_map, block_index, has_tool_calls
                         )
@@ -1011,7 +1041,10 @@ class OpenAIProvider:
         if buffer.strip():
             for parsed_event in parse_sse_events(buffer):
                 self._capture_stream_reasoning(parsed_event)
-                for translated in translate_openai_sse_event(parsed_event):
+                for translated in translate_openai_sse_event(
+                    parsed_event,
+                    token_count_multiplier=self.capabilities.token_count_multiplier,
+                ):
                     translated, block_index, has_tool_calls = _remap_block_index(
                         translated, index_map, block_index, has_tool_calls
                     )

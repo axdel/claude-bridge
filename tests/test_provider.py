@@ -18,6 +18,7 @@ def test_provider_capabilities_are_frozen_protocol_owned_values():
 
     assert capabilities.stream_request_mode == "body_parameter"
     assert capabilities.sync_response_mode == "sse"
+    assert capabilities.token_count_multiplier == 1.0
     with pytest.raises(FrozenInstanceError):
         capabilities.stream_request_mode = "url"  # type: ignore[misc]
 
@@ -32,6 +33,13 @@ def test_provider_capabilities_reject_unknown_modes():
     with pytest.raises(ValueError, match="sync_response_mode"):
         ProviderCapabilities(stream_request_mode="url", sync_response_mode="xml")  # type: ignore[arg-type]
 
+    with pytest.raises(ValueError, match="token_count_multiplier"):
+        ProviderCapabilities(
+            stream_request_mode="url",
+            sync_response_mode="sse",
+            token_count_multiplier=0,
+        )
+
 
 def test_openai_declares_body_parameter_streaming_and_sse_sync_response():
     """OpenAI exposes the proxy-visible transport modes it requires."""
@@ -41,6 +49,7 @@ def test_openai_declares_body_parameter_streaming_and_sse_sync_response():
     assert OpenAIProvider.capabilities == ProviderCapabilities(
         stream_request_mode="body_parameter",
         sync_response_mode="sse",
+        token_count_multiplier=1.2,
     )
 
 
@@ -52,4 +61,5 @@ def test_gemini_declares_url_streaming_and_sse_sync_response():
     assert GeminiProvider.capabilities == ProviderCapabilities(
         stream_request_mode="url",
         sync_response_mode="sse",
+        token_count_multiplier=1.0,
     )

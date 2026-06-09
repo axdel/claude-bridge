@@ -1720,9 +1720,9 @@ async def test_forward_via_provider_codex_empty_output_populates_text(_codex_sse
     assert response["content"] == [{"type": "text", "text": "hello from codex deltas"}]
     assert response["stop_reason"] == "end_turn"
     assert response["model"] == "gpt-5.5"
-    # The auto-compact signal must survive: input_tokens is the real context size.
-    assert response["usage"]["input_tokens"] == 10
-    assert response["usage"]["output_tokens"] == 5
+    # The auto-compact signal uses the OpenAI provider compatibility multiplier.
+    assert response["usage"]["input_tokens"] == 12
+    assert response["usage"]["output_tokens"] == 6
 
 
 @pytest.mark.asyncio

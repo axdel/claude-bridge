@@ -67,11 +67,12 @@ of leaking provider-incompatible content.
 - **Health check** — `/health` endpoint for liveness probes and process managers
 - **Structured logging** — request IDs, provider/model identity, log levels (`LOG_LEVEL=DEBUG`)
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
+- **Token count multiplier** — OpenAI/GPT usage totals report with a 1.2 compatibility multiplier for Claude Code auto-compact tuning
 - **Token estimation** — structure-aware byte counting for context window management
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
 - **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
 - **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
-- **343 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **351 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 

@@ -522,7 +522,7 @@ class TestUsageShape:
             "usage": {"input_tokens": 123, "output_tokens": 45},
         }
         usage = openai_to_anthropic(response)["usage"]
-        assert usage == {"input_tokens": 123, "output_tokens": 45}
+        assert usage == {"input_tokens": 148, "output_tokens": 54}
         assert isinstance(usage["input_tokens"], int)
         assert isinstance(usage["output_tokens"], int)
 
@@ -539,7 +539,7 @@ class TestUsageShape:
             "usage": {"input_tokens": 100.0, "output_tokens": 7.0},
         }
         usage = openai_to_anthropic(response)["usage"]
-        assert usage == {"input_tokens": 100, "output_tokens": 7}
+        assert usage == {"input_tokens": 120, "output_tokens": 8}
         assert isinstance(usage["input_tokens"], int)
         assert isinstance(usage["output_tokens"], int)
 
@@ -567,7 +567,7 @@ class TestUsageShape:
             },
         }
         usage = openai_to_anthropic(response)["usage"]
-        assert usage == {"input_tokens": 1000, "output_tokens": 200}
+        assert usage == {"input_tokens": 1200, "output_tokens": 240}
 
     def test_missing_token_detail_objects_default_safely(self):
         # Providers may omit the optional *_details objects entirely; absence must
@@ -578,7 +578,7 @@ class TestUsageShape:
             "usage": {"input_tokens": 50, "output_tokens": 10},
         }
         usage = openai_to_anthropic(response)["usage"]
-        assert usage == {"input_tokens": 50, "output_tokens": 10}
+        assert usage == {"input_tokens": 60, "output_tokens": 12}
 
 
 class TestOracleEnvelopeShape:
@@ -856,10 +856,10 @@ class TestStreamingBlockIndex:
         start_usage = next(e for e in events if e["event"] == "message_start")["data"]["message"][
             "usage"
         ]
-        assert start_usage["input_tokens"] == 50
+        assert start_usage["input_tokens"] == 60
         assert isinstance(start_usage["input_tokens"], int)
         delta_usage = next(e for e in events if e["event"] == "message_delta")["data"]["usage"]
-        assert delta_usage["output_tokens"] == 12
+        assert delta_usage["output_tokens"] == 14
         assert isinstance(delta_usage["output_tokens"], int)
 
     async def test_cross_chunk_buffering_preserves_block_indices(self):
