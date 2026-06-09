@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import socket
@@ -15,7 +16,12 @@ from threading import Thread
 import pytest
 
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities, StreamRequestMode
-from claude_bridge.proxy import start_proxy
+from claude_bridge.proxy import (
+    _approx_decoded_bytes,
+    _oversized_media,
+    estimate_input_tokens,
+    start_proxy,
+)
 
 
 def _find_free_port() -> int:
@@ -915,6 +921,156 @@ async def test_count_tokens_malformed_body(proxy_url: str):
     writer.close()
     assert b"200" in response
     assert b'"input_tokens": 0' in response
+
+
+# ---------------------------------------------------------------------------
+# Media-aware token estimation (T-008)
+# ---------------------------------------------------------------------------
+
+
+def _b64_of_size(decoded_bytes: int) -> str:
+    """A base64 string that decodes to exactly ``decoded_bytes`` bytes."""
+    return base64.b64encode(b"\x00" * decoded_bytes).decode()
+
+
+def _image_block(data: str, media_type: str = "image/png") -> dict:
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+
+
+def _document_block(data: str) -> dict:
+    return {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": data},
+    }
+
+
+def _user(content) -> dict:
+    return {"role": "user", "content": content}
+
+
+class TestMediaAwareTokenEstimation:
+    """estimate_input_tokens budgets image/document blocks at a flat per-modality
+    cost, never the base64 payload size — the fix for the auto-compact signal that
+    a pasted image used to blow up. Oracles are the documented flat budget and a
+    payload-size-invariance relation, neither read from running the estimator."""
+
+    def test_image_estimate_is_independent_of_base64_payload_size(self):
+        # Differential oracle: a model's per-image cost is fixed, so a 4-byte image
+        # and a 300 KB image must estimate identically. Counting base64 bytes would
+        # add ~115k tokens to the large one — this equality is what proves it does not.
+        small = estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(4))])]})
+        large = estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(300_000))])]})
+        assert small == large
+
+    def test_image_block_adds_the_documented_flat_budget(self):
+        # Oracle: the documented image budget (1200 tokens). Two requests identical
+        # but for one image block — the delta is exactly the flat budget, never the
+        # 50 KB base64 length.
+        text_only = estimate_input_tokens({"messages": [_user([{"type": "text", "text": "x"}])]})
+        with_image = estimate_input_tokens(
+            {
+                "messages": [
+                    _user([{"type": "text", "text": "x"}, _image_block(_b64_of_size(50_000))])
+                ]
+            }
+        )
+        assert with_image - text_only == 1200
+
+    def test_document_block_adds_the_documented_flat_budget(self):
+        # Oracle: the documented document budget (3000 tokens), payload-size-invariant.
+        text_only = estimate_input_tokens({"messages": [_user([{"type": "text", "text": "x"}])]})
+        with_doc = estimate_input_tokens(
+            {
+                "messages": [
+                    _user([{"type": "text", "text": "x"}, _document_block(_b64_of_size(50_000))])
+                ]
+            }
+        )
+        assert with_doc - text_only == 3000
+
+    def test_tool_result_nested_image_is_budgeted_not_counted(self):
+        # An image nested inside tool_result content is budgeted at the flat image
+        # cost, not counted as base64 text (T-005 made nested media real parts).
+        small = estimate_input_tokens(
+            {
+                "messages": [
+                    _user(
+                        [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t1",
+                                "content": [_image_block(_b64_of_size(8))],
+                            }
+                        ]
+                    )
+                ]
+            }
+        )
+        large = estimate_input_tokens(
+            {
+                "messages": [
+                    _user(
+                        [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t1",
+                                "content": [_image_block(_b64_of_size(250_000))],
+                            }
+                        ]
+                    )
+                ]
+            }
+        )
+        assert small == large
+
+    def test_text_only_estimate_matches_hand_derived_byte_count(self):
+        # Regression oracle: the documented formula is JSON-bytes / 3.5, rounded.
+        # json.dumps({"role": "user", "content": "hi"}) is 33 ASCII bytes →
+        # round(33 / 3.5) = 9. Hand-derived from the spec, not from the estimator.
+        assert estimate_input_tokens({"messages": [_user("hi")]}) == 9
+
+    def test_oversized_media_is_flagged_above_threshold(self):
+        # Oracle: the documented oversized threshold is 5 MiB decoded. A 6 MiB image
+        # is flagged; a 1 MiB image is not.
+        oversized = _oversized_media(
+            {"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]}
+        )
+        assert [d["kind"] for d in oversized] == ["image"]
+        under = _oversized_media({"messages": [_user([_image_block(_b64_of_size(1024 * 1024))])]})
+        assert under == []
+
+    def test_oversized_media_emits_a_warning(self):
+        # Behavior (not call-shape): estimating a request with oversized media emits
+        # an operator-visible WARNING naming the modality. Capture via a handler on
+        # the bridge logger directly — it sets propagate=False, so pytest's caplog
+        # (rooted) never sees it; this also makes the test order-independent.
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        bridge_logger = logging.getLogger("claude_bridge.proxy")
+        handler = _Capture(level=logging.WARNING)
+        previous_level = bridge_logger.level
+        bridge_logger.addHandler(handler)
+        bridge_logger.setLevel(logging.WARNING)
+        try:
+            estimate_input_tokens(
+                {"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]}
+            )
+        finally:
+            bridge_logger.removeHandler(handler)
+            bridge_logger.setLevel(previous_level)
+        assert any(r.levelno == logging.WARNING and "image" in r.getMessage() for r in records)
+
+    def test_approx_decoded_bytes_recovers_payload_size(self):
+        # Oracle: base64 of N bytes decodes back to N; the approximation recovers N
+        # within base64 padding rounding (<= 2 bytes). 900 % 3 == 0 → exact.
+        approx = _approx_decoded_bytes(base64.b64encode(b"\x01" * 900).decode())
+        assert approx == 900
 
 
 @pytest.mark.asyncio
