@@ -390,7 +390,8 @@ class TestToolUseContract:
         outputs = [i for i in result["input"] if i.get("type") == "function_call_output"]
         assert len(outputs) == 1
         assert outputs[0]["call_id"] == "fc_9"
-        # Spec: function_call_output.output is always a string, never null.
+        # Spec: function_call_output.output is str | list[dict]; a text-only result
+        # stays a plain string (never null, no array) — see TestToolResultMediaContract.
         assert outputs[0]["output"] == "hello"
         assert isinstance(outputs[0]["output"], str)
 
@@ -416,6 +417,114 @@ class TestToolUseContract:
         # An error result must be distinguishable from a success result carrying
         # the same text — otherwise the model cannot tell the tool failed.
         assert output["output"] == "[Error] boom"
+
+
+def _function_call_output(result: dict) -> dict:
+    """Return the single top-level function_call_output item."""
+    outputs = [i for i in result["input"] if i.get("type") == "function_call_output"]
+    assert len(outputs) == 1
+    return outputs[0]
+
+
+class TestToolResultMediaContract:
+    """tool_result media → ``function_call_output.output`` is ``str | list[dict]``.
+
+    Deterministic rule: an array of content parts is emitted ONLY when the content
+    carries media AND the provider declares ``supports_tool_output_content_parts``.
+    Otherwise the output stays a string; media in a string-only backend is redacted
+    (never base64). Oracles derive from the Responses spec and the redaction contract.
+    """
+
+    _IMAGE_B64 = "iVBORw0KGgo="
+
+    def _tool_result_request(self, *content_blocks: dict, is_error: bool = False) -> dict:
+        block: dict = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_9",
+            "content": list(content_blocks),
+        }
+        if is_error:
+            block["is_error"] = True
+        return _user_media_request(block)
+
+    def test_tool_result_emits_array_function_call_output_when_capable(self):
+        """text+image content with capability → output is an array of real parts.
+
+        Oracle: Responses ``function_call_output.output`` accepts an array of
+        ``input_text``/``input_image`` parts; the image is an ``input_image`` data URL
+        (RFC 2397). The model can only *see* the screenshot in this part form.
+        """
+        request = self._tool_result_request(
+            {"type": "text", "text": "Screenshot captured"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": self._IMAGE_B64},
+            },
+        )
+        result, _ = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        output = _function_call_output(result)["output"]
+        assert isinstance(output, list)
+        assert output[0] == {"type": "input_text", "text": "Screenshot captured"}
+        assert output[1] == {
+            "type": "input_image",
+            "image_url": f"data:image/png;base64,{self._IMAGE_B64}",
+        }
+        # The buggy stringification ("[image: data:...]") must be gone.
+        assert all(isinstance(part, dict) for part in output)
+
+    def test_tool_result_text_only_stays_string_even_when_capable(self):
+        """Text-only tool result stays a plain string even when arrays are supported.
+
+        Oracle: the deterministic rule requires media to be PRESENT before switching to
+        an array — a text-only result has the same consumer-visible string shape it
+        always had, protecting backends/consumers that read ``output`` as a string.
+        """
+        request = self._tool_result_request({"type": "text", "text": "plain result"})
+        result, _ = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        output = _function_call_output(result)["output"]
+        assert output == "plain result"
+        assert isinstance(output, str)
+
+    def test_tool_result_media_redacted_to_string_without_capability(self):
+        """Without array capability, a tool_result image degrades to a redacted string.
+
+        Oracle: redaction contract — the base64 payload must NOT reach the provider
+        request, and the placeholder names only the safe kind/media_type.
+        """
+        request = self._tool_result_request(
+            {"type": "text", "text": "Screenshot captured"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": self._IMAGE_B64},
+            },
+        )
+        # Default capabilities: supports_tool_output_content_parts is False.
+        result, _ = anthropic_to_openai(request)
+        output = _function_call_output(result)["output"]
+        assert isinstance(output, str)
+        assert self._IMAGE_B64 not in output
+        assert self._IMAGE_B64 not in json.dumps(result)
+        assert "Screenshot captured" in output
+        assert "[media omitted: image/image/png" in output
+
+    def test_tool_result_error_array_prepends_error_marker(self):
+        """An error tool_result in array form is prefixed with an error marker part.
+
+        Oracle: an error result must be distinguishable from a success result carrying
+        the same parts — the marker is a leading ``input_text`` part.
+        """
+        request = self._tool_result_request(
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": self._IMAGE_B64},
+            },
+            is_error=True,
+        )
+        result, _ = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        output = _function_call_output(result)["output"]
+        assert isinstance(output, list)
+        assert output[0] == {"type": "input_text", "text": "[Error]"}
+        assert output[1]["type"] == "input_image"
 
 
 class TestToolIdRoundTrip:

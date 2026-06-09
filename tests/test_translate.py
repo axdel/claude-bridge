@@ -627,8 +627,15 @@ class TestTranslationRobustness:
         assert len(fco) == 1
         assert fco[0]["output"] == "Part 1\nPart 2"
 
-    def test_tool_result_with_image_content_preserves_data(self):
-        """tool_result with mixed text+image content preserves image as data URL."""
+    def test_tool_result_image_redacted_to_string_when_not_capable(self):
+        """With a string-only backend (default caps), a tool_result image degrades to a
+        redacted text placeholder — the surrounding text survives, the base64 does not.
+
+        This supersedes the prior behavior that inlined the base64 as ``[image: data:...]``:
+        that string was both unusable by the model and a payload leak. Oracle: redaction
+        contract — base64 absent, kind/media_type named.
+        """
+        png_b64 = "iVBORw0KGgo="
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -646,7 +653,7 @@ class TestTranslationRobustness:
                                     "source": {
                                         "type": "base64",
                                         "media_type": "image/png",
-                                        "data": "iVBORw0KGgo=",
+                                        "data": png_b64,
                                     },
                                 },
                             ],
@@ -659,11 +666,15 @@ class TestTranslationRobustness:
         fco = [i for i in result["input"] if i.get("type") == "function_call_output"]
         assert len(fco) == 1
         output = fco[0]["output"]
+        assert isinstance(output, str)
         assert "Screenshot captured" in output
-        assert "data:image/png;base64,iVBORw0KGgo=" in output
+        assert "[media omitted: image/image/png" in output
+        assert png_b64 not in json.dumps(result)
 
-    def test_tool_result_with_url_image_preserves_url(self):
-        """tool_result with URL image source preserves the URL."""
+    def test_tool_result_url_image_redacted_to_string_when_not_capable(self):
+        """A URL-source tool_result image also redacts to the omitted placeholder when
+        the backend cannot carry tool-output media. Oracle: uniform redaction — the URL
+        is preserved only on the capable array path, not in the degraded string form."""
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -691,7 +702,9 @@ class TestTranslationRobustness:
         result, _ = anthropic_to_openai(request)
         fco = [i for i in result["input"] if i.get("type") == "function_call_output"]
         assert len(fco) == 1
-        assert "https://example.com/img.png" in fco[0]["output"]
+        output = fco[0]["output"]
+        assert "https://example.com/img.png" not in output
+        assert "[media omitted: image/" in output
 
     def test_unknown_content_block_becomes_redacted_placeholder(self):
         """An unsupported block degrades to a type-named placeholder that omits its

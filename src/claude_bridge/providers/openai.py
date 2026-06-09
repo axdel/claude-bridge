@@ -240,7 +240,7 @@ def _translate_content_block(
     if block_type == "tool_use":
         return _translate_tool_use_block(block), []
     if block_type == "tool_result":
-        return _translate_tool_result_block(block), []
+        return _translate_tool_result_block(block, capabilities)
     return _translate_unsupported_block(block_type)
 
 
@@ -329,37 +329,97 @@ def _translate_tool_use_block(block: dict) -> dict:
     }
 
 
-def _translate_tool_result_block(block: dict) -> dict:
-    """Translate an Anthropic tool_result block to a top-level function_call_output item.
+_TOOL_RESULT_MEDIA_TYPES = frozenset({"image", "document"})
 
-    Nested content is flattened to a string; image parts are inlined as a data/URL
-    marker (string form). A capability-gated content-part array is added in T-005.
+
+def _tool_result_has_media(content: object) -> bool:
+    """Report whether tool_result content carries an image/document block."""
+    if not isinstance(content, list):
+        return False
+    return any(b.get("type") in _TOOL_RESULT_MEDIA_TYPES for b in content)
+
+
+def _tool_result_string(content: object, is_error: bool) -> str:
+    """Flatten tool_result content to a string, redacting media (never base64).
+
+    Media blocks degrade to a bounded ``[media omitted: <kind>/<media_type> — …]``
+    placeholder: a string-only backend cannot carry the bytes, and echoing the base64
+    payload would both be useless to the model and leak the tool's output.
     """
-    content = block.get("content", "")
     if isinstance(content, list):
-        parts = []
+        rendered = []
         for b in content:
             if b.get("type") == "text":
-                parts.append(b.get("text", ""))
-            elif b.get("type") == "image":
-                source = b.get("source", {})
-                if source.get("type") == "base64":
-                    media = source.get("media_type", "application/octet-stream")
-                    data = source.get("data", "")
-                    parts.append(f"[image: data:{media};base64,{data}]")
-                elif source.get("type") == "url":
-                    parts.append(f"[image: {source.get('url', '')}]")
-        content = "\n".join(parts)
-    output = str(content) if content else ""
-    if block.get("is_error"):
-        output = f"[Error] {output}"
+                rendered.append(b.get("text", ""))
+            elif b.get("type") in _TOOL_RESULT_MEDIA_TYPES:
+                src = parse_media_source(b)
+                rendered.append(
+                    f"[media omitted: {src.kind}/{src.media_type} — "
+                    "provider/auth mode does not support tool-output media]"
+                )
+        text = "\n".join(rendered)
+    else:
+        text = str(content) if content else ""
+    return f"[Error] {text}" if is_error else text
+
+
+def _tool_result_parts(
+    content: list, capabilities: ProviderCapabilities, is_error: bool
+) -> tuple[list[dict], list[str]]:
+    """Build the array form of tool_result output: real Responses content parts.
+
+    Text becomes ``input_text``; image/document delegate to the same media helpers as
+    the message path (so an unforwardable modality degrades to a redacted part). An
+    error result is prefixed with a leading ``[Error]`` marker part so the model can
+    distinguish failure from success carrying the same parts.
+    """
+    parts: list[dict] = []
+    warnings: list[str] = []
+    for b in content:
+        btype = b.get("type")
+        if btype == "text":
+            parts.append({"type": "input_text", "text": b.get("text", "")})
+        elif btype == "image":
+            part, warns = _translate_image_block(parse_media_source(b), capabilities)
+            parts.append(part)
+            warnings.extend(warns)
+        elif btype == "document":
+            part, warns = _translate_document_block(parse_media_source(b), capabilities)
+            parts.append(part)
+            warnings.extend(warns)
+    if is_error:
+        parts.insert(0, {"type": "input_text", "text": "[Error]"})
+    return parts, warnings
+
+
+def _translate_tool_result_block(
+    block: dict, capabilities: ProviderCapabilities
+) -> tuple[dict, list[str]]:
+    """Translate an Anthropic tool_result block to a top-level function_call_output item.
+
+    ``output`` is ``str | list[dict]``. When the content carries media AND the provider
+    declares ``supports_tool_output_content_parts``, the output is an ARRAY of real
+    content parts (so tool-returned screenshots/PDFs reach a vision model). Otherwise it
+    is a string: text-only results keep their original string shape, and media in a
+    string-only backend is redacted (never base64).
+    """
+    content = block.get("content", "")
+    is_error = bool(block.get("is_error"))
     fc_id = _to_openai_id(block["tool_use_id"])
+    if (
+        isinstance(content, list)
+        and _tool_result_has_media(content)
+        and capabilities.supports_tool_output_content_parts
+    ):
+        output, warnings = _tool_result_parts(content, capabilities, is_error)
+    else:
+        output, warnings = _tool_result_string(content, is_error), []
     return {
         "_toplevel": True,
         "type": "function_call_output",
         "call_id": fc_id,
         "output": output,
-    }
+    }, warnings
 
 
 def _translate_unsupported_block(block_type: str) -> tuple[dict, list[str]]:
