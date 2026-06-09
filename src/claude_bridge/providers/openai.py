@@ -12,12 +12,13 @@ import urllib.request
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import claude_bridge.config as config
 from claude_bridge.auth import is_token_expired
-from claude_bridge.provider import PROVIDERS
+from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.stream import parse_sse_events
 
 _CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-_TOKEN_URL = "https://auth.openai.com/oauth/token"  # noqa: S105
+_TOKEN_URL = "https://auth.openai.com/oauth/token"  # noqa: S105  # nosec B105
 _DEFAULT_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 
 
@@ -86,7 +87,7 @@ async def refresh_access_token(refresh_token: str, auth_path: Path | None = None
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310  # nosec B310
                 token_data: dict = json.loads(resp.read())
         except (
             urllib.error.HTTPError,
@@ -130,7 +131,7 @@ DEFAULT_MODEL = "gpt-5.5"
 _STRIPPED_KEYS = ("output_config",)
 
 # Reasoning mode: "passthrough" preserves thinking blocks, "drop" strips them.
-_REASONING_MODE = os.environ.get("REASONING_MODE", "passthrough").lower()
+_REASONING_MODE = config.reasoning_mode()
 
 # Upper bound on the per-provider encrypted-reasoning cache (one entry per in-flight
 # tool call). Bounds memory under long agentic sessions; oldest entries evict first.
@@ -879,6 +880,10 @@ class OpenAIProvider:
     """
 
     name = "openai"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+    )
 
     def __init__(
         self,

@@ -6,6 +6,7 @@ import io
 import json
 import logging
 
+import claude_bridge.config as config
 from claude_bridge.log import (
     configure_logging,
     get_logger,
@@ -102,7 +103,7 @@ class TestTraceSink:
 
     def test_disabled_by_default_writes_nothing(self, tmp_path, monkeypatch):
         # No env var → tracing is off and the sink is a no-op (no file created).
-        monkeypatch.delenv("CLAUDE_BRIDGE_TRACE_PATH", raising=False)
+        monkeypatch.delenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, raising=False)
         target = tmp_path / "trace.jsonl"
         assert is_trace_enabled() is False
         trace_event("inbound_request", {"model": "gpt-5.5"})
@@ -110,7 +111,7 @@ class TestTraceSink:
 
     def test_enabled_appends_one_json_line_per_event(self, tmp_path, monkeypatch):
         target = tmp_path / "trace.jsonl"
-        monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
+        monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, str(target))
         assert is_trace_enabled() is True
         trace_event("inbound_request", {"model": "gpt-5.5", "message_count": 3})
         trace_event("warning", {"text": "stripped cache_control"})
@@ -124,7 +125,7 @@ class TestTraceSink:
 
     def test_record_carries_request_id(self, tmp_path, monkeypatch):
         target = tmp_path / "trace.jsonl"
-        monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
+        monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, str(target))
         token = request_id_var.set("deadbeef")
         try:
             trace_event("inbound_request", {"model": "gpt-5.5"})
@@ -137,7 +138,7 @@ class TestTraceSink:
         # tracing can never fail a user request.
         a_directory = tmp_path / "trace_dir"
         a_directory.mkdir()
-        monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(a_directory))
+        monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, str(a_directory))
         # No exception escapes even though opening a directory for append fails.
         trace_event("inbound_request", {"model": "gpt-5.5"})
 
@@ -154,7 +155,7 @@ class TestTraceFailureVisibility:
         monkeypatch.setattr(log_mod, "_trace_failure_warned", False, raising=False)
         a_directory = tmp_path / "trace_dir"
         a_directory.mkdir()
-        monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(a_directory))
+        monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, str(a_directory))
         stream = io.StringIO()
         configure_logging(level="INFO", stream=stream)
 
@@ -172,7 +173,7 @@ class TestTraceFailureVisibility:
         monkeypatch.setattr(log_mod, "_trace_failure_warned", False, raising=False)
         # Parent directory does not exist → open() raises FileNotFoundError every call.
         target = tmp_path / "missing_dir" / "trace.jsonl"
-        monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
+        monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, str(target))
         stream = io.StringIO()
         configure_logging(level="INFO", stream=stream)
 

@@ -2,6 +2,24 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-06-09
+
+### feat: consolidated audit drift remediation ([PR #9](https://github.com/axdel/claude-bridge/pull/9))
+Remediate provider, config, logging, decision-record, and security-tooling drift from the deep audit.
+
+- [`6ffccad`](https://github.com/axdel/claude-bridge/commit/6ffccad) Record streaming failure outcomes
+- [`cc840ab`](https://github.com/axdel/claude-bridge/commit/cc840ab) Harden provider preflight validation
+- [`9914235`](https://github.com/axdel/claude-bridge/commit/9914235) Align compatibility documentation
+- [`b0fbc1c`](https://github.com/axdel/claude-bridge/commit/b0fbc1c) Use provider sync response capabilities
+- [`c15445c`](https://github.com/axdel/claude-bridge/commit/c15445c) Use provider stream capabilities
+- [`9405c91`](https://github.com/axdel/claude-bridge/commit/9405c91) Declare provider capabilities
+- [`93a317f`](https://github.com/axdel/claude-bridge/commit/93a317f) Centralize runtime config ownership
+- [`bd8d43e`](https://github.com/axdel/claude-bridge/commit/bd8d43e) Keep xAI placeholder non-routable
+- [`2a0208a`](https://github.com/axdel/claude-bridge/commit/2a0208a) Redact provider error logs
+- [`4927bc5`](https://github.com/axdel/claude-bridge/commit/4927bc5) Redact Gemini unsupported blocks
+- [`3df8d21`](https://github.com/axdel/claude-bridge/commit/3df8d21) Record autocompact usage decision
+- [`2b27876`](https://github.com/axdel/claude-bridge/commit/2b27876) Add decision registry
+
 ## 2026-06-08
 
 ### v0.7.0 — Claude Code Wire Compatibility

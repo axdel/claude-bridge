@@ -69,8 +69,9 @@ of leaking provider-incompatible content.
 - **Metrics** — `/stats` endpoint: request count, errors, latency, tokens, provider, uptime
 - **Token estimation** — structure-aware byte counting for context window management
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
-- **Multi-provider** — adding a provider = one provider file plus registration import
-- **321 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
+- **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
+- **343 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -248,13 +249,13 @@ curl -s localhost:9999/stats | python3 -m json.tool
 |---|---|---|
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
 | `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — direct Gemini mode uses the public API when set; otherwise it uses Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) |
-| `GEMINI_MODEL` | `gemini-3-flash-preview` OAuth / `gemini-2.5-pro` API key | Gemini model override. OAuth defaults to Gemini 3 Flash; API-key mode defaults to Gemini 2.5 Pro |
+| `GEMINI_MODEL` | API-key: `gemini-2.5-pro`; OAuth: `gemini-3-flash-preview` | Gemini model override. Both auth modes honor the same env var; when unset, API-key mode uses the API-key default and OAuth mode uses the OAuth default |
 | `REASONING_MODE` | `passthrough` | OpenAI thinking-block handling: `passthrough` preserves tagged thinking text, `drop` strips it. Gemini strips thinking blocks because it has no equivalent |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `UPSTREAM_TIMEOUT` | `60`/`120` | Upstream request timeout in seconds (60s sync, 120s streaming) |
-| `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10MB) |
+| `UPSTREAM_TIMEOUT` | caller default (`60` sync / `120` streaming) | Upstream request timeout in seconds; invalid, zero, or negative values fall back to the caller default |
+| `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10 MiB) |
 | `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback preference list; the first registered provider is used |
-| `LLM_BRIDGE_PORT` | `9999` | Default proxy port |
+| `LLM_BRIDGE_PORT` | `9999` | Shell launcher default proxy port |
 | `ANTHROPIC_REAL_URL` | `https://api.anthropic.com` | Real Anthropic endpoint (passthrough) |
 | `CLAUDE_BRIDGE_TRACE_PATH` | _(none)_ | Optional redacted JSONL structural trace path for wire-compatibility debugging |
 
@@ -274,21 +275,26 @@ src/claude_bridge/
     ├── __init__.py   # Provider registration notes
     ├── openai.py     # OpenAI: API key + Codex OAuth + Responses API translation
     ├── gemini.py     # Gemini: API key + Gemini CLI OAuth + generateContent translation
-    └── xai.py        # xAI Grok: registered stub, not implemented
+    └── xai.py        # xAI Grok: unregistered placeholder, not implemented
 ```
 
 ### Adding a New Provider
 
 1. Create `src/claude_bridge/providers/yourprovider.py`
 2. Implement the `Provider` protocol:
+   - `capabilities` — declare `ProviderCapabilities(stream_request_mode=..., sync_response_mode=...)`
    - `authenticate()` — return auth headers
    - `translate_request()` — Anthropic -> your format
    - `translate_response()` — your format -> Anthropic
    - `translate_stream()` — raw bytes -> Anthropic SSE events
-3. Register: `PROVIDERS["yourprovider"] = YourProvider`
-4. Import in `__main__.py`
+3. Register only implemented providers: `PROVIDERS["yourprovider"] = YourProvider`
+4. Import registered providers in `__main__.py`
 5. Use: `./start.sh --provider yourprovider`
 6. Optionally copy `claude-codex` -> `claude-yourprovider` (change `--provider` and banner model)
+
+Capability modes are explicit: `stream_request_mode="body_parameter"` means the proxy sets `stream: true` in the provider request body, while `stream_request_mode="url"` means streaming is selected by endpoint URL. `sync_response_mode="sse"` keeps the current SSE aggregation path for non-streaming Anthropic clients; `sync_response_mode="json"` parses provider JSON and calls `translate_response()` directly.
+
+Unimplemented placeholders should stay unregistered and unimported, like the current xAI stub.
 
 ### OpenAI Translation Map
 
@@ -324,6 +330,12 @@ src/claude_bridge/
 > (subscription) or the public API for API key auth. `$schema`, `propertyNames`,
 > and other unsupported JSON Schema keywords are automatically stripped from tool definitions.
 
+## Decision Records
+
+Architecture and compatibility decisions live in [`DECISIONS.md`](DECISIONS.md).
+Ignored local memory files such as `CLAUDE.md`, when present, should point to that
+tracked registry instead of duplicating decision rows.
+
 ## Known Limitations
 
 - Claude Code's startup banner always shows "Sonnet 4.6" regardless of actual model
@@ -334,7 +346,7 @@ src/claude_bridge/
 - Failover is blocked during active tool-use turns (by design — prevents broken tool state)
 - Rate limit headers (`x-ratelimit-*`, `retry-after`) forwarded on sync responses only — streaming responses cannot include HTTP headers after SSE begins
 - Retry applies to sync HTTP calls only — streaming connections are not retried (SSE state replay is too complex)
-- xAI is registered only as an extensibility stub; `xai` is not a usable provider yet
+- xAI remains an unregistered extensibility placeholder; `xai` is not a runtime provider until implemented
 
 ## Running Tests
 
@@ -366,6 +378,18 @@ map that does not yet include freshly added lines and reports them as false surv
 Disabling the filter runs the full selected test set per mutant — accurate, slightly slower.
 
 Target: ≥85% kill rate on changed source files (zero survivors for auth code).
+
+### Security audits
+
+Dev-only security audit tools are available through `uv`:
+
+```bash
+uv run bandit -r src
+uv run pip-audit
+```
+
+Bandit suppressions are applied only at intentional stdlib/OAuth call sites; new
+findings should be reviewed rather than globally skipped.
 
 ## Verifying Against an Anthropic-Compatible Reference (optional)
 
@@ -448,7 +472,7 @@ suite.
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 321 | Minimal | Some |
+| Tests | 343 | Minimal | Some |
 
 ## Terms of Service Considerations
 
