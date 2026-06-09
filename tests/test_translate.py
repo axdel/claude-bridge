@@ -706,6 +706,75 @@ class TestTranslationRobustness:
         assert "https://example.com/img.png" not in output
         assert "[media omitted: image/" in output
 
+    def test_tool_result_media_string_fallback_emits_warning(self):
+        """When a tool_result carries media but the backend cannot carry tool-output
+        content arrays, the string fallback redacts the media — and MUST surface an
+        operator warning, not degrade silently.
+
+        Oracle: the observability contract. Every degraded media block surfaces a
+        warning (the message path does — see the degradation tests below); the
+        string-fallback tool_result path must honor the same contract so the
+        codex_oauth default does not silently drop tool-returned images. Derived from
+        the contract, not from running the translator (which returned no warning).
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_warn",
+                            "content": [
+                                {"type": "text", "text": "Screenshot captured"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBORw0KGgo=",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        # Default capabilities: string-only tool output (supports_tool_output_content
+        # _parts=False) — the codex_oauth default path.
+        _, warnings = anthropic_to_openai(request)
+        assert any("tool_result" in w and "media" in w for w in warnings)
+
+    def test_tool_result_text_only_string_path_emits_no_warning(self):
+        """A text-only tool_result on the string path degrades nothing, so it must NOT
+        emit a spurious media-redaction warning.
+
+        Oracle: the warning fires on degradation only. A text-only result loses no
+        content, so the warning contract says silence — this pins the guard to the
+        media-present condition rather than the string-path condition.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_text",
+                            "content": [{"type": "text", "text": "plain output"}],
+                        }
+                    ],
+                }
+            ],
+        }
+        _, warnings = anthropic_to_openai(request)
+        assert not any("media" in w for w in warnings)
+
     def test_unknown_content_block_becomes_redacted_placeholder(self):
         """An unsupported block degrades to a type-named placeholder that omits its
         nested content, with a warning — no raw str(block) leakage (D-SRVTOOL-001)."""

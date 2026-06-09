@@ -460,6 +460,11 @@ def _translate_tool_result_block(
         output, warnings = _tool_result_parts(content, capabilities, is_error)
     else:
         output, warnings = _tool_result_string(content, is_error), []
+        if isinstance(content, list) and _tool_result_has_media(content):
+            warnings = [
+                "tool_result media redacted to string "
+                "(provider/auth mode does not support tool-output content arrays)"
+            ]
     return {
         "_toplevel": True,
         "type": "function_call_output",
