@@ -4,6 +4,21 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-06-09
 
+### feat: systemic non-text content translation ([PR #10](https://github.com/axdel/claude-bridge/pull/10))
+Forward image, document/PDF, and tool_result media from Anthropic input to the OpenAI Responses API via a shared media-source parser and auth-mode-aware capabilities, with base64-safe token estimation and observable degradation.
+
+- [`fa29d71`](https://github.com/axdel/claude-bridge/commit/fa29d71) Document media-forwarding capability in README (D-CONTENT-001/D-MODALITY-001/D-SCOPE-001)
+- [`2a76b33`](https://github.com/axdel/claude-bridge/commit/2a76b33) Record D-MEDIA-001 (media bounded by request-body cap) from /review ADV-003
+- [`2bc0ff9`](https://github.com/axdel/claude-bridge/commit/2bc0ff9) Warn when tool_result media degrades to string fallback
+- [`6edabc0`](https://github.com/axdel/claude-bridge/commit/6edabc0) Validate document media_type and sanitize forwarded filename
+- [`e747352`](https://github.com/axdel/claude-bridge/commit/e747352) Finalize media-translation decision records
+- [`e79917f`](https://github.com/axdel/claude-bridge/commit/e79917f) Make token estimation media-aware and base64-safe in traces
+- [`7e0bd5b`](https://github.com/axdel/claude-bridge/commit/7e0bd5b) Declare OpenAI input-content capabilities per auth-mode backend
+- [`f9f47ae`](https://github.com/axdel/claude-bridge/commit/f9f47ae) Emit tool_result media as real Responses content parts
+- [`73df069`](https://github.com/axdel/claude-bridge/commit/73df069) Forward top-level image and document blocks to OpenAI Responses
+- [`e4f2277`](https://github.com/axdel/claude-bridge/commit/e4f2277) Add additive input-modality capabilities to ProviderCapabilities
+- [`88d6370`](https://github.com/axdel/claude-bridge/commit/88d6370) Add shared policy-free media-source parser (content.py)
+
 ### feat: consolidated audit drift remediation ([PR #9](https://github.com/axdel/claude-bridge/pull/9))
 Remediate provider, config, logging, decision-record, and security-tooling drift from the deep audit.
 
