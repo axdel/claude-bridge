@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from claude_bridge.provider import ProviderCapabilities
 from claude_bridge.providers.openai import (
     DEFAULT_MODEL,
     MODEL_MAP,
@@ -11,6 +12,16 @@ from claude_bridge.providers.openai import (
     openai_to_anthropic,
 )
 from claude_bridge.proxy import estimate_input_tokens
+
+# A provider/auth mode that declares the full image+document input surface.
+# Built locally (not imported) so these behavior tests stay independent of any
+# single provider's class-attribute capabilities, which evolve in later tasks.
+_FULL_MEDIA_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+    supports_tool_output_content_parts=True,
+)
 
 # ---------------------------------------------------------------------------
 # anthropic_to_openai — text-only requests
@@ -616,8 +627,15 @@ class TestTranslationRobustness:
         assert len(fco) == 1
         assert fco[0]["output"] == "Part 1\nPart 2"
 
-    def test_tool_result_with_image_content_preserves_data(self):
-        """tool_result with mixed text+image content preserves image as data URL."""
+    def test_tool_result_image_redacted_to_string_when_not_capable(self):
+        """With a string-only backend (default caps), a tool_result image degrades to a
+        redacted text placeholder — the surrounding text survives, the base64 does not.
+
+        This supersedes the prior behavior that inlined the base64 as ``[image: data:...]``:
+        that string was both unusable by the model and a payload leak. Oracle: redaction
+        contract — base64 absent, kind/media_type named.
+        """
+        png_b64 = "iVBORw0KGgo="
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -635,7 +653,7 @@ class TestTranslationRobustness:
                                     "source": {
                                         "type": "base64",
                                         "media_type": "image/png",
-                                        "data": "iVBORw0KGgo=",
+                                        "data": png_b64,
                                     },
                                 },
                             ],
@@ -648,11 +666,15 @@ class TestTranslationRobustness:
         fco = [i for i in result["input"] if i.get("type") == "function_call_output"]
         assert len(fco) == 1
         output = fco[0]["output"]
+        assert isinstance(output, str)
         assert "Screenshot captured" in output
-        assert "data:image/png;base64,iVBORw0KGgo=" in output
+        assert "[media omitted: image/image/png" in output
+        assert png_b64 not in json.dumps(result)
 
-    def test_tool_result_with_url_image_preserves_url(self):
-        """tool_result with URL image source preserves the URL."""
+    def test_tool_result_url_image_redacted_to_string_when_not_capable(self):
+        """A URL-source tool_result image also redacts to the omitted placeholder when
+        the backend cannot carry tool-output media. Oracle: uniform redaction — the URL
+        is preserved only on the capable array path, not in the degraded string form."""
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -680,7 +702,78 @@ class TestTranslationRobustness:
         result, _ = anthropic_to_openai(request)
         fco = [i for i in result["input"] if i.get("type") == "function_call_output"]
         assert len(fco) == 1
-        assert "https://example.com/img.png" in fco[0]["output"]
+        output = fco[0]["output"]
+        assert "https://example.com/img.png" not in output
+        assert "[media omitted: image/" in output
+
+    def test_tool_result_media_string_fallback_emits_warning(self):
+        """When a tool_result carries media but the backend cannot carry tool-output
+        content arrays, the string fallback redacts the media — and MUST surface an
+        operator warning, not degrade silently.
+
+        Oracle: the observability contract. Every degraded media block surfaces a
+        warning (the message path does — see the degradation tests below); the
+        string-fallback tool_result path must honor the same contract so the
+        codex_oauth default does not silently drop tool-returned images. Derived from
+        the contract, not from running the translator (which returned no warning).
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_warn",
+                            "content": [
+                                {"type": "text", "text": "Screenshot captured"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBORw0KGgo=",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        # Default capabilities: string-only tool output (supports_tool_output_content
+        # _parts=False) — the codex_oauth default path.
+        _, warnings = anthropic_to_openai(request)
+        assert any("tool_result" in w and "media" in w for w in warnings)
+
+    def test_tool_result_text_only_string_path_emits_no_warning(self):
+        """A text-only tool_result on the string path degrades nothing, so it must NOT
+        emit a spurious media-redaction warning.
+
+        Oracle: the warning fires on degradation only. A text-only result loses no
+        content, so the warning contract says silence — this pins the guard to the
+        media-present condition rather than the string-path condition.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_text",
+                            "content": [{"type": "text", "text": "plain output"}],
+                        }
+                    ],
+                }
+            ],
+        }
+        _, warnings = anthropic_to_openai(request)
+        assert not any("media" in w for w in warnings)
 
     def test_unknown_content_block_becomes_redacted_placeholder(self):
         """An unsupported block degrades to a type-named placeholder that omits its
@@ -728,6 +821,206 @@ class TestTranslationRobustness:
         assert block["type"] == "tool_use"
         # Empty string → json.loads fails → fallback to _raw
         assert block["input"] == {"_raw": ""}
+
+
+# ---------------------------------------------------------------------------
+# Top-level (message-path) image + document translation — the core fix
+# ---------------------------------------------------------------------------
+
+
+class TestTopLevelMediaTranslation:
+    """A top-level image/document block on the message path becomes a real
+    Responses content part when the provider declares the modality, and degrades
+    observably (warning + bounded placeholder, no payload leak) when it does not.
+
+    These drive the public ``anthropic_to_openai`` with raw Anthropic dicts, so
+    they exercise the new ``_translate_image_block`` / ``_translate_document_block``
+    helpers through the real message-path wiring — independently of the exact-shape
+    assertions in test_contract.py.
+    """
+
+    @staticmethod
+    def _user_parts(result: dict) -> list[dict]:
+        user = [i for i in result["input"] if i.get("role") == "user"]
+        assert len(user) == 1
+        return user[0]["content"]
+
+    def test_toplevel_image_becomes_input_image_data_url_when_capable(self):
+        """A pasted base64 image is forwarded as an input_image data URL.
+
+        Oracle: the data-URL grammar is RFC 2397 — ``data:<media-type>;base64,<data>``
+        — derived from the spec, not from running the translator.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "iVBORw0KGgo=",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_image"
+        assert part["image_url"] == "data:image/png;base64,iVBORw0KGgo="
+        assert warnings == []
+
+    def test_toplevel_document_becomes_input_file_with_title_filename(self):
+        """A base64 PDF document becomes an input_file whose filename is the block title.
+
+        Oracle: Responses input_file shape ``{type, filename, file_data}`` with a
+        ``data:`` URL — from the OpenAI Responses spec, not the implementation.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "title": "spec.pdf",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0xLjQK",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_file"
+        assert part["filename"] == "spec.pdf"
+        assert part["file_data"] == "data:application/pdf;base64,JVBERi0xLjQK"
+        assert warnings == []
+
+    def test_toplevel_document_with_unsupported_media_type_degrades_without_leak(self):
+        """A base64 document whose media_type is outside the document allowlist degrades
+        to a redacted placeholder + warning instead of being interpolated into a data: URL.
+
+        Oracle: the document path must enforce a MIME allowlist exactly as the image path
+        does (only ``application/pdf`` is a forwardable document) — an unforwardable type
+        degrades observably and never echoes its payload. Derived from the allowlist
+        contract, not from running the translator.
+        """
+        secret_b64 = "SECRETDOCPAYLOAD=="
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "title": "evil.bin",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "text/html;evil,x",
+                                "data": secret_b64,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_text"
+        assert secret_b64 not in json.dumps(result)
+        # No forwarded data: URL was built — the unvalidated media_type never reaches a
+        # file_data field (naming it in the degradation placeholder is intended).
+        assert "file_data" not in json.dumps(result)
+        assert "base64," not in json.dumps(result)
+        assert any("document" in w for w in warnings)
+
+    def test_toplevel_document_filename_is_sanitized_to_basename(self):
+        """A client-controlled document title is reduced to a safe basename before it is
+        emitted as the forwarded input_file.filename.
+
+        Oracle: a POSIX/Windows path's basename is hand-derivable — ``../../etc/passwd``
+        → ``passwd`` — and non-printable characters (newline) are stripped. The expected
+        filename comes from the basename+printable rule, not from the implementation.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "title": "../../etc/pa\nsswd",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0xLjQK",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_file"
+        # basename of "../../etc/pa\nsswd" with the newline stripped = "passwd".
+        assert part["filename"] == "passwd"
+        assert ".." not in part["filename"]
+        assert "/" not in part["filename"]
+        assert warnings == []
+
+    def test_toplevel_image_without_modality_degrades_without_base64_leak(self):
+        """When the provider does not declare the image modality, a top-level image
+        degrades to a bounded text placeholder with a warning, and the base64 payload
+        never reaches the provider request.
+
+        Oracle: the degradation contract (warn + placeholder, no payload echo) — a
+        KNOWN modality the backend lacks, distinct from an unknown block type.
+        """
+        secret_b64 = "SUPERSECRETBASE64PAYLOAD=="
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": secret_b64,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        # Default capabilities are text-only — image is a known modality the
+        # provider does not support, so it must degrade rather than forward.
+        result, warnings = anthropic_to_openai(request)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_text"
+        assert secret_b64 not in json.dumps(result)
+        assert any("image" in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------
