@@ -840,6 +840,83 @@ class TestTopLevelMediaTranslation:
         assert part["file_data"] == "data:application/pdf;base64,JVBERi0xLjQK"
         assert warnings == []
 
+    def test_toplevel_document_with_unsupported_media_type_degrades_without_leak(self):
+        """A base64 document whose media_type is outside the document allowlist degrades
+        to a redacted placeholder + warning instead of being interpolated into a data: URL.
+
+        Oracle: the document path must enforce a MIME allowlist exactly as the image path
+        does (only ``application/pdf`` is a forwardable document) — an unforwardable type
+        degrades observably and never echoes its payload. Derived from the allowlist
+        contract, not from running the translator.
+        """
+        secret_b64 = "SECRETDOCPAYLOAD=="
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "title": "evil.bin",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "text/html;evil,x",
+                                "data": secret_b64,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_text"
+        assert secret_b64 not in json.dumps(result)
+        # No forwarded data: URL was built — the unvalidated media_type never reaches a
+        # file_data field (naming it in the degradation placeholder is intended).
+        assert "file_data" not in json.dumps(result)
+        assert "base64," not in json.dumps(result)
+        assert any("document" in w for w in warnings)
+
+    def test_toplevel_document_filename_is_sanitized_to_basename(self):
+        """A client-controlled document title is reduced to a safe basename before it is
+        emitted as the forwarded input_file.filename.
+
+        Oracle: a POSIX/Windows path's basename is hand-derivable — ``../../etc/passwd``
+        → ``passwd`` — and non-printable characters (newline) are stripped. The expected
+        filename comes from the basename+printable rule, not from the implementation.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "title": "../../etc/pa\nsswd",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0xLjQK",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result, warnings = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        part = self._user_parts(result)[0]
+        assert part["type"] == "input_file"
+        # basename of "../../etc/pa\nsswd" with the newline stripped = "passwd".
+        assert part["filename"] == "passwd"
+        assert ".." not in part["filename"]
+        assert "/" not in part["filename"]
+        assert warnings == []
+
     def test_toplevel_image_without_modality_degrades_without_base64_leak(self):
         """When the provider does not declare the image modality, a top-level image
         degrades to a bounded text placeholder with a warning, and the base64 payload

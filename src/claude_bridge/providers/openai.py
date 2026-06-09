@@ -154,9 +154,19 @@ _SAFE_TOKEN_MAX = 64
 # an upstream 400 — the set is the contract, not a guess.
 _IMAGE_MIME_ALLOWLIST = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 
+# Document MIME types the Responses ``input_file`` part accepts as base64 ``file_data``.
+# A base64 document whose media_type is outside this set degrades to a placeholder
+# rather than interpolating an unvalidated, client-controlled media_type into a data:
+# URL — the same allowlist discipline the image path applies (the set is the contract).
+_DOCUMENT_MIME_ALLOWLIST = frozenset({"application/pdf"})
+
 # Fallback filename for a document with no Anthropic ``title`` — the Responses
 # ``input_file`` part requires a filename.
 _DEFAULT_DOCUMENT_FILENAME = "document.pdf"
+
+# Upper bound on a forwarded filename. The Anthropic ``title`` is client-controlled
+# and reaches the provider as metadata; cap it so a hostile title cannot bloat the body.
+_FILENAME_MAX = 255
 
 # Conservative default for callers that don't pass a provider's capabilities (e.g.
 # direct translation in tests): text-only input, string tool output — the pre-media
@@ -308,23 +318,41 @@ def _translate_image_block(
     return _media_placeholder("image", source.source_kind)
 
 
+def _safe_document_filename(title: object) -> str:
+    """Sanitize a client-controlled document title into a safe input_file filename.
+
+    The Anthropic ``title`` is untrusted and forwarded to the provider as metadata.
+    Reduces it to a basename (drops POSIX and Windows path separators), strips
+    non-printable characters, and caps length; an empty or fully-stripped title
+    falls back to ``_DEFAULT_DOCUMENT_FILENAME``.
+    """
+    if not title:
+        return _DEFAULT_DOCUMENT_FILENAME
+    basename = str(title).replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(ch for ch in basename if ch.isprintable()).strip()
+    return cleaned[:_FILENAME_MAX] or _DEFAULT_DOCUMENT_FILENAME
+
+
 def _translate_document_block(
     source: MediaSource, capabilities: ProviderCapabilities
 ) -> tuple[dict, list[str]]:
     """Forward a document as a Responses ``input_file`` part, or degrade if unforwardable.
 
     Spec: ``input_file`` carries ``filename``+``file_data`` (a ``data:`` URL) for base64,
-    or ``file_url`` for a URL source. A file/unknown source (no bytes) degrades to a
-    redacted placeholder.
+    or ``file_url`` for a URL source. Base64 outside the document MIME allowlist, or a
+    file/unknown source (no bytes), degrades to a redacted placeholder (never echoes the
+    payload). The forwarded filename is sanitized — the title is client-controlled.
     """
     if "document" not in capabilities.input_modalities:
         return _media_placeholder("document", "not supported by this provider/auth mode")
     if source.source_kind == "url":
         return {"type": "input_file", "file_url": source.url}, []
     if source.source_kind == "base64":
+        if source.media_type not in _DOCUMENT_MIME_ALLOWLIST:
+            return _media_placeholder("document", source.media_type)
         return {
             "type": "input_file",
-            "filename": source.filename or _DEFAULT_DOCUMENT_FILENAME,
+            "filename": _safe_document_filename(source.filename),
             "file_data": f"data:{source.media_type};base64,{source.data}",
         }, []
     return _media_placeholder("document", source.source_kind)
