@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 
+from claude_bridge.provider import ProviderCapabilities
 from claude_bridge.providers.openai import (
     OpenAIProvider,
     _safe_token,
@@ -26,6 +27,29 @@ from claude_bridge.providers.openai import (
     openai_to_anthropic,
 )
 from claude_bridge.proxy import estimate_input_tokens
+
+# A provider that declares the full media surface — used to assert the forward path.
+_FULL_MEDIA_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+    supports_tool_output_content_parts=True,
+)
+
+
+def _user_media_request(*blocks: dict) -> dict:
+    """Wrap one or more content blocks in a minimal single-user-message request."""
+    return {
+        "model": "claude-opus-4-6",
+        "messages": [{"role": "user", "content": list(blocks)}],
+    }
+
+
+def _user_content_parts(result: dict) -> list[dict]:
+    """Return the translated content parts of the single user message."""
+    user_message = next(item for item in result["input"] if item.get("role") == "user")
+    return user_message["content"]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures — realistic Claude Code traffic shapes
@@ -206,6 +230,115 @@ class TestSystemContextContract:
 
 
 # ---------------------------------------------------------------------------
+# media content translation (top-level image / document)
+# ---------------------------------------------------------------------------
+
+
+class TestMediaContentContract:
+    """A pasted image/PDF must reach gpt-5.5 as a real Responses content part when the
+    provider declares the modality, and degrade to a redacted placeholder (never
+    echoing base64) otherwise. Expected shapes are the OpenAI Responses spec:
+    ``input_image.image_url`` is a STRING data URL; ``input_file`` carries
+    ``filename``+``file_data`` (base64) or ``file_url``."""
+
+    def test_base64_image_becomes_input_image_data_url(self):
+        block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+        }
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        part = _user_content_parts(result)[0]
+        assert part == {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        # Media parts are nested content, never top-level items.
+        assert "_toplevel" not in part
+
+    def test_url_image_becomes_input_image_with_url(self):
+        block = {"type": "image", "source": {"type": "url", "url": "https://example.com/c.png"}}
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        assert _user_content_parts(result)[0] == {
+            "type": "input_image",
+            "image_url": "https://example.com/c.png",
+        }
+
+    def test_base64_document_becomes_input_file_with_filename(self):
+        block = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBER"},
+            "title": "spec.pdf",
+        }
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        assert _user_content_parts(result)[0] == {
+            "type": "input_file",
+            "filename": "spec.pdf",
+            "file_data": "data:application/pdf;base64,JVBER",
+        }
+
+    def test_document_without_title_uses_default_filename(self):
+        # input_file requires a filename; a titleless document falls back to document.pdf.
+        block = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBER"},
+        }
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        assert _user_content_parts(result)[0]["filename"] == "document.pdf"
+
+    def test_url_document_becomes_input_file_with_url(self):
+        block = {"type": "document", "source": {"type": "url", "url": "https://example.com/d.pdf"}}
+        result, _ = anthropic_to_openai(_user_media_request(block), _FULL_MEDIA_CAPABILITIES)
+        assert _user_content_parts(result)[0] == {
+            "type": "input_file",
+            "file_url": "https://example.com/d.pdf",
+        }
+
+    def test_image_modality_absent_degrades_without_leaking_base64(self):
+        # Default text-only capabilities: the image must NOT be forwarded. The
+        # placeholder is text, a warning is raised, and the base64 payload must not
+        # appear anywhere in the request body.
+        block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "SECRETBASE64"},
+        }
+        result, warnings = anthropic_to_openai(_user_media_request(block))
+        part = _user_content_parts(result)[0]
+        assert part["type"] == "input_text"
+        assert "SECRETBASE64" not in json.dumps(result)
+        assert any("image" in w for w in warnings)
+
+    def test_unsupported_image_mime_degrades_without_leaking_base64(self):
+        # image/svg+xml is outside the Responses input_image allowlist → degrade
+        # rather than forward bytes the backend would reject; never echo the payload.
+        block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/svg+xml", "data": "SECRETSVG"},
+        }
+        result, warnings = anthropic_to_openai(
+            _user_media_request(block), _FULL_MEDIA_CAPABILITIES
+        )
+        part = _user_content_parts(result)[0]
+        assert part["type"] == "input_text"
+        assert "SECRETSVG" not in json.dumps(result)
+        assert any("image" in w for w in warnings)
+
+    def test_media_blocks_preserve_surrounding_text_order(self):
+        # Ordering oracle: text, image, text must stay in declared order.
+        result, _ = anthropic_to_openai(
+            _user_media_request(
+                {"type": "text", "text": "before"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                },
+                {"type": "text", "text": "after"},
+            ),
+            _FULL_MEDIA_CAPABILITIES,
+        )
+        parts = _user_content_parts(result)
+        assert [p["type"] for p in parts] == ["input_text", "input_image", "input_text"]
+        assert parts[0]["text"] == "before"
+        assert parts[2]["text"] == "after"
+
+
+# ---------------------------------------------------------------------------
 # tool_use / tool_result translation
 # ---------------------------------------------------------------------------
 
@@ -257,7 +390,8 @@ class TestToolUseContract:
         outputs = [i for i in result["input"] if i.get("type") == "function_call_output"]
         assert len(outputs) == 1
         assert outputs[0]["call_id"] == "fc_9"
-        # Spec: function_call_output.output is always a string, never null.
+        # Spec: function_call_output.output is str | list[dict]; a text-only result
+        # stays a plain string (never null, no array) — see TestToolResultMediaContract.
         assert outputs[0]["output"] == "hello"
         assert isinstance(outputs[0]["output"], str)
 
@@ -283,6 +417,114 @@ class TestToolUseContract:
         # An error result must be distinguishable from a success result carrying
         # the same text — otherwise the model cannot tell the tool failed.
         assert output["output"] == "[Error] boom"
+
+
+def _function_call_output(result: dict) -> dict:
+    """Return the single top-level function_call_output item."""
+    outputs = [i for i in result["input"] if i.get("type") == "function_call_output"]
+    assert len(outputs) == 1
+    return outputs[0]
+
+
+class TestToolResultMediaContract:
+    """tool_result media → ``function_call_output.output`` is ``str | list[dict]``.
+
+    Deterministic rule: an array of content parts is emitted ONLY when the content
+    carries media AND the provider declares ``supports_tool_output_content_parts``.
+    Otherwise the output stays a string; media in a string-only backend is redacted
+    (never base64). Oracles derive from the Responses spec and the redaction contract.
+    """
+
+    _IMAGE_B64 = "iVBORw0KGgo="
+
+    def _tool_result_request(self, *content_blocks: dict, is_error: bool = False) -> dict:
+        block: dict = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_9",
+            "content": list(content_blocks),
+        }
+        if is_error:
+            block["is_error"] = True
+        return _user_media_request(block)
+
+    def test_tool_result_emits_array_function_call_output_when_capable(self):
+        """text+image content with capability → output is an array of real parts.
+
+        Oracle: Responses ``function_call_output.output`` accepts an array of
+        ``input_text``/``input_image`` parts; the image is an ``input_image`` data URL
+        (RFC 2397). The model can only *see* the screenshot in this part form.
+        """
+        request = self._tool_result_request(
+            {"type": "text", "text": "Screenshot captured"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": self._IMAGE_B64},
+            },
+        )
+        result, _ = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        output = _function_call_output(result)["output"]
+        assert isinstance(output, list)
+        assert output[0] == {"type": "input_text", "text": "Screenshot captured"}
+        assert output[1] == {
+            "type": "input_image",
+            "image_url": f"data:image/png;base64,{self._IMAGE_B64}",
+        }
+        # The buggy stringification ("[image: data:...]") must be gone.
+        assert all(isinstance(part, dict) for part in output)
+
+    def test_tool_result_text_only_stays_string_even_when_capable(self):
+        """Text-only tool result stays a plain string even when arrays are supported.
+
+        Oracle: the deterministic rule requires media to be PRESENT before switching to
+        an array — a text-only result has the same consumer-visible string shape it
+        always had, protecting backends/consumers that read ``output`` as a string.
+        """
+        request = self._tool_result_request({"type": "text", "text": "plain result"})
+        result, _ = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        output = _function_call_output(result)["output"]
+        assert output == "plain result"
+        assert isinstance(output, str)
+
+    def test_tool_result_media_redacted_to_string_without_capability(self):
+        """Without array capability, a tool_result image degrades to a redacted string.
+
+        Oracle: redaction contract — the base64 payload must NOT reach the provider
+        request, and the placeholder names only the safe kind/media_type.
+        """
+        request = self._tool_result_request(
+            {"type": "text", "text": "Screenshot captured"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": self._IMAGE_B64},
+            },
+        )
+        # Default capabilities: supports_tool_output_content_parts is False.
+        result, _ = anthropic_to_openai(request)
+        output = _function_call_output(result)["output"]
+        assert isinstance(output, str)
+        assert self._IMAGE_B64 not in output
+        assert self._IMAGE_B64 not in json.dumps(result)
+        assert "Screenshot captured" in output
+        assert "[media omitted: image/image/png" in output
+
+    def test_tool_result_error_array_prepends_error_marker(self):
+        """An error tool_result in array form is prefixed with an error marker part.
+
+        Oracle: an error result must be distinguishable from a success result carrying
+        the same parts — the marker is a leading ``input_text`` part.
+        """
+        request = self._tool_result_request(
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": self._IMAGE_B64},
+            },
+            is_error=True,
+        )
+        result, _ = anthropic_to_openai(request, _FULL_MEDIA_CAPABILITIES)
+        output = _function_call_output(result)["output"]
+        assert isinstance(output, list)
+        assert output[0] == {"type": "input_text", "text": "[Error]"}
+        assert output[1]["type"] == "input_image"
 
 
 class TestToolIdRoundTrip:

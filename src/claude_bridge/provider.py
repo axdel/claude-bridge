@@ -21,32 +21,46 @@ from typing import Literal, Protocol, runtime_checkable
 
 StreamRequestMode = Literal["body_parameter", "url"]
 SyncResponseMode = Literal["json", "sse"]
+InputModality = Literal["text", "image", "document"]
 _STREAM_REQUEST_MODES = frozenset({"body_parameter", "url"})
 _SYNC_RESPONSE_MODES = frozenset({"json", "sse"})
+_INPUT_MODALITIES: frozenset[InputModality] = frozenset({"text", "image", "document"})
 
 
 @dataclass(frozen=True)
 class ProviderCapabilities:
-    """Provider-declared transport and accounting behavior for proxy orchestration.
+    """Provider-declared transport, input-content, and accounting behavior.
 
     ``stream_request_mode`` declares whether streaming is selected by request body
     or endpoint URL. ``sync_response_mode`` declares the response format returned
-    for non-streaming client requests. ``token_count_multiplier`` lets providers
-    tune reported usage totals for local compatibility without changing provider
-    wire parsing.
+    for non-streaming client requests. ``input_modalities`` declares which content
+    kinds the provider can forward (text always; image/document when supported),
+    and ``supports_tool_output_content_parts`` declares whether tool results may
+    carry a content-part array rather than a flattened string. The mapper consults
+    these to decide forward-vs-degrade per provider without runtime guessing; both
+    input fields default to the conservative pre-feature behavior (text-only,
+    string tool output) so existing providers are unaffected. ``token_count_multiplier``
+    lets providers tune reported usage totals for local compatibility without changing
+    provider wire parsing.
     """
 
     stream_request_mode: StreamRequestMode
     sync_response_mode: SyncResponseMode
+    input_modalities: frozenset[InputModality] = frozenset({"text"})
+    supports_tool_output_content_parts: bool = False
     token_count_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
-        """Validate mode and accounting values at runtime for dynamic providers."""
+        """Validate mode, modality, and accounting values for dynamically authored providers."""
         if self.stream_request_mode not in _STREAM_REQUEST_MODES:
             msg = f"Unknown stream_request_mode: {self.stream_request_mode!r}"
             raise ValueError(msg)
         if self.sync_response_mode not in _SYNC_RESPONSE_MODES:
             msg = f"Unknown sync_response_mode: {self.sync_response_mode!r}"
+            raise ValueError(msg)
+        unknown_modalities = self.input_modalities - _INPUT_MODALITIES
+        if unknown_modalities:
+            msg = f"Unknown input modalities: {sorted(unknown_modalities)!r}"
             raise ValueError(msg)
         if self.token_count_multiplier <= 0:
             msg = f"Invalid token_count_multiplier: {self.token_count_multiplier!r}"

@@ -10,6 +10,7 @@ marker in every content-bearing field; no marker may survive into any output.
 
 from __future__ import annotations
 
+import base64
 import json
 
 # Every marker is planted in a content-bearing position of the fixtures below.
@@ -242,6 +243,109 @@ class TestSummarizeProviderRequest:
         summary = _summarize_provider_request(translated, [])
         assert summary["input_items"] == 2
         assert "SECRET_REASONING" not in json.dumps(summary)
+
+
+class TestMediaTraceSummary:
+    """Media blocks are summarized in the inbound trace as {kind, media_type,
+    approx_bytes} — structural metadata only. The base64 payload never appears,
+    and _summarize_provider_request never echoes a translated data-URL part."""
+
+    def test_inbound_media_summarized_as_kind_type_bytes(self):
+        from claude_bridge.proxy import _summarize_anthropic_request
+
+        # 404-byte payload (b"\x89PNG" + 400 zero bytes); approx_bytes recovers it.
+        img_b64 = base64.b64encode(b"\x89PNG" + b"\x00" * 400).decode()
+        request = {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": img_b64,
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+        summary = _summarize_anthropic_request(request)
+        media = summary["media"]
+        assert len(media) == 1
+        assert media[0]["kind"] == "image"
+        assert media[0]["media_type"] == "image/png"
+        assert abs(media[0]["approx_bytes"] - 404) <= 2  # recovers the 404-byte payload
+        assert img_b64 not in json.dumps(summary)
+
+    def test_tool_result_nested_media_is_summarized(self):
+        from claude_bridge.proxy import _summarize_anthropic_request
+
+        pdf_b64 = base64.b64encode(b"%PDF-1.4" + b"\x00" * 800).decode()
+        request = {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": [
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": pdf_b64,
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        summary = _summarize_anthropic_request(request)
+        kinds = [(m["kind"], m["media_type"]) for m in summary["media"]]
+        assert ("document", "application/pdf") in kinds
+        assert pdf_b64 not in json.dumps(summary)
+
+    def test_no_media_yields_empty_media_list(self):
+        from claude_bridge.proxy import _summarize_anthropic_request
+
+        summary = _summarize_anthropic_request(
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert summary["media"] == []
+
+    def test_provider_request_summary_never_echoes_base64_dataurl(self):
+        # _summarize_provider_request must not serialize translated input content —
+        # even a real input_image data-URL part stays out of the trace.
+        from claude_bridge.proxy import _summarize_provider_request
+
+        img_b64 = base64.b64encode(b"\x89PNG" + b"\x00" * 400).decode()
+        translated = {
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "look"},
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{img_b64}"},
+                    ],
+                }
+            ],
+        }
+        summary = _summarize_provider_request(translated, [])
+        blob = json.dumps(summary)
+        assert img_b64 not in blob
+        assert "data:image/png;base64" not in blob
+        assert summary["input_items"] == 1
 
 
 class TestSummarizeAnthropicResponse:
