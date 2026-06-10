@@ -115,7 +115,7 @@ class TestOpenAIToAnthropicSSETranslation:
         msg = results[0]["data"]["message"]
         assert msg["id"].startswith("msg_bridge_")
         assert msg["role"] == "assistant"
-        assert msg["usage"]["input_tokens"] == 42
+        assert msg["usage"]["input_tokens"] == 50
         assert msg["usage"]["output_tokens"] == 0
 
     def test_response_created_usage_coerced_to_int(self):
@@ -138,7 +138,7 @@ class TestOpenAIToAnthropicSSETranslation:
         }
         results = translate_openai_sse_event(event)
         usage = results[0]["data"]["message"]["usage"]
-        assert usage["input_tokens"] == 42
+        assert usage["input_tokens"] == 50
         assert isinstance(usage["input_tokens"], int)
 
     def test_content_part_added_emits_content_block_start(self):
@@ -216,7 +216,7 @@ class TestOpenAIToAnthropicSSETranslation:
         # First: message_delta with stop_reason + usage
         assert results[0]["event"] == "message_delta"
         assert results[0]["data"]["delta"]["stop_reason"] == "end_turn"
-        assert results[0]["data"]["usage"]["output_tokens"] == 25
+        assert results[0]["data"]["usage"] == {"input_tokens": 12, "output_tokens": 30}
 
         # Second: message_stop
         assert results[1]["event"] == "message_stop"
@@ -350,8 +350,8 @@ class TestOpenAIToAnthropicSSETranslation:
         results = translate_openai_sse_event(event)
         message_delta = next(r for r in results if r["event"] == "message_delta")
         usage = message_delta["data"]["usage"]
-        assert usage["input_tokens"] == 10
-        assert usage["output_tokens"] == 25
+        assert usage["input_tokens"] == 12
+        assert usage["output_tokens"] == 30
         assert isinstance(usage["input_tokens"], int)
         assert isinstance(usage["output_tokens"], int)
 

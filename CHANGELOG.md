@@ -4,6 +4,11 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-06-10
 
+### fix: add OpenAI token count multiplier ([PR #12](https://github.com/axdel/claude-bridge/pull/12))
+Provider-declared token_count_multiplier (additive ProviderCapabilities field, neutral 1.0 default) scales reported usage totals; OpenAI/GPT set to 1.2 to tune Claude Code auto-compact for GPT-5.5 token-count divergence, applied at the capability boundary over the D-USAGE-001 flat mapping.
+
+- [`e6a83c0`](https://github.com/axdel/claude-bridge/commit/e6a83c0) Add OpenAI token count multiplier
+
 ### fix: single-pass token estimation ([PR #11](https://github.com/axdel/claude-bridge/pull/11))
 Fold the oversized-media scan into the single token-estimation walk; behavior byte-identical (differential-verified). Resolves SCL-001.
 

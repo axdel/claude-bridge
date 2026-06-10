@@ -29,7 +29,7 @@ _INPUT_MODALITIES: frozenset[InputModality] = frozenset({"text", "image", "docum
 
 @dataclass(frozen=True)
 class ProviderCapabilities:
-    """Provider-declared transport and input-content behavior for orchestration.
+    """Provider-declared transport, input-content, and accounting behavior.
 
     ``stream_request_mode`` declares whether streaming is selected by request body
     or endpoint URL. ``sync_response_mode`` declares the response format returned
@@ -39,16 +39,19 @@ class ProviderCapabilities:
     carry a content-part array rather than a flattened string. The mapper consults
     these to decide forward-vs-degrade per provider without runtime guessing; both
     input fields default to the conservative pre-feature behavior (text-only,
-    string tool output) so existing providers are unaffected.
+    string tool output) so existing providers are unaffected. ``token_count_multiplier``
+    lets providers tune reported usage totals for local compatibility without changing
+    provider wire parsing.
     """
 
     stream_request_mode: StreamRequestMode
     sync_response_mode: SyncResponseMode
     input_modalities: frozenset[InputModality] = frozenset({"text"})
     supports_tool_output_content_parts: bool = False
+    token_count_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
-        """Validate mode and modality values at runtime for dynamically authored providers."""
+        """Validate mode, modality, and accounting values for dynamically authored providers."""
         if self.stream_request_mode not in _STREAM_REQUEST_MODES:
             msg = f"Unknown stream_request_mode: {self.stream_request_mode!r}"
             raise ValueError(msg)
@@ -58,6 +61,9 @@ class ProviderCapabilities:
         unknown_modalities = self.input_modalities - _INPUT_MODALITIES
         if unknown_modalities:
             msg = f"Unknown input modalities: {sorted(unknown_modalities)!r}"
+            raise ValueError(msg)
+        if self.token_count_multiplier <= 0:
+            msg = f"Invalid token_count_multiplier: {self.token_count_multiplier!r}"
             raise ValueError(msg)
 
 
