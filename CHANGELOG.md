@@ -2,6 +2,13 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-06-10
+
+### fix: single-pass token estimation ([PR #11](https://github.com/axdel/claude-bridge/pull/11))
+Fold the oversized-media scan into the single token-estimation walk; behavior byte-identical (differential-verified). Resolves SCL-001.
+
+- [`064d098`](https://github.com/axdel/claude-bridge/commit/064d098) Single-pass token estimation, drop oversized media re-walk
+
 ## 2026-06-09
 
 ### feat: systemic non-text content translation ([PR #10](https://github.com/axdel/claude-bridge/pull/10))
