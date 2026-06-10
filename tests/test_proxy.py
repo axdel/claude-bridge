@@ -1030,13 +1030,16 @@ class TestMediaAwareTokenEstimation:
         assert estimate_input_tokens({"messages": [_user("hi")]}) == 9
 
     def test_oversized_media_is_flagged_above_threshold(self):
-        # Oracle: the documented oversized threshold is 5 MiB decoded. A 6 MiB image
-        # is flagged; a 1 MiB image is not.
+        # Oracle: the documented oversized threshold is 5 MiB decoded. _oversized_media
+        # is a pure filter over media descriptors, so the descriptor's approx_bytes is
+        # the hand-built oracle — 6 MiB is flagged, 1 MiB is not.
         oversized = _oversized_media(
-            {"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]}
+            [{"kind": "image", "media_type": "image/png", "approx_bytes": 6 * 1024 * 1024}]
         )
         assert [d["kind"] for d in oversized] == ["image"]
-        under = _oversized_media({"messages": [_user([_image_block(_b64_of_size(1024 * 1024))])]})
+        under = _oversized_media(
+            [{"kind": "image", "media_type": "image/png", "approx_bytes": 1024 * 1024}]
+        )
         assert under == []
 
     def test_oversized_media_emits_a_warning(self):
