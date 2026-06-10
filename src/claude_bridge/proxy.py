@@ -267,63 +267,55 @@ def _iter_media_blocks(content: object) -> Iterator[dict]:
             yield from _iter_media_blocks(block.get("content"))
 
 
-def _request_media_descriptors(request: dict) -> list[dict]:
-    """Structural descriptors for every media block across all messages."""
-    descriptors: list[dict] = []
-    for message in request.get("messages", []):
-        if isinstance(message, dict):
-            descriptors.extend(
-                _media_descriptor(block) for block in _iter_media_blocks(message.get("content"))
-            )
-    return descriptors
+def _oversized_media(descriptors: list[dict]) -> list[dict]:
+    """Descriptors whose decoded payload exceeds ``_OVERSIZED_MEDIA_BYTES``."""
+    return [d for d in descriptors if d["approx_bytes"] > _OVERSIZED_MEDIA_BYTES]
 
 
-def _oversized_media(request: dict) -> list[dict]:
-    """Media descriptors whose decoded payload exceeds ``_OVERSIZED_MEDIA_BYTES``."""
-    return [
-        d
-        for d in _request_media_descriptors(request)
-        if d["approx_bytes"] > _OVERSIZED_MEDIA_BYTES
-    ]
+def _content_token_units(content: object) -> tuple[int, int, list[dict]]:
+    """Return ``(text_bytes, media_tokens, media_descriptors)`` for a content value.
 
-
-def _content_token_units(content: object) -> tuple[int, int]:
-    """Return ``(text_bytes, media_tokens)`` for a content value.
-
-    Image/document blocks contribute a flat per-modality token budget; tool_result
-    content is walked so nested media is budgeted identically; every other block is
+    Image/document blocks contribute a flat per-modality token budget AND a
+    structural descriptor (surfaced from this single walk so the caller need not
+    re-traverse for the oversized-media scan); tool_result content is walked so
+    nested media is budgeted and described identically; every other block is
     counted by JSON byte size, matching the pre-media estimate.
     """
     if not isinstance(content, list):
-        return len(json.dumps(content).encode()), 0
+        return len(json.dumps(content).encode()), 0, []
     text_bytes = 0
     media_tokens = 0
+    descriptors: list[dict] = []
     for block in content:
         block_type = block.get("type") if isinstance(block, dict) else None
         if block_type in _MEDIA_TOKEN_ESTIMATES:
             media_tokens += _MEDIA_TOKEN_ESTIMATES[block_type]
+            descriptors.append(_media_descriptor(block))
         elif block_type == "tool_result":
             wrapper = {k: v for k, v in block.items() if k != "content"}
-            nested_bytes, nested_media = _content_token_units(block.get("content"))
+            nested_bytes, nested_media, nested_descriptors = _content_token_units(
+                block.get("content")
+            )
             text_bytes += len(json.dumps(wrapper).encode()) + nested_bytes
             media_tokens += nested_media
+            descriptors.extend(nested_descriptors)
         else:
             text_bytes += len(json.dumps(block).encode())
-    return text_bytes, media_tokens
+    return text_bytes, media_tokens, descriptors
 
 
-def _message_token_units(message: object) -> tuple[int, int]:
-    """Return ``(text_bytes, media_tokens)`` for one message.
+def _message_token_units(message: object) -> tuple[int, int, list[dict]]:
+    """Return ``(text_bytes, media_tokens, media_descriptors)`` for one message.
 
     String/non-list content is counted whole, byte-identical to the pre-media
     estimate; list content has its media blocks budgeted flatly (see
     ``_content_token_units``) while the role wrapper is still counted by bytes.
     """
     if not isinstance(message, dict) or not isinstance(message.get("content"), list):
-        return len(json.dumps(message).encode()), 0
+        return len(json.dumps(message).encode()), 0, []
     wrapper = {k: v for k, v in message.items() if k != "content"}
-    text_bytes, media_tokens = _content_token_units(message["content"])
-    return len(json.dumps(wrapper).encode()) + text_bytes, media_tokens
+    text_bytes, media_tokens, descriptors = _content_token_units(message["content"])
+    return len(json.dumps(wrapper).encode()) + text_bytes, media_tokens, descriptors
 
 
 def estimate_input_tokens(request: dict) -> int:
@@ -341,17 +333,19 @@ def estimate_input_tokens(request: dict) -> int:
     """
     text_bytes = 0
     media_tokens = 0
+    media_descriptors: list[dict] = []
     system = request.get("system")
     if system is not None:
         text_bytes += len(json.dumps(system).encode())
     for message in request.get("messages", []):
-        message_bytes, message_media = _message_token_units(message)
+        message_bytes, message_media, message_descriptors = _message_token_units(message)
         text_bytes += message_bytes
         media_tokens += message_media
+        media_descriptors.extend(message_descriptors)
     tools = request.get("tools")
     if tools:
         text_bytes += len(json.dumps(tools).encode())
-    for descriptor in _oversized_media(request):
+    for descriptor in _oversized_media(media_descriptors):
         logger.warning(
             "Oversized %s media (~%d bytes) forwarded without a hard cap",
             descriptor["kind"],
