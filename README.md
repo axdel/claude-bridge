@@ -376,19 +376,32 @@ fixtures. Coverage is enforced at 80%.
 
 Mutation testing (dev-only — `pytest-gremlins`, never a runtime dependency)
 checks that the tests actually constrain behavior rather than merely execute it.
-Always scope it to the source files you changed; an unscoped run mutates the
-whole tree — slower, and noisy with unrelated survivors:
+Run it through the wrapper script, which encodes the correct invocation and
+scopes to your changed source files by default (an unscoped run mutates the
+whole tree — slower, and noisy with unrelated survivors):
 
 ```bash
-CHANGED=$(git diff --name-only HEAD -- '*.py' | rg -v '(^|/)tests?/' | paste -sd, -)
+scripts/mutate.sh                       # mutate changed source vs HEAD
+scripts/mutate.sh tests/test_stream.py  # narrow the kill-test universe (faster)
+scripts/mutate.sh --all                 # full-tree sweep (scheduled)
+```
+
+The script runs:
+
+```bash
 uv run pytest --no-cov --gremlins \
   --gremlin-targets="$CHANGED" --gremlin-no-coverage-filter \
   --gremlin-parallel --gremlin-cache
 ```
 
-`--gremlin-no-coverage-filter` is required: without it, gremlins consults a coverage
-map that does not yet include freshly added lines and reports them as false survivors.
-Disabling the filter runs the full selected test set per mutant — accurate, slightly slower.
+`--gremlin-no-coverage-filter` is mandatory. Without it, gremlins' coverage-guided
+selection builds a degenerate line→test map — on this Python 3.14 environment each
+mutated line resolves to a single covering test that rarely asserts the mutation,
+so mutants the suite actually kills are reported as false survivors (observed 50%
+where the true rate is 100%). The flag bypasses the map and runs the full test set
+per mutant: accurate, slower. (`--no-cov` only avoids redundant coverage overhead —
+it does *not* fix the selection; pyproject's addopts forces `--cov` on every pytest
+run.)
 
 Target: ≥85% kill rate on changed source files (zero survivors for auth code).
 
