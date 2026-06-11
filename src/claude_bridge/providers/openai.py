@@ -16,7 +16,7 @@ import claude_bridge.config as config
 from claude_bridge.auth import is_token_expired
 from claude_bridge.content import MediaSource, parse_media_source
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
-from claude_bridge.stream import parse_sse_events
+from claude_bridge.stream import iter_sse_event_blobs, parse_sse_events
 
 _CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 _TOKEN_URL = "https://auth.openai.com/oauth/token"  # noqa: S105  # nosec B105
@@ -946,11 +946,15 @@ def _synthesize_refusal_block(text: str) -> list[dict]:
     ]
 
 
-def _sse_response_completed(data: dict, *, token_count_multiplier: float) -> list[dict]:
-    """Translate response.completed → [refusal block?] + message_delta + message_stop.
+def _sse_terminal_response(data: dict, *, token_count_multiplier: float) -> list[dict]:
+    """Translate a terminal Responses event (``response.completed`` /
+    ``response.incomplete``) → [refusal block?] + message_delta + message_stop.
 
-    A content-filtered turn is prefixed with a synthesized refusal text block and ends
-    with ``end_turn``; any other ``incomplete`` maps to ``max_tokens``.
+    Both terminal event types carry a ``response`` object whose ``status`` and
+    ``incomplete_details`` drive the stop_reason: ``completed`` → ``end_turn``
+    (or ``tool_use`` when tool calls were emitted); ``incomplete`` →
+    ``max_tokens`` unless the reason is ``content_filter``, which ends the turn
+    cleanly (``end_turn``) and is prefixed with a synthesized refusal text block.
     """
     resp = data.get("response", {})
     status = resp.get("status", "completed")
@@ -976,6 +980,75 @@ def _sse_response_completed(data: dict, *, token_count_multiplier: float) -> lis
     )
     events.append({"event": "message_stop", "data": {"type": "message_stop"}})
     return events
+
+
+# Upper bound on a provider-controlled error message surfaced in an Anthropic error
+# event. json.dumps escapes control characters on the wire, so this only guards
+# against a hostile/huge message bloating the stream — not log injection.
+_ERROR_MESSAGE_MAX = 500
+
+
+def _sse_error_event(message: str) -> list[dict]:
+    """Build an Anthropic ``error`` SSE event that terminates the stream.
+
+    A failed or errored upstream response is an API error, not assistant output;
+    the Anthropic streaming protocol ends a stream with an ``error`` event rather
+    than a ``message_stop``. The provider-controlled message is length-bounded.
+    """
+    text = (message or "Provider stream error").strip()[:_ERROR_MESSAGE_MAX]
+    return [
+        {
+            "event": "error",
+            "data": {"type": "error", "error": {"type": "api_error", "message": text}},
+        }
+    ]
+
+
+def _sse_response_failed(data: dict) -> list[dict]:
+    """Translate a ``response.failed`` event to an Anthropic error event.
+
+    The ``response.error`` object carries a ``code`` (``server_error``,
+    ``rate_limit_exceeded``, ...) and a human-readable ``message``.
+    """
+    resp = data.get("response")
+    resp = resp if isinstance(resp, dict) else {}
+    error = resp.get("error")
+    error = error if isinstance(error, dict) else {}
+    message = error.get("message") or error.get("code") or "Provider response failed"
+    return _sse_error_event(message)
+
+
+def _sse_top_level_error(data: dict) -> list[dict]:
+    """Translate a bare top-level Responses ``error`` stream event (emitted on a
+    mid-stream server failure) to an Anthropic error event."""
+    error = data.get("error")
+    error = error if isinstance(error, dict) else {}
+    message = data.get("message") or error.get("message") or data.get("code")
+    return _sse_error_event(message or "Provider stream error")
+
+
+def _sse_synthetic_termination(has_tool_calls: bool) -> list[dict]:
+    """Build the message_delta + message_stop for a stream that emitted a
+    message_start but never received a terminal event (e.g. a dropped upstream
+    connection).
+
+    stop_reason is ``tool_use`` when tool calls were already emitted (Claude Code
+    must run them), else ``end_turn`` — a clean stop that does NOT masquerade as
+    token exhaustion and trigger an auto-compact retry loop. Usage is reported as
+    zero output tokens since the true terminal usage never arrived.
+    """
+    stop_reason = "tool_use" if has_tool_calls else "end_turn"
+    return [
+        {
+            "event": "message_delta",
+            "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason},
+                "usage": {"output_tokens": 0},
+            },
+        },
+        {"event": "message_stop", "data": {"type": "message_stop"}},
+    ]
 
 
 # Events that are informational — no Anthropic equivalent.
@@ -1061,8 +1134,14 @@ def translate_openai_sse_event(
             }
         ]
 
-    if event_type == "response.completed":
-        return _sse_response_completed(data, token_count_multiplier=token_count_multiplier)
+    if event_type in ("response.completed", "response.incomplete"):
+        return _sse_terminal_response(data, token_count_multiplier=token_count_multiplier)
+
+    if event_type == "response.failed":
+        return _sse_response_failed(data)
+
+    if event_type == "error":
+        return _sse_top_level_error(data)
 
     if event_type in _SKIPPED_SSE_EVENTS:
         return []
@@ -1222,8 +1301,14 @@ class OpenAIProvider:
         )
 
     def _capture_stream_reasoning(self, parsed_event: dict) -> None:
-        """Capture encrypted reasoning from a streamed response.completed event."""
-        if parsed_event.get("event") != "response.completed":
+        """Capture encrypted reasoning from a streamed terminal event.
+
+        Both ``response.completed`` and ``response.incomplete`` carry the output
+        array (including reasoning items with ``encrypted_content``); an
+        incomplete turn that still emitted a function_call needs its reasoning
+        stashed too, or the next request's tool echo is rejected (D-REASON-001).
+        """
+        if parsed_event.get("event") not in ("response.completed", "response.incomplete"):
             return
         response_obj = (parsed_event.get("data") or {}).get("response") or {}
         self._stash_reasoning(_associate_reasoning_with_calls(response_obj.get("output", [])))
@@ -1232,38 +1317,26 @@ class OpenAIProvider:
         """Translate raw provider byte chunks to Anthropic SSE events.
 
         Maintains a block index counter so Anthropic indices are sequential
-        starting at 0 (OpenAI output_index may have gaps from skipped items).
-        Also fixes stop_reason based on whether tool calls were emitted.
+        starting at 0 (OpenAI output_index may have gaps from skipped items) and
+        fixes stop_reason based on whether tool calls were emitted.
+
+        Termination invariant: a stream that emits ``message_start`` is always
+        closed by a terminator — a ``message_stop`` (success/incomplete) or an
+        ``error`` event (failure). If the upstream drops without any terminal
+        event, a ``message_stop`` is synthesized so Claude Code finalizes the
+        turn instead of hanging.
         """
-        buffer = b""
         block_index = 0
         index_map: dict[int, int] = {}
         has_tool_calls = False
+        started = False
+        terminated = False
 
-        async for chunk in raw_chunks:
-            buffer += chunk
-            buffer = buffer.replace(b"\r\n", b"\n")
-            while b"\n\n" in buffer:
-                event_end = buffer.index(b"\n\n") + 2
-                event_bytes = buffer[:event_end]
-                buffer = buffer[event_end:]
-                for parsed_event in parse_sse_events(event_bytes):
-                    self._capture_stream_reasoning(parsed_event)
-                    for translated in translate_openai_sse_event(
-                        parsed_event,
-                        token_count_multiplier=self.capabilities.token_count_multiplier,
-                    ):
-                        translated, block_index, has_tool_calls = _remap_block_index(
-                            translated, index_map, block_index, has_tool_calls
-                        )
-                        yield translated
-            if len(buffer) > _MAX_SSE_BUFFER:
-                raise RuntimeError(
-                    f"Provider SSE stream exceeded {_MAX_SSE_BUFFER} bytes without an "
-                    "event terminator; aborting malformed stream"
-                )
-        if buffer.strip():
-            for parsed_event in parse_sse_events(buffer):
+        def _emit(event_bytes: bytes) -> list[dict]:
+            """Translate one SSE blob, threading block-index and lifecycle state."""
+            nonlocal block_index, has_tool_calls, started, terminated
+            out: list[dict] = []
+            for parsed_event in parse_sse_events(event_bytes):
                 self._capture_stream_reasoning(parsed_event)
                 for translated in translate_openai_sse_event(
                     parsed_event,
@@ -1272,7 +1345,21 @@ class OpenAIProvider:
                     translated, block_index, has_tool_calls = _remap_block_index(
                         translated, index_map, block_index, has_tool_calls
                     )
-                    yield translated
+                    name = translated.get("event")
+                    if name == "message_start":
+                        started = True
+                    elif name in ("message_stop", "error"):
+                        terminated = True
+                    out.append(translated)
+            return out
+
+        async for event_bytes in iter_sse_event_blobs(raw_chunks, max_buffer=_MAX_SSE_BUFFER):
+            for translated in _emit(event_bytes):
+                yield translated
+
+        if started and not terminated:
+            for translated in _sse_synthetic_termination(has_tool_calls):
+                yield translated
 
 
 PROVIDERS["openai"] = OpenAIProvider

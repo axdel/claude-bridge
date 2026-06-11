@@ -362,3 +362,26 @@ class TestReasoningContinuity:
         preceding = _reasoning_before(translated["input"], "fc_s")
         assert preceding is not None
         assert preceding.get("encrypted_content") == "ENC_STREAM"
+
+    def test_streaming_incomplete_event_captures_reasoning(self):
+        # A turn truncated by max_output_tokens (response.incomplete) can still have
+        # emitted a function_call; its preceding encrypted reasoning must be stashed,
+        # or the next request's tool echo is rejected (D-REASON-001). The capture set
+        # must include response.incomplete, not only response.completed.
+        import asyncio
+
+        provider = _provider()
+        incomplete_response = _response_with(
+            [_reasoning_item("rs_inc", "ENC_INCOMPLETE"), _function_call_item("fc_inc")]
+        )
+        incomplete_response["status"] = "incomplete"
+        incomplete_response["incomplete_details"] = {"reason": "max_output_tokens"}
+        stream = _sse(
+            "response.incomplete",
+            {"type": "response.incomplete", "response": incomplete_response},
+        )
+        asyncio.run(_collect_stream(provider, stream))
+        translated, _ = provider.translate_request(_tool_turn_request("toolu_inc"))
+        preceding = _reasoning_before(translated["input"], "fc_inc")
+        assert preceding is not None
+        assert preceding.get("encrypted_content") == "ENC_INCOMPLETE"

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import claude_bridge.config as config
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
+from claude_bridge.stream import iter_sse_event_blobs
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal"
@@ -866,19 +867,9 @@ class GeminiProvider:
         Gemini SSE format: ``data: <json>\\n\\n`` with complete JSON per chunk.
         No typed event names, no ``[DONE]`` sentinel.
         """
-        buffer = b""
         state: dict = {}
-        async for chunk in raw_chunks:
-            buffer += chunk
-            buffer = buffer.replace(b"\r\n", b"\n")
-            while b"\n\n" in buffer:
-                event_end = buffer.index(b"\n\n") + 2
-                event_bytes = buffer[:event_end]
-                buffer = buffer[event_end:]
-                for event in _parse_sse_data(event_bytes, state):
-                    yield event
-        if buffer.strip():
-            for event in _parse_sse_data(buffer, state):
+        async for event_bytes in iter_sse_event_blobs(raw_chunks):
+            for event in _parse_sse_data(event_bytes, state):
                 yield event
 
 

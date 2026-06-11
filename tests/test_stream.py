@@ -6,7 +6,11 @@ import json
 
 import pytest
 
-from claude_bridge.stream import format_anthropic_sse, parse_sse_events
+from claude_bridge.stream import (
+    format_anthropic_sse,
+    iter_sse_event_blobs,
+    parse_sse_events,
+)
 
 # ---------------------------------------------------------------------------
 # parse_sse_events
@@ -232,103 +236,6 @@ class TestOpenAIToAnthropicSSETranslation:
         results = translate_openai_sse_event(event)
         assert results == []
 
-    def test_incomplete_status_maps_to_max_tokens(self):
-        from claude_bridge.providers.openai import translate_openai_sse_event
-
-        event = {
-            "event": "response.completed",
-            "data": {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_789",
-                    "model": "gpt-5.5",
-                    "status": "incomplete",
-                    "usage": {"input_tokens": 5, "output_tokens": 100},
-                },
-            },
-        }
-        results = translate_openai_sse_event(event)
-        assert results[0]["data"]["delta"]["stop_reason"] == "max_tokens"
-
-    def test_completed_max_output_tokens_maps_to_max_tokens(self):
-        # incomplete_details.reason == "max_output_tokens" is the genuine
-        # token-budget exhaustion signal — must surface as max_tokens.
-        from claude_bridge.providers.openai import translate_openai_sse_event
-
-        event = {
-            "event": "response.completed",
-            "data": {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_mot",
-                    "model": "gpt-5.5",
-                    "status": "incomplete",
-                    "incomplete_details": {"reason": "max_output_tokens"},
-                    "usage": {"input_tokens": 5, "output_tokens": 100},
-                },
-            },
-        }
-        results = translate_openai_sse_event(event)
-        message_delta = next(r for r in results if r["event"] == "message_delta")
-        assert message_delta["data"]["delta"]["stop_reason"] == "max_tokens"
-
-    def test_completed_content_filter_maps_to_end_turn_not_max_tokens(self):
-        # A content-filtered completion is NOT budget exhaustion. Mapping it to
-        # max_tokens makes Claude Code's auto-compact think it ran out of room and
-        # retry forever. content_filter must terminate the turn cleanly (end_turn).
-        from claude_bridge.providers.openai import translate_openai_sse_event
-
-        event = {
-            "event": "response.completed",
-            "data": {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_cf",
-                    "model": "gpt-5.5",
-                    "status": "incomplete",
-                    "incomplete_details": {"reason": "content_filter"},
-                    "usage": {"input_tokens": 5, "output_tokens": 3},
-                },
-            },
-        }
-        results = translate_openai_sse_event(event)
-        message_delta = next(r for r in results if r["event"] == "message_delta")
-        assert message_delta["data"]["delta"]["stop_reason"] == "end_turn"
-
-    def test_completed_content_filter_synthesizes_refusal_block(self):
-        # A bare end_turn with empty content would render as a blank assistant
-        # turn in Claude Code. Synthesize a visible refusal text block so the
-        # user learns why the turn stopped — mirrors the Gemini SAFETY path.
-        from claude_bridge.providers.openai import translate_openai_sse_event
-
-        event = {
-            "event": "response.completed",
-            "data": {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_cf2",
-                    "model": "gpt-5.5",
-                    "status": "incomplete",
-                    "incomplete_details": {"reason": "content_filter"},
-                    "usage": {"input_tokens": 5, "output_tokens": 0},
-                },
-            },
-        }
-        results = translate_openai_sse_event(event)
-        events = [r["event"] for r in results]
-        assert events == [
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "message_delta",
-            "message_stop",
-        ]
-        start = results[0]["data"]
-        assert start["content_block"] == {"type": "text", "text": ""}
-        delta = results[1]["data"]
-        assert delta["delta"]["type"] == "text_delta"
-        assert delta["delta"]["text"].strip() != ""
-
     def test_message_delta_usage_coerced_to_int(self):
         # Some providers emit float token counts. Anthropic usage fields are
         # integers — a float leaks the provider's wire format into Claude Code's
@@ -356,6 +263,154 @@ class TestOpenAIToAnthropicSSETranslation:
         assert isinstance(usage["output_tokens"], int)
 
 
+class TestTerminalStreamEvents:
+    """Every Responses terminal event type must produce an Anthropic stream
+    terminator.
+
+    Oracle: the OpenAI Responses streaming API ends a stream with ONE of four
+    distinct top-level event types — ``response.completed`` (success),
+    ``response.incomplete`` (``max_output_tokens``/``content_filter``),
+    ``response.failed`` (``server_error``/...), or a top-level ``error`` event.
+    A ``response.completed`` event always carries ``status: "completed"``; the
+    incomplete/failed states arrive under their OWN event type, never nested in
+    a completed event. Anthropic finalizes a turn only on ``message_stop`` (or an
+    ``error`` event terminating the stream). So each non-completed terminal event
+    must translate to a terminator — otherwise Claude Code halts mid-turn.
+    """
+
+    def test_response_incomplete_event_maps_to_max_tokens_and_stops(self):
+        # Real wire shape: event TYPE is response.incomplete (not a completed
+        # event with status nested inside). max_output_tokens → max_tokens.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.incomplete",
+            "data": {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_inc",
+                    "model": "gpt-5.5",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 5, "output_tokens": 100},
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        names = [r["event"] for r in results]
+        assert "message_stop" in names
+        message_delta = next(r for r in results if r["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "max_tokens"
+
+    def test_response_incomplete_content_filter_ends_turn_with_refusal(self):
+        # content_filter is NOT budget exhaustion → end_turn, plus a visible
+        # refusal block so the turn does not render blank.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.incomplete",
+            "data": {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_inc_cf",
+                    "model": "gpt-5.5",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "content_filter"},
+                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        # A bare end_turn with empty content would render as a blank assistant turn
+        # in Claude Code; a visible refusal text block must precede the terminator so
+        # the user learns why the turn stopped (mirrors the Gemini SAFETY path).
+        assert [r["event"] for r in results] == [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+        assert results[0]["data"]["content_block"] == {"type": "text", "text": ""}
+        refusal_delta = results[1]["data"]["delta"]
+        assert refusal_delta["type"] == "text_delta"
+        assert refusal_delta["text"].strip() != ""
+        message_delta = next(r for r in results if r["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "end_turn"
+
+    def test_response_incomplete_without_details_defaults_to_max_tokens(self):
+        # GPT-5 can emit status "incomplete" with null incomplete_details. The
+        # conservative oracle: absent a reason, treat it as token exhaustion
+        # (max_tokens) so Claude Code knows the turn was truncated, not clean.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.incomplete",
+            "data": {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_inc_nodetails",
+                    "model": "gpt-5.5",
+                    "status": "incomplete",
+                    "usage": {"input_tokens": 5, "output_tokens": 100},
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        names = [r["event"] for r in results]
+        assert "message_stop" in names
+        message_delta = next(r for r in results if r["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "max_tokens"
+
+    def test_response_failed_event_emits_error_terminator(self):
+        # A failed upstream response is an API error, not an assistant message —
+        # faithful translation is an Anthropic error event carrying the reason.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "response.failed",
+            "data": {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_fail",
+                    "status": "failed",
+                    "error": {
+                        "code": "server_error",
+                        "message": "The model failed to generate a response.",
+                    },
+                },
+            },
+        }
+        results = translate_openai_sse_event(event)
+        error_events = [r for r in results if r["event"] == "error"]
+        assert len(error_events) == 1
+        assert error_events[0]["data"]["type"] == "error"
+        # The SPECIFIC upstream reason must be surfaced verbatim (so the user learns
+        # WHY the turn failed) — not collapsed to a generic default.
+        assert error_events[0]["data"]["error"]["message"] == (
+            "The model failed to generate a response."
+        )
+
+    def test_top_level_error_event_emits_error_terminator(self):
+        # The Responses stream can emit a bare top-level ``error`` event on a
+        # mid-stream server failure; it must terminate the Anthropic stream.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        event = {
+            "event": "error",
+            "data": {
+                "type": "error",
+                "code": "server_error",
+                "message": "upstream exploded",
+            },
+        }
+        results = translate_openai_sse_event(event)
+        error_events = [r for r in results if r["event"] == "error"]
+        assert len(error_events) == 1
+        assert error_events[0]["data"]["type"] == "error"
+        assert error_events[0]["data"]["error"]["message"] == "upstream exploded"
+
+
 # ---------------------------------------------------------------------------
 # translate_stream integration tests
 # ---------------------------------------------------------------------------
@@ -370,6 +425,69 @@ async def _chunks_from(byte_list: list[bytes]):
 def _make_sse_event(event_type: str, data: dict) -> bytes:
     """Build raw SSE bytes for one event."""
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+async def _collect(aiter):
+    """Drain an async iterator into a list."""
+    return [item async for item in aiter]
+
+
+class TestIterSSEEventBlobs:
+    """Direct unit tests for the shared SSE byte-framing owner.
+
+    Oracle: the SSE wire format delimits events with a blank line (``\\n\\n``),
+    CRLF normalized to LF (W3C EventSource spec). A framer must yield each event
+    INCLUDING its terminator and split exactly on the delimiter — values derived
+    from the spec, never from running the framer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_event_yielded_with_terminator_intact(self):
+        # One \n\n-terminated event in one chunk → exactly that event, byte-for-byte.
+        blobs = await _collect(iter_sse_event_blobs(_chunks_from([b"data: a\n\n"])))
+        assert blobs == [b"data: a\n\n"]
+
+    @pytest.mark.asyncio
+    async def test_two_events_split_on_blank_line_boundary(self):
+        # Two events concatenated in one chunk → split exactly at each \n\n; the
+        # boundary offset must include the terminator (kills a shifted cut point).
+        chunk = b"event: a\ndata: 1\n\nevent: b\ndata: 2\n\n"
+        blobs = await _collect(iter_sse_event_blobs(_chunks_from([chunk])))
+        assert blobs == [b"event: a\ndata: 1\n\n", b"event: b\ndata: 2\n\n"]
+
+    @pytest.mark.asyncio
+    async def test_event_split_across_chunks_is_buffered(self):
+        # A delimiter straddling two chunks must still frame as one event.
+        blobs = await _collect(
+            iter_sse_event_blobs(_chunks_from([b"data: a\n", b"\ndata: b\n\n"]))
+        )
+        assert blobs == [b"data: a\n\n", b"data: b\n\n"]
+
+    @pytest.mark.asyncio
+    async def test_unterminated_trailing_remainder_is_flushed(self):
+        # A final fragment with no \n\n is yielded once the stream ends (default
+        # max_buffer=None must not raise on the post-loop bound check).
+        blobs = await _collect(iter_sse_event_blobs(_chunks_from([b"data: a\n\ndata: tail"])))
+        assert blobs == [b"data: a\n\n", b"data: tail"]
+
+    @pytest.mark.asyncio
+    async def test_crlf_normalized_to_lf(self):
+        # CRLF line endings collapse to LF before framing.
+        blobs = await _collect(iter_sse_event_blobs(_chunks_from([b"data: a\r\n\r\n"])))
+        assert blobs == [b"data: a\n\n"]
+
+    @pytest.mark.asyncio
+    async def test_max_buffer_not_exceeded_at_exact_cap_does_not_raise(self):
+        # Exactly cap bytes, unterminated: the bound is EXCLUSIVE, so no raise.
+        # The trailing remainder is flushed at stream end. Kills > vs >=.
+        blobs = await _collect(iter_sse_event_blobs(_chunks_from([b"x" * 8]), max_buffer=8))
+        assert blobs == [b"x" * 8]
+
+    @pytest.mark.asyncio
+    async def test_max_buffer_exceeded_raises_runtime_error(self):
+        # Over-cap and unterminated → abort the malformed stream. Kills > vs <.
+        with pytest.raises(RuntimeError, match="malformed"):
+            await _collect(iter_sse_event_blobs(_chunks_from([b"x" * 9]), max_buffer=8))
 
 
 class TestTranslateStream:
@@ -403,18 +521,31 @@ class TestTranslateStream:
                 "delta": "Hello",
             },
         )
+        completed = _make_sse_event(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "model": "gpt-5.5",
+                    "status": "completed",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        )
 
-        chunks = [created_event + text_delta]
+        chunks = [created_event + text_delta + completed]
         events = []
         async for event in provider.translate_stream(_chunks_from(chunks)):
             events.append(event)
 
-        # response.created → message_start + ping, text.delta → content_block_delta
-        assert len(events) == 3
+        # response.created → message_start + ping, text.delta → content_block_delta,
+        # response.completed → message_delta + message_stop (the terminator).
         assert events[0]["event"] == "message_start"
         assert events[1]["event"] == "ping"
         assert events[2]["event"] == "content_block_delta"
         assert events[2]["data"]["delta"]["text"] == "Hello"
+        assert events[-1]["event"] == "message_stop"
 
     @pytest.mark.asyncio
     async def test_event_split_across_chunks(self):
@@ -543,10 +674,10 @@ class TestTranslateStream:
                 "text": "partial",
             },
         )
-        completed = _make_sse_event(
-            "response.completed",
+        incomplete = _make_sse_event(
+            "response.incomplete",
             {
-                "type": "response.completed",
+                "type": "response.incomplete",
                 "response": {
                     "id": "resp_cf3",
                     "model": "gpt-5.5",
@@ -559,7 +690,7 @@ class TestTranslateStream:
 
         events = []
         async for event in provider.translate_stream(
-            _chunks_from([part_added + text_delta + text_done + completed])
+            _chunks_from([part_added + text_delta + text_done + incomplete])
         ):
             events.append(event)
 
@@ -578,6 +709,184 @@ class TestTranslateStream:
         assert refusal_delta["data"]["delta"]["text"].strip() != ""
         message_delta = next(e for e in events if e["event"] == "message_delta")
         assert message_delta["data"]["delta"]["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_response_incomplete_stream_terminates_with_message_stop(self):
+        """A streamed turn that ends with a real response.incomplete event still
+        closes with message_stop — Claude Code must finalize, not hang."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider()
+
+        created = _make_sse_event(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_inc_stream",
+                    "model": "gpt-5.5",
+                    "status": "in_progress",
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                },
+            },
+        )
+        text_delta = _make_sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "partial answer",
+            },
+        )
+        incomplete = _make_sse_event(
+            "response.incomplete",
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_inc_stream",
+                    "model": "gpt-5.5",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 10, "output_tokens": 4096},
+                },
+            },
+        )
+
+        events = []
+        async for event in provider.translate_stream(
+            _chunks_from([created + text_delta + incomplete])
+        ):
+            events.append(event)
+
+        assert events[-1]["event"] == "message_stop"
+        message_delta = next(e for e in events if e["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "max_tokens"
+        # The terminator arrived from the real terminal event, so the invariant must
+        # NOT also synthesize one — exactly one message_stop / message_delta total.
+        assert sum(e["event"] == "message_stop" for e in events) == 1
+        assert sum(e["event"] == "message_delta" for e in events) == 1
+
+    @pytest.mark.asyncio
+    async def test_dropped_stream_with_tool_call_synthesizes_tool_use_stop(self):
+        """A dropped stream that already emitted a tool call must synthesize
+        stop_reason=tool_use — Claude Code has to RUN the tool, not treat the turn
+        as a clean end_turn."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider()
+
+        created = _make_sse_event(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_tool_drop",
+                    "model": "gpt-5.5",
+                    "status": "in_progress",
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                },
+            },
+        )
+        tool_call = _make_sse_event(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "read_file",
+                },
+            },
+        )
+
+        # Stream ends after the tool-call start — no terminal event.
+        events = []
+        async for event in provider.translate_stream(_chunks_from([created + tool_call])):
+            events.append(event)
+
+        assert events[-1]["event"] == "message_stop"
+        message_delta = next(e for e in events if e["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_started_stream_without_terminator_synthesizes_message_stop(self):
+        """A stream that emits message_start but no terminal event (connection
+        drop mid-turn) is closed by a synthesized message_stop — the termination
+        invariant. Claude Code's parser requires message_stop as the final event
+        (see tests/test_contract.py)."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider()
+
+        created = _make_sse_event(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_drop",
+                    "model": "gpt-5.5",
+                    "status": "in_progress",
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                },
+            },
+        )
+        text_delta = _make_sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "cut off here",
+            },
+        )
+
+        # Stream ends after the delta — no response.completed/incomplete/failed.
+        events = []
+        async for event in provider.translate_stream(_chunks_from([created + text_delta])):
+            events.append(event)
+
+        assert events[0]["event"] == "message_start"
+        assert events[-1]["event"] == "message_stop"
+
+    @pytest.mark.asyncio
+    async def test_response_failed_stream_emits_error_event(self):
+        """A streamed turn that ends with response.failed emits an error event so
+        the stream does not end silently."""
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider()
+
+        created = _make_sse_event(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_fail_stream",
+                    "model": "gpt-5.5",
+                    "status": "in_progress",
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                },
+            },
+        )
+        failed = _make_sse_event(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_fail_stream",
+                    "status": "failed",
+                    "error": {"code": "server_error", "message": "boom"},
+                },
+            },
+        )
+
+        events = []
+        async for event in provider.translate_stream(_chunks_from([created + failed])):
+            events.append(event)
+
+        assert any(e["event"] == "error" for e in events)
 
 
 # ---------------------------------------------------------------------------
