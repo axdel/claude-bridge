@@ -2,6 +2,13 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-06-11
+
+### fix: terminate Anthropic stream on every OpenAI Responses terminal event ([PR #13](https://github.com/axdel/claude-bridge/pull/13))
+GPT-5.5 turns ending in response.incomplete, response.failed, or a top-level error now emit a stream terminator, so Claude Code finalizes the turn instead of halting mid-work; a termination invariant guarantees every started stream is closed.
+
+- [`9d1b29b`](https://github.com/axdel/claude-bridge/commit/9d1b29b) Terminate Anthropic stream on every OpenAI Responses terminal event
+
 ## 2026-06-10
 
 ### fix: add OpenAI token count multiplier ([PR #12](https://github.com/axdel/claude-bridge/pull/12))

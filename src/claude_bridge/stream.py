@@ -7,6 +7,43 @@ providers (for parsing inbound provider-specific SSE streams).
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+
+
+async def iter_sse_event_blobs(
+    raw_chunks: AsyncIterator[bytes],
+    *,
+    max_buffer: int | None = None,
+) -> AsyncIterator[bytes]:
+    """Reframe a raw provider byte stream into complete SSE event blobs.
+
+    Buffers ``raw_chunks`` and yields one blob per ``\\n\\n``-terminated event
+    (CRLF normalized to LF), then any non-empty trailing remainder. This is the
+    single owner of SSE byte-framing; every provider's ``translate_stream``
+    derives its event boundaries here instead of re-implementing the buffer walk.
+
+    When ``max_buffer`` is set and the undrained buffer exceeds it without a
+    terminator, raises ``RuntimeError`` — a terminator-less stream would
+    otherwise grow the buffer without bound (OOM) and make repeated
+    concatenation quadratic.
+    """
+    buffer = b""
+    async for chunk in raw_chunks:
+        buffer += chunk
+        buffer = buffer.replace(b"\r\n", b"\n")
+        while b"\n\n" in buffer:
+            event_end = buffer.index(b"\n\n") + 2
+            event_bytes = buffer[:event_end]
+            buffer = buffer[event_end:]
+            yield event_bytes
+        if max_buffer is not None and len(buffer) > max_buffer:
+            msg = (
+                f"Provider SSE stream exceeded {max_buffer} bytes without an "
+                "event terminator; aborting malformed stream"
+            )
+            raise RuntimeError(msg)
+    if buffer.strip():
+        yield buffer
 
 
 def parse_sse_events(raw_bytes: bytes) -> list[dict]:
