@@ -2,6 +2,11 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-06-19
+
+### v0.8.0 — Media Translation Reliability
+Release v0.8.0.
+
 ## 2026-06-11
 
 ### fix: terminate Anthropic stream on every OpenAI Responses terminal event ([PR #13](https://github.com/axdel/claude-bridge/pull/13))
