@@ -4,6 +4,9 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-06-19
 
+### v0.8.1 — Lockfile Version Sync
+Release v0.8.1.
+
 ### v0.8.0 — Media Translation Reliability
 Release v0.8.0.
 
