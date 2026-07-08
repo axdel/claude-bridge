@@ -1,37 +1,218 @@
-# Decision Records
+# Decisions
 
-Tracked registry for claude-bridge architecture, governance, and compatibility decisions.
-
-This file is the canonical home for decision records. Ignored local memory files such as
-`CLAUDE.md`, when present, should point here instead of duplicating the registry.
+> Every irreversible or non-obvious design choice gets an ID, a rationale, and a tombstone.
+> "Why this, not that" is as important as the code itself.
 
 ## Registry
 
-| ID | Decision | Rationale | Status | Context | Invalidates |
-|-|-|-|-|-|-|
-| D-RUNTIME-001 | Keep runtime stdlib-only with zero runtime dependencies | Portability and supply-chain risk matter more than convenience helpers for this local bridge. | accepted | 2026-03-20 initial project conventions | — |
-| D-API-001 | Target OpenAI Responses API instead of Chat Completions | Responses has richer tool-call semantics, including `call_id` and `id` separation, that better match Anthropic Messages. | accepted | 2026-03-20 initial OpenAI provider | — |
-| D-AUTH-001 | Prefer API-key auth by default, with Codex OAuth as experimental fallback | Standard API-key mode is the supported path while subscription OAuth remains policy-gray and local-only. | accepted | 2026-03-20 initial OpenAI provider | — |
-| D-THINK-001 | Preserve native reasoning formats rather than cross-mapping semantics | Anthropic thinking and provider reasoning are not equivalent, so opaque passthrough or dropping is safer than pretending they translate. | accepted | 2026-03-20 reasoning-mode design | — |
-| D-REASON-001 | Stateful reasoning continuity qualifies the translation purity rule | GPT-5.5 with `store:false` requires clients to echo prior encrypted reasoning for multi-turn tool use, while the pure translation functions remain side-effect-free. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
-| D-CACHE-001 | Bound the provider-local reasoning cache with LRU eviction | A 256-entry oldest-first cache prevents hidden unbounded provider state while preserving tool-loop continuity. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
-| D-USAGE-001 | Report OpenAI usage as flat Anthropic totals | OpenAI `input_tokens` and `output_tokens` already include cached and reasoning details, so splitting them into Anthropic cache fields would double-count. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
-| D-USAGE-002 | Do not add a bridge-side usage floor for Claude Code autocompact without provider-response evidence | Claude Code `/context` category boxes are diagnostic estimates, while auto-compact is driven by API usage plus local deltas; changing reported usage from local estimates could over-compact or double-count. Superseded by: D-USAGE-003. | superseded | feature/audit-drift-remediation T-002 | T-002 diagnostic concern |
-| D-USAGE-003 | Apply a provider token-count multiplier and set OpenAI/GPT to 1.2 | The multiplier is an explicit compatibility knob for empirical Claude Code auto-compact tuning, kept at the provider capability boundary instead of re-estimating prompt structure in the proxy. | accepted | bugfix/token-count-multiplier | D-USAGE-002 |
-| D-SRVTOOL-001 | Treat unsupported server-tool blocks as redacted unsupported content | Unknown server-tool blocks have no proven target-provider equivalent, so safe degradation beats speculative translation. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
-| D-SSE-001 | Cap malformed SSE buffers instead of rewriting normal buffering | A 4 MiB cap bounds malformed streams while well-formed SSE drains quickly, making a bytearray rewrite unnecessary. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
-| D-TRACE-001 | Use open-append-close JSONL trace writes for compatibility diagnostics | The opt-in fail-open trace is simpler and more rotation-friendly without a long-lived handle. | accepted | 2026-06-08 feature/claude-code-compatibility | — |
-| D-GOV-001 | Keep decision records in tracked `DECISIONS.md`, not ignored local `CLAUDE.md` | The registry must be committed and diffable while project-local memory remains ignored and outside branch scope. | accepted | feature/audit-drift-remediation T-001 | Ignored local `CLAUDE.md` §Key Decisions should point here out-of-band |
-| D-CONFIG-001 | Centralize runtime env ownership in a minimal stdlib `config.py` | A small config owner fixes scattered env reads without adding dependencies or broad settings injection. | accepted | feature/audit-drift-remediation plan | README.md §Configuration |
-| D-PROVIDER-001 | Declare provider stream and sync-response behavior via `ProviderCapabilities` | Provider-specific behavior should be explicit in `provider.py` while `proxy.py` continues to own HTTP transport, retries, stats, and errors. | accepted | feature/audit-drift-remediation plan | README.md §Adding a New Provider, `provider.py` provider contract |
-| D-PROVIDER-002 | Keep xAI unregistered until a real provider implementation exists | A routable provider whose methods raise `NotImplementedError` breaks the provider contract and failover semantics. | accepted | feature/audit-drift-remediation T-005 | README.md provider list and limitations |
-| D-LOG-001 | Log provider error status and extracted summaries instead of unredacted upstream payloads | Upstream error payloads can include request-derived content or secrets; bounded summaries preserve operator diagnostics without leaking provider data. | accepted | feature/audit-drift-remediation T-004 | README.md feature list |
-| D-DEPS-001 | Add Bandit and pip-audit as dev-only audit tools | Security gates require reproducible local source/dependency checks, and dev-only dependencies preserve the stdlib-only runtime contract. | accepted | feature/audit-drift-remediation T-010 | README.md §Security audits |
-| D-CONTENT-001 | Add a shared policy-free `content.py` media-source parser that both providers DERIVE from | Anthropic media-source parsing (base64/url/file → media_type/data/url/filename) is one fact; a single leaf parser stops the OpenAI and Gemini providers re-encoding it divergently (Single Owner). Kept strictly policy-free — no encoding, no warnings, no size policy — per the [grok] YAGNI caveat; if it ever needs provider-specific parameters, that is the trigger to inline it back per-provider. | accepted | feature/nontext-content-translation T-002 | CLAUDE.md Boundary Map (adds `content` leaf row + allows `providers/* → content`), Canonical Glossary (adds media block, media source, input modality), Derivation Map (content.py is a non-derived leaf) |
-| D-PROVIDER-003 | Widen `ProviderCapabilities` (transport-only per D-PROVIDER-001) with additive input-content fields | The mapper needs a declared, testable seam — `input_modalities` and `supports_tool_output_content_parts` — to decide forward-vs-degrade per provider/backend without runtime guessing. Both fields default to the conservative pre-feature behavior (text-only, string tool output) so every existing provider and the sibling `token_count_multiplier` branch construct unchanged. Rejected a separate content-capability dataclass: for a 3-provider world a second value object is more surface than the one widened docstring costs (KISS). | accepted | feature/nontext-content-translation T-003 | `provider.py` ProviderCapabilities docstring (now transport + input-content), README.md §Adding a New Provider |
-| D-MODALITY-001 | Declare OpenAI input-content capabilities per auth-mode backend on the instance, keeping the class attribute conservative | api.openai.com and chatgpt.com (Codex) are one provider class with two backends of differing modality support, so a single class-level `capabilities` is the wrong runtime granularity. `__init__` sets `self.capabilities` per `auth_mode`: api_key → `{text,image,document}` + tool-output arrays True (documented public Responses support); codex_oauth → `{text,image,document}` + tool-output arrays **False**. The codex defaults come from the T-001 live probe (input_image and input_file returned HTTP 200; array-form `function_call_output.output` was NOT probed, so it stays disabled and tool-result media degrades observably until a real tool-loop probe). The class attribute stays the conservative text-only default for Protocol conformance and instance-less callers; instances shadow it, and the proxy + `translate_request` both read the instance. | accepted | feature/nontext-content-translation T-006 | `openai.py` OpenAIProvider docstring; README.md §Auth modes / limitations; follow-up: codex tool-output-array tool-loop probe |
-| D-SCOPE-001 | Drop Gemini media translation from this feature and leave `gemini.py` text-only as-is | The user narrowed scope mid-branch — Gemini is no longer under active development for this bridge (no media support added; Grok will receive the canonical media treatment later), so building Gemini media support is unrequested scope; removing `gemini.py` was also not requested, so its existing text/tool path stays unchanged and media degrades observably there until Gemini is removed or revived. | accepted | feature/nontext-content-translation T-007 (dropped) | plan.md T-007 marked DROPPED; CLAUDE.md Modules (`providers/gemini.py` documented media-unsupported, OpenAI is the supported media path) |
-| D-TOKEN-001 | Estimate media input tokens with a flat per-modality budget (image 1200, document 3000) computed inline in `proxy.py`, independent of base64 payload size | `estimate_input_tokens` previously counted a base64 payload as text bytes (a ~300 KiB pasted image read as ~114k phantom tokens), corrupting Claude Code's auto-compact signal at `/v1/messages/count_tokens`; model media cost is dominated by fixed per-item processing (vision tiles, per-page render/extract) rather than base64 length, so a flat budget tracks reality better than byte-counting and keeps text-only estimates byte-identical (int media tokens add after rounding). Kept inline in `proxy.py` rather than in the policy-free `content.py` leaf because pre-routing token estimation is a proxy-owned concern with no provider, so `content.py` stays parse-only per D-CONTENT-001. | accepted | feature/nontext-content-translation T-008 | CLAUDE.md Known Tech Debt (flat document budget ignores page count → token_count_multiplier follow-up) |
-| D-MEDIA-001 | Bound media input by the whole-request-body cap, not a second per-media hard cap | `_MAX_REQUEST_BODY` (config; enforced at `proxy.py:198` before any media handling, rejecting with HTTP 413) already bounds total request size including base64 media; `_OVERSIZED_MEDIA_BYTES` (5 MiB, `proxy.py:223`) drives a diagnostic warning only, and `_approx_decoded_bytes` (`proxy.py:226`) is pure integer arithmetic (`len(data) * 3 // 4`, no base64 decode) so an oversized pasted image inflates neither memory nor the token estimate. A second per-media hard cap would duplicate the body bound and would wrongly reject valid multi-image requests that sit under the body limit — the body cap is the single source of size truth. | accepted | feature/nontext-content-translation /review ADV-003 (adversary lens) | — |
-| D-STREAM-001 | Map the full OpenAI Responses terminal-event taxonomy to an Anthropic stream terminator | The Responses streaming API ends a turn with one of four DISTINCT top-level event types — `response.completed`, `response.incomplete` (`max_output_tokens`/`content_filter`), `response.failed` (`server_error`/...), or a bare top-level `error` — never a `completed` event with a non-completed status nested inside. The original dispatcher routed only `response.completed` to the terminating handler and dropped the rest to `return []`, so a GPT-5.5 turn ending incomplete (the common case under hardcoded `xhigh` reasoning) or failed produced no `message_stop`, and Claude Code halted mid-work with no error (HTTP 200). Route `response.incomplete` to the existing terminal handler (it already maps status/`incomplete_details` to `max_tokens`/`end_turn` + a refusal block on content_filter); translate `response.failed` and the top-level `error` to an Anthropic `error` event carrying the verbatim, length-bounded upstream reason (an upstream failure is an API error, not assistant output). Also capture reasoning continuity (D-REASON-001) on `response.incomplete`, not only `completed`. | accepted | bugfix/stream-terminal-events (silent mid-work halt on GPT-5.5 incomplete/failed turns) | — |
-| D-STREAM-002 | Enforce a termination invariant in `translate_stream` independent of the upstream event taxonomy | Mapping each known terminal event (D-STREAM-001) fixes the observed cases but not the class of bug: any future unhandled terminal, or a dropped upstream connection, would again leave a started turn without a closer. `translate_stream` tracks whether a `message_start` was emitted and whether a terminator (`message_stop`/`error`) followed; if a started stream ends without one, it synthesizes `message_delta` + `message_stop` (`stop_reason = tool_use` when tool calls were already emitted so Claude Code runs them, else `end_turn` — never `max_tokens`, which would trigger an auto-compact retry loop). The invariant fires ONLY when a `message_start` was sent (a stream that produced no output stays empty) and never when a real terminator already arrived (no duplicate terminator). This makes "started stream with no closer" structurally impossible regardless of what the upstream sends. | accepted | bugfix/stream-terminal-events (silent mid-work halt on GPT-5.5 incomplete/failed turns) | — |
+### D-RUNTIME-001 — Keep runtime stdlib-only with zero runtime dependencies
+- **Status:** accepted
+- **Date:** 2026-03-20
+- **Context:** initial project conventions
+- **Decision:** Keep runtime stdlib-only with zero runtime dependencies.
+- **Rationale:** Portability and supply-chain risk matter more than convenience helpers for this local bridge.
+- **Invalidates:** —
+
+### D-API-001 — Target OpenAI Responses API instead of Chat Completions
+- **Status:** accepted
+- **Date:** 2026-03-20
+- **Context:** initial OpenAI provider
+- **Decision:** Target OpenAI Responses API instead of Chat Completions.
+- **Rationale:** Responses has richer tool-call semantics, including `call_id` and `id` separation, that better match Anthropic Messages.
+- **Invalidates:** —
+
+### D-AUTH-001 — Prefer API-key auth by default, with Codex OAuth as experimental fallback
+- **Status:** accepted
+- **Date:** 2026-03-20
+- **Context:** initial OpenAI provider
+- **Decision:** Prefer API-key auth by default, with Codex OAuth as experimental fallback.
+- **Rationale:** Standard API-key mode is the supported path while subscription OAuth remains policy-gray and local-only.
+- **Invalidates:** —
+
+### D-THINK-001 — Preserve native reasoning formats rather than cross-mapping semantics
+- **Status:** accepted
+- **Date:** 2026-03-20
+- **Context:** reasoning-mode design
+- **Decision:** Preserve native reasoning formats rather than cross-mapping semantics.
+- **Rationale:** Anthropic thinking and provider reasoning are not equivalent, so opaque passthrough or dropping is safer than pretending they translate.
+- **Invalidates:** —
+
+### D-REASON-001 — Stateful reasoning continuity qualifies the translation purity rule
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/claude-code-compatibility
+- **Decision:** Stateful reasoning continuity qualifies the translation purity rule.
+- **Rationale:** GPT-5.5 with `store:false` requires clients to echo prior encrypted reasoning for multi-turn tool use, while the pure translation functions remain side-effect-free.
+- **Invalidates:** —
+
+### D-CACHE-001 — Bound the provider-local reasoning cache with LRU eviction
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/claude-code-compatibility
+- **Decision:** Bound the provider-local reasoning cache with LRU eviction.
+- **Rationale:** A 256-entry oldest-first cache prevents hidden unbounded provider state while preserving tool-loop continuity.
+- **Invalidates:** —
+
+### D-USAGE-001 — Report OpenAI usage as flat Anthropic totals
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/claude-code-compatibility
+- **Decision:** Report OpenAI usage as flat Anthropic totals.
+- **Rationale:** OpenAI `input_tokens` and `output_tokens` already include cached and reasoning details, so splitting them into Anthropic cache fields would double-count.
+- **Invalidates:** —
+
+### D-USAGE-002 — Do not add a bridge-side usage floor for Claude Code autocompact without provider-response evidence
+- **Status:** superseded
+- **Date:** 2026-06-08
+- **Context:** feature/audit-drift-remediation
+- **Decision:** Do not add a bridge-side usage floor for Claude Code autocompact without provider-response evidence.
+- **Rationale:** Claude Code `/context` category boxes are diagnostic estimates, while auto-compact is driven by API usage plus local deltas; changing reported usage from local estimates could over-compact or double-count.
+- **Invalidates:** —
+- **Superseded by:** D-USAGE-003
+
+### D-USAGE-003 — Apply a provider token-count multiplier and set OpenAI/GPT to 1.2
+- **Status:** accepted
+- **Date:** 2026-06-09
+- **Context:** bugfix/token-count-multiplier
+- **Decision:** Apply a provider token-count multiplier and set OpenAI/GPT to 1.2.
+- **Rationale:** The multiplier is an explicit compatibility knob for empirical Claude Code auto-compact tuning, kept at the provider capability boundary instead of re-estimating prompt structure in the proxy.
+- **Invalidates:** —
+- **Replaces:** D-USAGE-002
+
+### D-SRVTOOL-001 — Treat unsupported server-tool blocks as redacted unsupported content
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/claude-code-compatibility
+- **Decision:** Treat unsupported server-tool blocks as redacted unsupported content.
+- **Rationale:** Unknown server-tool blocks have no proven target-provider equivalent, so safe degradation beats speculative translation.
+- **Invalidates:** —
+
+### D-SSE-001 — Cap malformed SSE buffers instead of rewriting normal buffering
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/claude-code-compatibility
+- **Decision:** Cap malformed SSE buffers instead of rewriting normal buffering.
+- **Rationale:** A 4 MiB cap bounds malformed streams while well-formed SSE drains quickly, making a bytearray rewrite unnecessary.
+- **Invalidates:** —
+
+### D-TRACE-001 — Use open-append-close JSONL trace writes for compatibility diagnostics
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/claude-code-compatibility
+- **Decision:** Use open-append-close JSONL trace writes for compatibility diagnostics.
+- **Rationale:** The opt-in fail-open trace is simpler and more rotation-friendly without a long-lived handle.
+- **Invalidates:** —
+
+### D-GOV-001 — Keep decision records in tracked `DECISIONS.md`, not ignored local `CLAUDE.md`
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/audit-drift-remediation
+- **Decision:** Keep decision records in tracked `DECISIONS.md`, not ignored local `CLAUDE.md`.
+- **Rationale:** The registry must be committed and diffable while project-local memory remains ignored and outside branch scope.
+- **Invalidates:** Ignored local `CLAUDE.md` §Key Decisions should point here out-of-band
+
+### D-CONFIG-001 — Centralize runtime env ownership in a minimal stdlib `config.py`
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/audit-drift-remediation
+- **Decision:** Centralize runtime env ownership in a minimal stdlib `config.py`.
+- **Rationale:** A small config owner fixes scattered env reads without adding dependencies or broad settings injection.
+- **Invalidates:** README.md §Configuration
+
+### D-PROVIDER-001 — Declare provider stream and sync-response behavior via `ProviderCapabilities`
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/audit-drift-remediation
+- **Decision:** Declare provider stream and sync-response behavior via `ProviderCapabilities`.
+- **Rationale:** Provider-specific behavior should be explicit in `provider.py` while `proxy.py` continues to own HTTP transport, retries, stats, and errors.
+- **Invalidates:** README.md §Adding a New Provider, `provider.py` provider contract
+
+### D-PROVIDER-002 — Keep xAI unregistered until a real provider implementation exists
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/audit-drift-remediation
+- **Decision:** Keep xAI unregistered until a real provider implementation exists.
+- **Rationale:** A routable provider whose methods raise `NotImplementedError` breaks the provider contract and failover semantics.
+- **Invalidates:** README.md provider list and limitations
+
+### D-LOG-001 — Log provider error status and extracted summaries instead of unredacted upstream payloads
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/audit-drift-remediation
+- **Decision:** Log provider error status and extracted summaries instead of unredacted upstream payloads.
+- **Rationale:** Upstream error payloads can include request-derived content or secrets; bounded summaries preserve operator diagnostics without leaking provider data.
+- **Invalidates:** README.md feature list
+
+### D-DEPS-001 — Add Bandit and pip-audit as dev-only audit tools
+- **Status:** accepted
+- **Date:** 2026-06-08
+- **Context:** feature/audit-drift-remediation
+- **Decision:** Add Bandit and pip-audit as dev-only audit tools.
+- **Rationale:** Security gates require reproducible local source/dependency checks, and dev-only dependencies preserve the stdlib-only runtime contract.
+- **Invalidates:** README.md §Security audits
+
+### D-CONTENT-001 — Add a shared policy-free `content.py` media-source parser that both providers DERIVE from
+- **Status:** accepted
+- **Date:** 2026-06-09
+- **Context:** feature/nontext-content-translation
+- **Decision:** Add a shared policy-free `content.py` media-source parser that both providers DERIVE from.
+- **Rationale:** Anthropic media-source parsing (base64/url/file → media_type/data/url/filename) is one fact; a single leaf parser stops the OpenAI and Gemini providers re-encoding it divergently (Single Owner). Kept strictly policy-free — no encoding, no warnings, no size policy — per the [grok] YAGNI caveat; if it ever needs provider-specific parameters, that is the trigger to inline it back per-provider.
+- **Invalidates:** CLAUDE.md Boundary Map (adds `content` leaf row + allows `providers/* → content`), Canonical Glossary (adds media block, media source, input modality), Derivation Map (content.py is a non-derived leaf)
+
+### D-PROVIDER-003 — Widen `ProviderCapabilities` (transport-only per D-PROVIDER-001) with additive input-content fields
+- **Status:** accepted
+- **Date:** 2026-06-09
+- **Context:** feature/nontext-content-translation
+- **Decision:** Widen `ProviderCapabilities` (transport-only per D-PROVIDER-001) with additive input-content fields.
+- **Rationale:** The mapper needs a declared, testable seam — `input_modalities` and `supports_tool_output_content_parts` — to decide forward-vs-degrade per provider/backend without runtime guessing. Both fields default to the conservative pre-feature behavior (text-only, string tool output) so every existing provider and the sibling `token_count_multiplier` branch construct unchanged. Rejected a separate content-capability dataclass: for a 3-provider world a second value object is more surface than the one widened docstring costs (KISS).
+- **Invalidates:** `provider.py` ProviderCapabilities docstring (now transport + input-content), README.md §Adding a New Provider
+
+### D-MODALITY-001 — Declare OpenAI input-content capabilities per auth-mode backend on the instance, keeping the class attribute conservative
+- **Status:** accepted
+- **Date:** 2026-06-09
+- **Context:** feature/nontext-content-translation
+- **Decision:** Declare OpenAI input-content capabilities per auth-mode backend on the instance, keeping the class attribute conservative.
+- **Rationale:** api.openai.com and chatgpt.com (Codex) are one provider class with two backends of differing modality support, so a single class-level `capabilities` is the wrong runtime granularity. `__init__` sets `self.capabilities` per `auth_mode`: api_key → `{text,image,document}` + tool-output arrays True (documented public Responses support); codex_oauth → `{text,image,document}` + tool-output arrays **False**. The codex defaults come from the live probe (input_image and input_file returned HTTP 200; array-form `function_call_output.output` was NOT probed, so it stays disabled and tool-result media degrades observably until a real tool-loop probe). The class attribute stays the conservative text-only default for Protocol conformance and instance-less callers; instances shadow it, and the proxy + `translate_request` both read the instance.
+- **Invalidates:** `openai.py` OpenAIProvider docstring; README.md §Auth modes / limitations; follow-up: codex tool-output-array tool-loop probe
+
+### D-SCOPE-001 — Drop Gemini media translation from this feature and leave `gemini.py` text-only as-is
+- **Status:** accepted
+- **Date:** 2026-06-09
+- **Context:** feature/nontext-content-translation
+- **Decision:** Drop Gemini media translation from this feature and leave `gemini.py` text-only as-is.
+- **Rationale:** The user narrowed scope mid-branch — Gemini is no longer under active development for this bridge (no media support added; Grok will receive the canonical media treatment later), so building Gemini media support is unrequested scope; removing `gemini.py` was also not requested, so its existing text/tool path stays unchanged and media degrades observably there until Gemini is removed or revived.
+- **Invalidates:** CLAUDE.md Modules (`providers/gemini.py` documented media-unsupported, OpenAI is the supported media path)
+
+### D-TOKEN-001 — Estimate media input tokens with a flat per-modality budget (image 1200, document 3000) computed inline in `proxy.py`
+- **Status:** accepted
+- **Date:** 2026-06-09
+- **Context:** feature/nontext-content-translation
+- **Decision:** Estimate media input tokens with a flat per-modality budget (image 1200, document 3000) computed inline in `proxy.py`, independent of base64 payload size.
+- **Rationale:** `estimate_input_tokens` previously counted a base64 payload as text bytes (a ~300 KiB pasted image read as ~114k phantom tokens), corrupting Claude Code's auto-compact signal at `/v1/messages/count_tokens`; model media cost is dominated by fixed per-item processing (vision tiles, per-page render/extract) rather than base64 length, so a flat budget tracks reality better than byte-counting and keeps text-only estimates byte-identical (int media tokens add after rounding). Kept inline in `proxy.py` rather than in the policy-free `content.py` leaf because pre-routing token estimation is a proxy-owned concern with no provider, so `content.py` stays parse-only per D-CONTENT-001.
+- **Invalidates:** CLAUDE.md Known Tech Debt (flat document budget ignores page count → token_count_multiplier follow-up)
+
+### D-MEDIA-001 — Bound media input by the whole-request-body cap, not a second per-media hard cap
+- **Status:** accepted
+- **Date:** 2026-06-09
+- **Context:** feature/nontext-content-translation
+- **Decision:** Bound media input by the whole-request-body cap, not a second per-media hard cap.
+- **Rationale:** `_MAX_REQUEST_BODY` (config; enforced at `proxy.py:198` before any media handling, rejecting with HTTP 413) already bounds total request size including base64 media; `_OVERSIZED_MEDIA_BYTES` (5 MiB, `proxy.py:223`) drives a diagnostic warning only, and `_approx_decoded_bytes` (`proxy.py:226`) is pure integer arithmetic (`len(data) * 3 // 4`, no base64 decode) so an oversized pasted image inflates neither memory nor the token estimate. A second per-media hard cap would duplicate the body bound and would wrongly reject valid multi-image requests that sit under the body limit — the body cap is the single source of size truth.
+- **Invalidates:** —
+
+### D-STREAM-001 — Map the full OpenAI Responses terminal-event taxonomy to an Anthropic stream terminator
+- **Status:** accepted
+- **Date:** 2026-06-11
+- **Context:** bugfix/stream-terminal-events (silent mid-work halt on GPT-5.5 incomplete/failed turns)
+- **Decision:** Map the full OpenAI Responses terminal-event taxonomy to an Anthropic stream terminator.
+- **Rationale:** The Responses streaming API ends a turn with one of four DISTINCT top-level event types — `response.completed`, `response.incomplete` (`max_output_tokens`/`content_filter`), `response.failed` (`server_error`/...), or a bare top-level `error` — never a `completed` event with a non-completed status nested inside. The original dispatcher routed only `response.completed` to the terminating handler and dropped the rest to `return []`, so a GPT-5.5 turn ending incomplete (the common case under hardcoded `xhigh` reasoning) or failed produced no `message_stop`, and Claude Code halted mid-work with no error (HTTP 200). Route `response.incomplete` to the existing terminal handler (it already maps status/`incomplete_details` to `max_tokens`/`end_turn` + a refusal block on content_filter); translate `response.failed` and the top-level `error` to an Anthropic `error` event carrying the verbatim, length-bounded upstream reason (an upstream failure is an API error, not assistant output). Also capture reasoning continuity (D-REASON-001) on `response.incomplete`, not only `completed`.
+- **Invalidates:** —
+
+### D-STREAM-002 — Enforce a termination invariant in `translate_stream` independent of the upstream event taxonomy
+- **Status:** accepted
+- **Date:** 2026-06-11
+- **Context:** bugfix/stream-terminal-events (silent mid-work halt on GPT-5.5 incomplete/failed turns)
+- **Decision:** Enforce a termination invariant in `translate_stream` independent of the upstream event taxonomy.
+- **Rationale:** Mapping each known terminal event (D-STREAM-001) fixes the observed cases but not the class of bug: any future unhandled terminal, or a dropped upstream connection, would again leave a started turn without a closer. `translate_stream` tracks whether a `message_start` was emitted and whether a terminator (`message_stop`/`error`) followed; if a started stream ends without one, it synthesizes `message_delta` + `message_stop` (`stop_reason = tool_use` when tool calls were already emitted so Claude Code runs them, else `end_turn` — never `max_tokens`, which would trigger an auto-compact retry loop). The invariant fires ONLY when a `message_start` was sent (a stream that produced no output stays empty) and never when a real terminator already arrived (no duplicate terminator). This makes "started stream with no closer" structurally impossible regardless of what the upstream sends.
+- **Invalidates:** —
+
+## Archive
