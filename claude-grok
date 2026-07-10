@@ -36,16 +36,36 @@ trap cleanup EXIT INT TERM
 # Start bridge in background
 export PYTHONPATH="${BRIDGE_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
 export LOG_LEVEL
-python3 -m claude_bridge --port "$PORT" --provider xai 2>/dev/null &
+# `-P` (safe path, Python 3.11+) drops the automatic prepend of the current
+# directory to sys.path, so running claude-grok from an untrusted project dir
+# cannot let a local `claude_bridge/__main__.py` shadow the real bridge and read
+# ~/.grok/auth.json (search-path injection, CWE-427). Our own trusted src dir is
+# still first on the explicit PYTHONPATH exported above.
+# In debug mode surface bridge logs on the terminal; otherwise stay quiet.
+# Without this the advertised `--debug` (LOG_LEVEL=DEBUG) would be a no-op —
+# every log line went to /dev/null, leaving no way to diagnose auth/refresh/
+# version-gate/stream failures.
+if [[ "$LOG_LEVEL" == "DEBUG" ]]; then
+    python3 -P -m claude_bridge --port "$PORT" --provider xai &
+else
+    python3 -P -m claude_bridge --port "$PORT" --provider xai 2>/dev/null &
+fi
 BRIDGE_PID=$!
 
 # Wait for bridge to accept connections (max 3s)
 for _ in $(seq 1 30); do
-    if python3 -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
+    if python3 -P -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
         break
     fi
     sleep 0.1
 done
+
+# Abort if the bridge died during startup (e.g. the port was already bound):
+# never hand Claude Code's prompts to whatever else may be listening on $PORT.
+if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+    echo "claude-grok: bridge failed to start on 127.0.0.1:${PORT} (port busy?)." >&2
+    exit 1
+fi
 
 cat <<'BANNER'
 
@@ -56,7 +76,7 @@ cat <<'BANNER'
  \___|_|\__,_|\__,_|\__,_|\___|      \__, |_|  \___/|_|\_\
                                      |___/
 BANNER
-BRIDGE_VERSION=$(python3 -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
+BRIDGE_VERSION=$(python3 -P -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
 echo " port:${PORT}  pid:${BRIDGE_PID}  model:grok-4.20  version:${BRIDGE_VERSION}"
 echo " by axdel  github.com/axdel/claude-bridge"
 echo ""
