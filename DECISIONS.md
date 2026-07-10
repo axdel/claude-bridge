@@ -275,4 +275,12 @@
 - **Invalidates:** CLAUDE.md Modules (remove `providers/gemini.py`), README.md provider list
 - **Replaces:** D-SCOPE-001
 
+### D-XAI-007 — Pin the xAI OIDC issuer and refuse cross-host or non-HTTPS token refresh
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Pin the refresh issuer to the hardcoded HTTPS constant `https://auth.x.ai`, ignore any `oidc_issuer` field carried in `~/.grok/auth.json`, and refuse to POST the refresh_token to a non-HTTPS scheme or a cross-host endpoint.
+- **Rationale:** A poisoned `auth.json` could otherwise redirect the refresh_token and client_id to an attacker-controlled or internal host (SSRF / credential exfiltration, CWE-918/200); the issuer is a fixed xAI endpoint, so trusting a file-provided `oidc_issuer` buys nothing and only opens the exfil path — rejected honoring it.
+- **Invalidates:** —
+
 ## Archive
