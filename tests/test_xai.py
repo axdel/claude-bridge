@@ -25,10 +25,13 @@ import pytest
 
 from claude_bridge.auth import decode_jwt_exp
 from claude_bridge.content import parse_media_source
-from claude_bridge.provider import ProviderCapabilities
+from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.providers.xai import (
     _MAX_SSE_BUFFER,
     _REASONING_CACHE_MAX,
+    _XAI_CAPABILITIES,
+    _XAI_CLIENT_IDENTIFIER,
+    _XAI_ENDPOINT,
     XAIProvider,
     _associate_reasoning_with_calls,
     _iso_to_timestamp,
@@ -2173,3 +2176,108 @@ class TestReasoningCacheBound:
         provider._stash_reasoning({"call-new": self._entry(9999)})
         assert "call-0" in provider._reasoning_by_call_id
         assert "call-1" not in provider._reasoning_by_call_id
+
+
+# --- authenticate (subscription OAuth headers) ---
+
+
+class TestAuthenticate:
+    """authenticate() assembles the subscription bearer plus the grok client headers.
+
+    The bearer is resolved from a real ~/.grok/auth.json (a fresh, far-future-exp fake
+    JWT, so no refresh and no network fires) — in-process code is exercised directly,
+    never mocked (Mock Decision Framework).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_bearer_version_and_identifier_headers(self, tmp_path, monkeypatch):
+        data = _grok_auth()
+        auth_file = _write_grok_auth(tmp_path, data)
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+
+        headers = await XAIProvider(auth_path=auth_file).authenticate()
+
+        # Oracle: token is the exact bearer we wrote; version is the env override
+        # (config resolver returns it verbatim); identifier is the fixed client string.
+        token = data[_ENTRY_KEY]["key"]
+        assert headers == {
+            "Authorization": f"Bearer {token}",
+            "x-grok-client-version": "1.2.3",
+            "x-grok-client-identifier": _XAI_CLIENT_IDENTIFIER,
+        }
+
+    @pytest.mark.asyncio
+    async def test_authorization_carries_the_auth_file_bearer(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "9.9.9")
+        data = _grok_auth()
+        auth_file = _write_grok_auth(tmp_path, data)
+
+        headers = await XAIProvider(auth_path=auth_file).authenticate()
+
+        assert headers["Authorization"] == f"Bearer {data[_ENTRY_KEY]['key']}"
+
+    @pytest.mark.asyncio
+    async def test_client_identifier_is_grok_cli(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "9.9.9")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+
+        headers = await XAIProvider(auth_path=auth_file).authenticate()
+
+        # Oracle: the plan's documented divergence from Codex (bearer-only) — the
+        # fixed grok CLI client identifier string, not a secret.
+        assert headers["x-grok-client-identifier"] == "grok-cli"
+
+    @pytest.mark.asyncio
+    async def test_client_version_reflects_config_resolver(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "0.2.93")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+
+        headers = await XAIProvider(auth_path=auth_file).authenticate()
+
+        assert headers["x-grok-client-version"] == "0.2.93"
+
+    @pytest.mark.asyncio
+    async def test_bearer_never_leaks_outside_authorization_header(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        data = _grok_auth()
+        auth_file = _write_grok_auth(tmp_path, data)
+
+        headers = await XAIProvider(auth_path=auth_file).authenticate()
+
+        # Security oracle: the opaque bearer must appear ONLY in Authorization —
+        # never smuggled into the version or identifier header.
+        token = data[_ENTRY_KEY]["key"]
+        assert token not in headers["x-grok-client-version"]
+        assert token not in headers["x-grok-client-identifier"]
+
+
+# --- provider contract: capabilities, endpoint, registration ---
+
+
+class TestProviderContract:
+    def test_capabilities_declare_image_and_document_modalities(self):
+        caps = XAIProvider().capabilities
+        assert caps.input_modalities == frozenset({"text", "image", "document"})
+
+    def test_capabilities_declare_array_form_tool_output(self):
+        assert XAIProvider().capabilities.supports_tool_output_content_parts is True
+
+    def test_capabilities_token_multiplier_is_identity(self):
+        # Subscription-metered proxy needs no OpenAI-compat token scaling (D-XAI-005).
+        assert XAIProvider().capabilities.token_count_multiplier == 1.0
+
+    def test_capabilities_transport_modes(self):
+        caps = XAIProvider().capabilities
+        assert caps.stream_request_mode == "body_parameter"
+        assert caps.sync_response_mode == "sse"
+
+    def test_endpoint_is_cli_chat_proxy_responses(self):
+        # Oracle: the subscription-metered proxy's Responses endpoint (plan decision).
+        assert XAIProvider().endpoint == "https://cli-chat-proxy.grok.com/v1/responses"
+        assert XAIProvider.endpoint == _XAI_ENDPOINT
+
+    def test_provider_registered_in_registry(self):
+        assert PROVIDERS["xai"] is XAIProvider
+
+    def test_provider_capabilities_are_the_full_declaration(self):
+        assert XAIProvider().capabilities is _XAI_CAPABILITIES

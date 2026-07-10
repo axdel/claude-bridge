@@ -31,7 +31,7 @@ from pathlib import Path
 import claude_bridge.config as config
 from claude_bridge.auth import decode_jwt_exp
 from claude_bridge.content import MediaSource, parse_media_source
-from claude_bridge.provider import ProviderCapabilities
+from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.stream import iter_sse_event_blobs, parse_sse_events
 
 # The grok CLI's OAuth client is a *public* OIDC client identifier (like Codex's),
@@ -41,6 +41,11 @@ _XAI_ISSUER = "https://auth.x.ai"
 _XAI_AUTH_KEY_PREFIX = "https://auth.x.ai::"
 _XAI_TOKEN_PATH = "/oauth2/token"  # noqa: S105  # nosec B105  # URL path, not a secret
 _DEFAULT_XAI_AUTH_PATH = Path.home() / ".grok" / "auth.json"
+
+# cli-chat-proxy gates each request on a client-identifier header alongside the version
+# header. This is the grok CLI's own public client name, not a secret. Divergence from
+# Codex (bearer-only) is documented in D-XAI-001 / D-XAI-002.
+_XAI_CLIENT_IDENTIFIER = "grok-cli"
 
 
 def _iso_to_timestamp(value: str) -> float:
@@ -1240,6 +1245,22 @@ def _associate_reasoning_with_calls(output: list[dict]) -> dict[str, dict]:
     return associations
 
 
+# The subscription-metered proxy's Responses endpoint — billed against the grok CLI login,
+# not a separate api.x.ai API key. Chosen over ``api.x.ai/v1/responses`` (see plan decision).
+_XAI_ENDPOINT = "https://cli-chat-proxy.grok.com/v1/responses"
+
+# Full provider capabilities: text + image + document input, array-form tool output, and the
+# identity token-count multiplier (subscription-metered, no OpenAI-compat scaling). References
+# the single ``_XAI_TOKEN_COUNT_MULTIPLIER`` owner rather than re-encoding the literal.
+_XAI_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+    supports_tool_output_content_parts=True,
+    token_count_multiplier=_XAI_TOKEN_COUNT_MULTIPLIER,
+)
+
+
 class XAIProvider:
     """xAI Grok provider — subscription-OAuth backend on cli-chat-proxy.
 
@@ -1247,16 +1268,20 @@ class XAIProvider:
     (``anthropic_to_xai``, ``xai_to_anthropic``, and ``translate_xai_sse_event`` above), plus
     encrypted-reasoning continuity: the reasoning item preceding each tool call is captured
     (from a response or a streamed terminal) and echoed back before its function_call on the
-    next request, so Grok can resume its own chain of thought across tool turns. Auth headers
-    are still a stub, and this module does not yet register ``XAIProvider`` in ``PROVIDERS`` —
-    both land with capability wiring in a later step.
+    next request, so Grok can resume its own chain of thought across tool turns. ``authenticate``
+    resolves the grok subscription bearer from ``~/.grok/auth.json`` (refreshing via OIDC when
+    expired) and pairs it with the ``x-grok-client-version`` / ``x-grok-client-identifier``
+    headers the proxy gates on. Registered as ``PROVIDERS["xai"]`` at module import.
     """
 
     name = "xai"
-    endpoint = "https://api.x.ai/v1/chat/completions"
-    capabilities = _XAI_TEXT_ONLY_CAPABILITIES
+    endpoint = _XAI_ENDPOINT
+    capabilities = _XAI_CAPABILITIES
 
-    def __init__(self) -> None:
+    def __init__(self, *, auth_path: Path | None = None) -> None:
+        # Optional override of ~/.grok/auth.json for testing; the no-arg default resolves the
+        # real subscription file, so the fallback path's ``provider_cls()`` construction works.
+        self._auth_path = auth_path
         # Encrypted reasoning items captured from each tool turn, keyed by the EXACT upstream
         # call_id, so they can be re-injected before their function_calls on the next request.
         # In-memory only — opaque, never persisted, never logged, never returned to Claude Code.
@@ -1264,8 +1289,23 @@ class XAIProvider:
         self._reasoning_lock = threading.Lock()
 
     async def authenticate(self) -> dict[str, str]:
-        """Return xAI auth headers. Requires XAI_API_KEY env var."""
-        raise NotImplementedError("xAI Grok provider not yet implemented")
+        """Return the subscription bearer plus the grok client headers.
+
+        Divergence from Codex (bearer-only): cli-chat-proxy rejects a request whose
+        ``x-grok-client-version`` is older than its floor or that lacks a client identifier,
+        so both accompany the bearer. The opaque bearer is never logged and rides only in the
+        ``Authorization`` header.
+
+        Raises:
+            FileNotFoundError / ValueError: Propagated from ``get_xai_bearer_token`` when the
+                grok auth file is absent, malformed, or expired with no refresh token.
+        """
+        token = await get_xai_bearer_token(self._auth_path)
+        return {
+            "Authorization": f"Bearer {token}",
+            "x-grok-client-version": config.xai_client_version(),
+            "x-grok-client-identifier": _XAI_CLIENT_IDENTIFIER,
+        }
 
     def _stash_reasoning(self, associations: dict[str, dict]) -> None:
         """Store captured reasoning blobs, refreshing recency and evicting the oldest entries
@@ -1384,3 +1424,6 @@ class XAIProvider:
         if started and not terminated:
             for translated in _sse_synthetic_termination(has_tool_calls):
                 yield translated
+
+
+PROVIDERS["xai"] = XAIProvider

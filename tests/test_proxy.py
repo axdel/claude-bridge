@@ -526,26 +526,23 @@ def test_provider_cache_unknown_returns_none():
 
 
 @pytest.mark.asyncio
-async def test_xai_stub_is_not_registered_for_cache_fallback_or_direct_mode(monkeypatch):
-    """The discoverable xAI stub is not a routable runtime provider."""
-    import importlib
-
+async def test_xai_is_registered_and_cache_and_fallback_routable(monkeypatch):
+    """xAI is a registered runtime provider, resolvable via the cache and the fallback chain."""
+    import claude_bridge.providers.xai  # importing registers "xai" in PROVIDERS
     from claude_bridge.proxy import _get_cached_provider, _get_fallback_provider, _provider_cache
 
-    PROVIDERS.pop("xai", None)
     _provider_cache.pop("xai", None)
     monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "xai")
 
     try:
-        xai_module = importlib.import_module("claude_bridge.providers.xai")
-        importlib.reload(xai_module)
-        assert "xai" not in PROVIDERS
-        assert _get_cached_provider("xai") is None
-        assert _get_fallback_provider() is None
-        with pytest.raises(ValueError, match=r"Unknown provider 'xai'\. Available:"):
-            await start_proxy(host="127.0.0.1", port=_find_free_port(), provider_name="xai")
+        assert PROVIDERS["xai"] is claude_bridge.providers.xai.XAIProvider
+        cached = _get_cached_provider("xai")
+        assert cached is not None
+        assert cached.name == "xai"
+        fallback = _get_fallback_provider()
+        assert fallback is not None
+        assert fallback.name == "xai"
     finally:
-        PROVIDERS.pop("xai", None)
         _provider_cache.pop("xai", None)
 
 
@@ -587,11 +584,11 @@ def test_get_fallback_provider_warns_for_unknown_provider(monkeypatch):
 
     stream = io.StringIO()
     configure_logging(level="WARNING", stream=stream)
-    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "xai")
+    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "ghost-provider")
 
     assert _get_fallback_provider() is None
 
-    assert "Fallback provider 'xai' is not registered" in stream.getvalue()
+    assert "Fallback provider 'ghost-provider' is not registered" in stream.getvalue()
 
 
 # ---------------------------------------------------------------------------
