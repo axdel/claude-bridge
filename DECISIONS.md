@@ -283,4 +283,28 @@
 - **Rationale:** A poisoned `auth.json` could otherwise redirect the refresh_token and client_id to an attacker-controlled or internal host (SSRF / credential exfiltration, CWE-918/200); the issuer is a fixed xAI endpoint, so trusting a file-provided `oidc_issuer` buys nothing and only opens the exfil path — rejected honoring it.
 - **Invalidates:** —
 
+### D-BUILD-001 — Make `claude_bridge` editable-installable via a `[build-system]`, not a PYTHONPATH hack
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Add a hatchling `[build-system]` and `[tool.hatch.build.targets.wheel]` targeting `src/claude_bridge`, alongside an empty `[project] dependencies`, so `uv sync` editable-installs the package and venv tooling can import `claude_bridge` from `sys.path`.
+- **Rationale:** The boundary-map gate runs import-linter/grimp, which needs `root_package` importable; the alternative — teaching the protocol's `tool_env` to prepend `PYTHONPATH=src` — was rejected as a per-tool hack the exemplar (claude-protocol itself) avoids by shipping a build backend, and hatchling is build-time only so the stdlib-only runtime (D-RUNTIME-001) is untouched.
+- **Invalidates:** —
+
+### D-DEPS-002 — Add import-linter as a dev-only architecture gate
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Add `import-linter` to `[dependency-groups] dev` and declare three `[tool.importlinter]` contracts — providers mutually independent, proxy dispatches via the abstraction, leaf utilities never import orchestration — enforcing the module import DAG.
+- **Rationale:** The boundary-map primitive delegates to `lint-imports`, so the DAG documented in BOUNDARY_MAP.md needs a mechanical enforcer; import-linter is the Python standard for this and, like Bandit and pip-audit (D-DEPS-001), is dev-only — the runtime stays zero-dependency.
+- **Invalidates:** —
+
+### D-GOV-002 — Provision the six mandatory architecture-primitive registries on this branch
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Author CANONICAL_GLOSSARY, BOUNDARY_MAP, DERIVATION_MAP, RESOURCE_OWNERSHIP, INVARIANTS, and MEMORY_GOVERNANCE at the repo root, grounded in the shipped code, rather than merging with the primitive gap waived.
+- **Rationale:** The review merge gate reported the six mandatory primitives as blocking STUB; provisioning them here — versus deferring to a separate prerequisite track or merging under a waiver — closes the gap in the same branch that first exercised the gate, and the registries derive from the existing architecture so they carry no invented facts.
+- **Invalidates:** —
+
 ## Archive
