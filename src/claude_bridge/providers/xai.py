@@ -21,7 +21,7 @@ import contextlib
 import datetime
 import json
 import os
-import stat
+import tempfile
 import threading
 import time
 import urllib.error
@@ -37,11 +37,15 @@ from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.stream import iter_sse_event_blobs, parse_sse_events
 
 # The grok CLI's OAuth client is a *public* OIDC client identifier (like Codex's),
-# not a secret. The token endpoint is derived from the entry's ``oidc_issuer``;
-# this value is the guaranteed fallback matching the grok CLI's issuer.
+# not a secret. The refresh token endpoint is PINNED to the issuer below — never
+# taken from the (attacker-controllable) auth.json — so a poisoned credential file
+# cannot redirect the refresh_token POST to an arbitrary or internal host
+# (SSRF / credential exfiltration, CWE-918/CWE-200).
 _XAI_ISSUER = "https://auth.x.ai"
 _XAI_AUTH_KEY_PREFIX = "https://auth.x.ai::"
 _XAI_TOKEN_PATH = "/oauth2/token"  # noqa: S105  # nosec B105  # URL path, not a secret
+# The one host the refresh_token may ever be POSTed to (derived from the pinned issuer).
+_TRUSTED_ISSUER_HOST = urllib.parse.urlsplit(_XAI_ISSUER).hostname
 _DEFAULT_XAI_AUTH_PATH = Path.home() / ".grok" / "auth.json"
 
 # cli-chat-proxy gates each request on a client-identifier header alongside the version
@@ -124,6 +128,29 @@ def _xai_token_expired(entry: dict, margin_seconds: int = 30) -> bool:
     return time.time() + margin_seconds >= min(candidates)
 
 
+def _validated_bearer(token: str) -> str:
+    """Return *token* iff it is safe to place in an ``Authorization`` header.
+
+    A bearer JWT is ``token68`` (RFC 7235); we enforce the header-safety subset of
+    that grammar — printable ASCII with no control characters (``isprintable()`` also
+    admits a bare space, which no JWT contains and which cannot inject a header).
+    Rejecting anything else BEFORE header construction stops a
+    CR/LF- or control-char-bearing token (corrupt or poisoned ``auth.json``) from
+    surfacing the secret inside an ``http.client`` "Invalid header value"
+    ``ValueError`` and its traceback (credential leak, CWE-20/CWE-532).
+
+    Raises:
+        ValueError: If the token is empty or carries non-ASCII / non-printable
+            characters. The message never contains the token value.
+    """
+    if not token or not token.isascii() or not token.isprintable():
+        raise ValueError(
+            "xAI bearer token is malformed (non-printable characters); "
+            "run `grok` to re-authenticate."
+        )
+    return token
+
+
 _xai_refresh_lock = asyncio.Lock()
 
 
@@ -146,7 +173,7 @@ async def get_xai_bearer_token(auth_path: Path | None = None) -> str:
         entry_key, entry = read_xai_auth(auth_path)
         token = entry.get("key")
         if isinstance(token, str) and not _xai_token_expired(entry):
-            return token
+            return _validated_bearer(token)
 
         refresh_token = entry.get("refresh_token")
         if not refresh_token:
@@ -157,9 +184,11 @@ async def get_xai_bearer_token(auth_path: Path | None = None) -> str:
             raise ValueError(msg)
 
         client_id = entry.get("oidc_client_id") or entry_key.split("::", 1)[-1]
-        issuer = entry.get("oidc_issuer") or _XAI_ISSUER
-        return await refresh_xai_token(
-            entry_key, refresh_token, client_id, issuer=issuer, auth_path=auth_path
+        # Issuer is PINNED to _XAI_ISSUER (never entry.get("oidc_issuer")): the refresh
+        # POST carries the refresh_token, so a poisoned auth.json must not choose its
+        # destination host.
+        return _validated_bearer(
+            await refresh_xai_token(entry_key, refresh_token, client_id, auth_path=auth_path)
         )
 
 
@@ -176,7 +205,8 @@ async def refresh_xai_token(
     POSTs ``grant_type=refresh_token`` to ``<issuer>/oauth2/token`` (RFC 6749
     §6), then rewrites ``~/.grok/auth.json`` updating ONLY the selected entry's
     ``key`` / ``refresh_token`` / ``expires_at`` — preserving every sibling
-    entry, profile field, unknown field, and the file's permission bits.
+    entry, profile field, and unknown field, and rewriting at owner-only ``0600``
+    perms (D-XAI-003), never the source file's possibly-broad bits.
 
     Returns:
         The new bearer JWT.
@@ -187,6 +217,12 @@ async def refresh_xai_token(
     """
     resolved_path = auth_path or _DEFAULT_XAI_AUTH_PATH
     token_url = f"{issuer.rstrip('/')}{_XAI_TOKEN_PATH}"
+    # Defense in depth: callers already pin the issuer, but refuse outright to POST the
+    # refresh_token anywhere but HTTPS on the trusted xAI host — a standing guard against
+    # any future reintroduction of a dynamic issuer (SSRF, CWE-918).
+    _parts = urllib.parse.urlsplit(token_url)
+    if _parts.scheme != "https" or _parts.hostname != _TRUSTED_ISSUER_HOST:
+        raise ValueError("Refusing to refresh against an untrusted xAI token endpoint.")
 
     def _do_refresh() -> str:
         body = urllib.parse.urlencode(
@@ -238,15 +274,22 @@ async def refresh_xai_token(
                 entry.pop("expires_at", None)
         current[entry_key] = entry
 
-        # Preserve the secret file's permission bits across the atomic replace.
+        # Write the rotated secret through a uniquely-named 0600 descriptor in the
+        # same directory: mkstemp opens O_EXCL (never follows a symlink, never reuses
+        # a predictable name) and the file is owner-only from the instant it exists,
+        # so there is no world-readable umask window (CWE-377/CWE-732). os.replace
+        # then atomically swaps it in, carrying the 0600 mode onto auth.json —
+        # matching D-XAI-003, not the source file's possibly-broad bits.
+        fd, tmp_name = tempfile.mkstemp(dir=resolved_path.parent, prefix=".auth-", suffix=".tmp")
+        tmp_path = Path(tmp_name)
         try:
-            mode = stat.S_IMODE(os.stat(resolved_path).st_mode)
-        except OSError:
-            mode = 0o600
-        tmp_path = resolved_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(current, indent=2))
-        os.chmod(tmp_path, mode)
-        os.replace(tmp_path, resolved_path)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps(current, indent=2))
+            os.replace(tmp_path, resolved_path)
+        finally:
+            # os.replace consumes tmp_path on success; on any failure before it, drop
+            # the partial file rather than leaking a token-bearing temp into ~/.grok.
+            tmp_path.unlink(missing_ok=True)
 
         return new_key
 
@@ -291,7 +334,7 @@ _FILENAME_MAX = 255
 
 # Upper bound on a user-controlled token (block / tool_choice ``type``) embedded in a
 # translation warning — caps log/trace line length against a hostile oversized type.
-_XAI_SAFE_TOKEN_MAX = 64
+_SAFE_TOKEN_MAX = 64
 
 # Instruction sent to xAI when the Anthropic request carries no system prompt (the
 # cli-chat-proxy Responses endpoint expects an instructions string).
@@ -315,8 +358,8 @@ def _safe_token(value: object) -> str:
     the length so a hostile type cannot forge log records or flood the trace.
     """
     cleaned = "".join(ch for ch in str(value) if ch.isprintable())
-    if len(cleaned) > _XAI_SAFE_TOKEN_MAX:
-        return cleaned[:_XAI_SAFE_TOKEN_MAX] + "..."
+    if len(cleaned) > _SAFE_TOKEN_MAX:
+        return cleaned[:_SAFE_TOKEN_MAX] + "..."
     return cleaned
 
 

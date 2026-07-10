@@ -39,6 +39,7 @@ from claude_bridge.providers.xai import (
     _tool_result_parts,
     _translate_document_block,
     _translate_image_block,
+    _validated_bearer,
     _xai_token_expired,
     anthropic_to_xai,
     get_xai_bearer_token,
@@ -72,6 +73,43 @@ _ARRAY_TOOL_CAPS = ProviderCapabilities(
 def _load_fixture(name: str) -> dict:
     """Load a golden xAI wire-capture fixture (see tests/fixtures/xai/README.md)."""
     return json.loads((_FIXTURES / name).read_text())
+
+
+# The only value a committed fixture may carry in an ``encrypted_content`` field. A real
+# provider-issued reasoning continuation is opaque, replayable state that the invariant
+# (xai.py: "In-memory only ... never persisted") forbids checking into the repo.
+_SYNTHETIC_ENCRYPTED_SENTINEL = "SYNTHETIC-TEST-REASONING-BLOB-not-a-real-grok-continuation"
+
+
+def _iter_encrypted_content(node: object) -> list[str]:
+    """Recursively collect every ``encrypted_content`` value in a decoded JSON tree."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "encrypted_content" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(_iter_encrypted_content(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_iter_encrypted_content(item))
+    return found
+
+
+def test_no_fixture_persists_a_real_encrypted_reasoning_blob():
+    """Enforce the in-memory-only reasoning invariant at the fixture layer: no committed
+    fixture may hold a real captured ``encrypted_content`` blob — only the synthetic
+    sentinel. Guards against a future re-capture silently persisting replayable state."""
+    offenders: dict[str, list[str]] = {}
+    for fixture in _FIXTURES.glob("*.json"):
+        blobs = _iter_encrypted_content(json.loads(fixture.read_text()))
+        bad = [b for b in blobs if b != _SYNTHETIC_ENCRYPTED_SENTINEL]
+        if bad:
+            offenders[fixture.name] = bad
+    assert not offenders, (
+        f"Fixtures persist real encrypted_content (must be the synthetic sentinel): "
+        f"{sorted(offenders)}"
+    )
 
 
 def _input_items(result: dict, item_type: str) -> list[dict]:
@@ -322,6 +360,94 @@ class TestGetXaiBearerToken:
         results = await asyncio.gather(*[get_xai_bearer_token(auth_file) for _ in range(5)])
         assert all(r == data[_ENTRY_KEY]["key"] for r in results)
 
+    @pytest.mark.asyncio
+    async def test_poisoned_issuer_ignored_on_refresh(self, monkeypatch, tmp_path: Path):
+        # Confused-deputy pin: the refresh POST carries the refresh_token, so a
+        # poisoned auth.json must NOT choose its destination host. Oracle: the
+        # endpoint is pinned to _XAI_ISSUER + the RFC 6749 token path —
+        # https://auth.x.ai/oauth2/token — regardless of the attacker-controlled
+        # oidc_issuer field. Fails against issuer-derived-from-file code (which
+        # would POST to http://attacker.example/oauth2/token).
+        new_token = _make_jwt({"exp": time.time() + 3600})
+        data = _grok_auth(
+            {
+                "key": _make_jwt({"exp": time.time() - 100}),
+                "expires_at": _iso(time.time() - 100),
+                "oidc_issuer": "http://attacker.example",
+            }
+        )
+        auth_file = _write_grok_auth(tmp_path, data)
+        captured: dict = {}
+
+        def _capture(req, *a, **kw):
+            captured["url"] = req.full_url
+            return _FakeTokenResp({"access_token": new_token, "expires_in": 3600})
+
+        monkeypatch.setattr("urllib.request.urlopen", _capture)
+        result = await get_xai_bearer_token(auth_file)
+        assert result == new_token
+        assert captured["url"] == "https://auth.x.ai/oauth2/token"
+        assert "attacker.example" not in captured["url"]
+
+    @pytest.mark.asyncio
+    async def test_control_char_bearer_rejected_without_leaking_secret(self, tmp_path: Path):
+        # A fresh (valid-exp) but CR/LF-poisoned bearer must be rejected BEFORE it
+        # reaches an Authorization header — else http.client echoes the secret into
+        # an "Invalid header value" ValueError (CWE-532). Oracle: RFC 7235 token68
+        # forbids control chars, and the raised message must NOT contain the token.
+        # Fails against code that skips validation (it would return the poisoned token).
+        valid = _make_jwt({"exp": time.time() + 3600})
+        poisoned = valid + "\r\nX-Injected: evil"
+        data = _grok_auth({"key": poisoned, "expires_at": _iso(time.time() + 3600)})
+        auth_file = _write_grok_auth(tmp_path, data)
+        with pytest.raises(ValueError, match="malformed") as excinfo:
+            await get_xai_bearer_token(auth_file)
+        assert poisoned not in str(excinfo.value)
+        assert "evil" not in str(excinfo.value)
+
+
+# --- _validated_bearer: header-safety gate for the outbound bearer ---
+
+
+class TestValidatedBearer:
+    """_validated_bearer — the header-safety gate for the outbound bearer.
+
+    Oracle: RFC 7235 defines a bearer credential as ``token68`` — printable ASCII
+    with no control characters. Every expected verdict derives from that grammar,
+    never from running the validator. The security invariant: a rejection message
+    never contains the token value (CWE-532).
+    """
+
+    def test_clean_jwt_passes_through_unchanged(self):
+        token = _make_jwt({"exp": time.time() + 3600})
+        assert _validated_bearer(token) == token
+
+    def test_empty_token_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("")
+
+    def test_carriage_return_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("Bearer-good\rX-Injected: evil")
+
+    def test_newline_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("Bearer-good\nX-Injected: evil")
+
+    def test_tab_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("Bearer-good\tinjected")
+
+    def test_non_ascii_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("tökén-with-unicode")
+
+    def test_message_never_contains_the_token_value(self):
+        secret = "SUPER-SECRET-BEARER\r\ninjected"
+        with pytest.raises(ValueError) as excinfo:
+            _validated_bearer(secret)
+        assert "SUPER-SECRET-BEARER" not in str(excinfo.value)
+
 
 # --- refresh_xai_token: persistence, rotation, preservation ---
 
@@ -399,10 +525,13 @@ class TestRefreshXaiToken:
         assert persisted[_ENTRY_KEY]["oidc_issuer"] == "https://auth.x.ai"
 
     @pytest.mark.asyncio
-    async def test_preserves_file_permissions(self, monkeypatch, tmp_path: Path):
+    async def test_refresh_tightens_permissions_to_owner_only(self, monkeypatch, tmp_path: Path):
+        # The rotated secret is ALWAYS rewritten owner-only (0600, D-XAI-003). Even when the
+        # prior file was world/group-readable, the refresh must tighten — never carry broad
+        # bits forward (0644 in must become 0600 out). Fails against mode-preserving code.
         new_token = _make_jwt({"exp": time.time() + 3600})
         auth_file = self._expired_file(tmp_path)
-        auth_file.chmod(0o600)
+        auth_file.chmod(0o644)  # start broad — a world-readable secret
         monkeypatch.setattr(
             "urllib.request.urlopen",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
@@ -518,8 +647,8 @@ class TestRefreshXaiToken:
 
     @pytest.mark.asyncio
     async def test_creates_file_with_default_mode_when_absent(self, monkeypatch, tmp_path: Path):
-        # If the auth file vanished between read and write, stat() fails; the bridge
-        # must fall back to 0o600 (never a world-readable secret) and still persist.
+        # If the auth file does not yet exist, the refresh still persists it owner-only
+        # (0600, never a world-readable secret) via the freshly-created 0600 temp descriptor.
         new_token = _make_jwt({"exp": time.time() + 3600})
         auth_file = tmp_path / ".grok" / "auth.json"
         auth_file.parent.mkdir(parents=True, exist_ok=True)  # dir exists, file does not
@@ -532,6 +661,49 @@ class TestRefreshXaiToken:
         assert auth_file.exists()
         assert stat.S_IMODE(os.stat(auth_file).st_mode) == 0o600
         assert json.loads(auth_file.read_text())[_ENTRY_KEY]["key"] == new_token
+
+    @pytest.mark.asyncio
+    async def test_non_https_issuer_refused_without_posting(self, monkeypatch, tmp_path: Path):
+        # Standing defense-in-depth guard (CWE-918): refuse to POST the refresh_token
+        # to a non-HTTPS endpoint even if a caller passes a downgraded issuer. Oracle:
+        # the security requirement forbids sending the secret over http. The secret
+        # must never leave the process — urlopen is never reached, file byte-identical.
+        auth_file = self._expired_file(tmp_path)
+        before = auth_file.read_bytes()
+        calls: list[int] = []
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: calls.append(1))
+        with pytest.raises(ValueError, match="untrusted"):
+            await refresh_xai_token(
+                _ENTRY_KEY,
+                "refresh-original",
+                _CLIENT_ID,
+                issuer="http://auth.x.ai",
+                auth_path=auth_file,
+            )
+        assert calls == []  # the refresh_token never left the process
+        assert auth_file.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_cross_host_https_issuer_refused_without_posting(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # HTTPS is necessary but not sufficient: the host must be the pinned xAI
+        # issuer host. A cross-origin https issuer (SSRF pivot to an internal service)
+        # is refused before the POST. Oracle: only _TRUSTED_ISSUER_HOST is permitted.
+        auth_file = self._expired_file(tmp_path)
+        before = auth_file.read_bytes()
+        calls: list[int] = []
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: calls.append(1))
+        with pytest.raises(ValueError, match="untrusted"):
+            await refresh_xai_token(
+                _ENTRY_KEY,
+                "refresh-original",
+                _CLIENT_ID,
+                issuer="https://evil.example",
+                auth_path=auth_file,
+            )
+        assert calls == []
+        assert auth_file.read_bytes() == before
 
 
 # --- import decode_jwt_exp used to keep the oracle honest (no unused import) ---
@@ -1907,8 +2079,12 @@ _CID = "call-bb020360-5c8a-4760-a7e6-b9cff0c2e700-0"
 
 
 def _encrypted_reasoning_item() -> dict:
-    """The real captured reasoning item carrying an ``encrypted_content`` blob
-    (reasoning_encrypted.json output[0]) — the continuation state B7 must round-trip."""
+    """The captured reasoning item structure carrying an ``encrypted_content`` field
+    (reasoning_encrypted.json output[0]) — the continuation state B7 must round-trip.
+
+    The opaque blob itself is a synthetic sentinel: the real provider-issued
+    continuation is never persisted to the repo (in-memory-only invariant; see
+    ``test_no_fixture_persists_a_real_encrypted_reasoning_blob``)."""
     return _load_fixture("reasoning_encrypted.json")["output"][0]
 
 
@@ -1921,8 +2097,8 @@ def _real_function_call(call_id: str) -> dict:
 
 
 def _encrypted_reasoning_tool_response(call_id: str = _CID, *, status: str = "completed") -> dict:
-    """Compose a store:false tool turn: a real encrypted reasoning item followed by a real
-    function_call.
+    """Compose a store:false tool turn: a captured encrypted reasoning item (its opaque blob
+    replaced by a synthetic sentinel) followed by a real function_call.
 
     xAI was captured emitting encrypted reasoning (reasoning_encrypted.json — a text turn) and
     tool calls (single_tool_call.json — captured ``store:true``, so no encrypted blob) in
