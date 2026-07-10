@@ -1,7 +1,7 @@
 """Reasoning-continuity contract (T-005 / D-REASON-001) — the bridge's one
 stateful surface, split out of test_contract.py (QAL3).
 
-gpt-5.5 with ``store: false`` rejects a function_call whose required reasoning
+gpt-5.6-sol with ``store: false`` rejects a function_call whose required reasoning
 item is absent. The provider captures encrypted reasoning from each response
 keyed by call_id and re-injects it immediately before the matching function_call
 on the next request — opaque, in-memory, bounded, never leaked. These tests
@@ -118,7 +118,7 @@ def _response_with(output: list[dict]) -> dict:
     """A completed Responses payload wrapping the given output items."""
     return {
         "id": "resp_1",
-        "model": "gpt-5.5",
+        "model": "gpt-5.6-sol",
         "status": "completed",
         "output": output,
         "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -155,7 +155,7 @@ def _reasoning_before(items: list[dict], call_id: str) -> dict | None:
 
 
 class TestReasoningContinuity:
-    """T-005: gpt-5.5 with ``store: false`` rejects a function_call whose required
+    """T-005: gpt-5.6-sol with ``store: false`` rejects a function_call whose required
     reasoning item is absent from the input. The provider asks for encrypted reasoning,
     captures it from each response keyed by call_id, and re-injects it immediately before
     the matching function_call on the next request — opaque, in-memory, never leaked."""

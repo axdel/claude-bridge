@@ -106,20 +106,20 @@ class TestTraceSink:
         monkeypatch.delenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, raising=False)
         target = tmp_path / "trace.jsonl"
         assert is_trace_enabled() is False
-        trace_event("inbound_request", {"model": "gpt-5.5"})
+        trace_event("inbound_request", {"model": "gpt-5.6-sol"})
         assert not target.exists()
 
     def test_enabled_appends_one_json_line_per_event(self, tmp_path, monkeypatch):
         target = tmp_path / "trace.jsonl"
         monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, str(target))
         assert is_trace_enabled() is True
-        trace_event("inbound_request", {"model": "gpt-5.5", "message_count": 3})
+        trace_event("inbound_request", {"model": "gpt-5.6-sol", "message_count": 3})
         trace_event("warning", {"text": "stripped cache_control"})
         lines = target.read_text(encoding="utf-8").splitlines()
         assert len(lines) == 2
         first = json.loads(lines[0])
         assert first["event"] == "inbound_request"
-        assert first["model"] == "gpt-5.5"
+        assert first["model"] == "gpt-5.6-sol"
         assert first["message_count"] == 3
         assert json.loads(lines[1])["event"] == "warning"
 
@@ -128,7 +128,7 @@ class TestTraceSink:
         monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, str(target))
         token = request_id_var.set("deadbeef")
         try:
-            trace_event("inbound_request", {"model": "gpt-5.5"})
+            trace_event("inbound_request", {"model": "gpt-5.6-sol"})
         finally:
             request_id_var.reset(token)
         assert json.loads(target.read_text(encoding="utf-8").splitlines()[0])["req"] == "deadbeef"
@@ -140,7 +140,7 @@ class TestTraceSink:
         a_directory.mkdir()
         monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, str(a_directory))
         # No exception escapes even though opening a directory for append fails.
-        trace_event("inbound_request", {"model": "gpt-5.5"})
+        trace_event("inbound_request", {"model": "gpt-5.6-sol"})
 
 
 class TestTraceFailureVisibility:
@@ -159,7 +159,7 @@ class TestTraceFailureVisibility:
         stream = io.StringIO()
         configure_logging(level="INFO", stream=stream)
 
-        trace_event("inbound_request", {"model": "gpt-5.5"})
+        trace_event("inbound_request", {"model": "gpt-5.6-sol"})
 
         output = stream.getvalue()
         # OPS1: the pre-check path names "not a regular file", distinct from a write
@@ -177,8 +177,8 @@ class TestTraceFailureVisibility:
         stream = io.StringIO()
         configure_logging(level="INFO", stream=stream)
 
-        trace_event("inbound_request", {"model": "gpt-5.5"})
-        trace_event("inbound_request", {"model": "gpt-5.5"})
+        trace_event("inbound_request", {"model": "gpt-5.6-sol"})
+        trace_event("inbound_request", {"model": "gpt-5.6-sol"})
 
         output = stream.getvalue()
         # OPS2: exactly one WARNING reaches the INFO-level operator; the second failure

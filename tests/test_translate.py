@@ -7,7 +7,6 @@ import json
 from claude_bridge.provider import ProviderCapabilities
 from claude_bridge.providers.openai import (
     DEFAULT_MODEL,
-    MODEL_MAP,
     anthropic_to_openai,
     openai_to_anthropic,
 )
@@ -39,7 +38,7 @@ class TestAnthropicToOpenaiTextOnly:
         }
         result, warnings = anthropic_to_openai(request)
 
-        assert result["model"] == "gpt-5.5"
+        assert result["model"] == "gpt-5.6-sol"
         assert result["store"] is False
         assert "max_output_tokens" not in result  # Codex endpoint doesn't support it
         assert len(result["input"]) == 1
@@ -413,15 +412,23 @@ class TestAnthropicToOpenaiModelFallback:
         result, _ = anthropic_to_openai(request)
         assert result["model"] == DEFAULT_MODEL
 
-    def test_all_known_models_mapped(self):
-        for anthropic_model, openai_model in MODEL_MAP.items():
+    def test_current_models_route_to_default(self):
+        """Any Anthropic model — current, older, or future — routes to the single
+        upstream default; routing is not keyed on exact opus/sonnet/haiku versions."""
+        for anthropic_model in (
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+            "claude-fable-5",
+            "claude-opus-4-6",  # older release still routes correctly
+        ):
             request = {
                 "model": anthropic_model,
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "Hi"}],
             }
             result, _ = anthropic_to_openai(request)
-            assert result["model"] == openai_model
+            assert result["model"] == DEFAULT_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +461,7 @@ class TestOpenaiToAnthropicTextOnly:
     def test_basic_text_response(self):
         response = {
             "id": "resp_abc123",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "completed",
             "output": [
                 {
@@ -470,7 +477,7 @@ class TestOpenaiToAnthropicTextOnly:
         assert result["id"] == "msg_bridge_resp_abc123"
         assert result["type"] == "message"
         assert result["role"] == "assistant"
-        assert result["model"] == "gpt-5.5"
+        assert result["model"] == "gpt-5.6-sol"
         assert result["stop_reason"] == "end_turn"
         assert result["content"] == [{"type": "text", "text": "Hello back!"}]
         assert result["usage"] == {"input_tokens": 12, "output_tokens": 6}
@@ -478,7 +485,7 @@ class TestOpenaiToAnthropicTextOnly:
     def test_incomplete_status_maps_to_max_tokens(self):
         response = {
             "id": "resp_xyz",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "incomplete",
             "output": [
                 {
@@ -496,7 +503,7 @@ class TestOpenaiToAnthropicTextOnly:
     def test_unknown_status_defaults_to_end_turn(self):
         response = {
             "id": "resp_unk",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "cancelled",
             "output": [],
             "usage": {"input_tokens": 0, "output_tokens": 0},
@@ -506,7 +513,7 @@ class TestOpenaiToAnthropicTextOnly:
 
     def test_missing_id_uses_unknown(self):
         response = {
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "completed",
             "output": [],
             "usage": {"input_tokens": 0, "output_tokens": 0},
@@ -526,7 +533,7 @@ class TestOpenaiToAnthropicToolUse:
     def test_function_call_to_tool_use(self):
         response = {
             "id": "resp_tools",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "completed",
             "output": [
                 {
@@ -551,7 +558,7 @@ class TestOpenaiToAnthropicToolUse:
     def test_mixed_text_and_tool_use(self):
         response = {
             "id": "resp_mixed",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "completed",
             "output": [
                 {
@@ -587,7 +594,7 @@ class TestTranslationRobustness:
         """json.loads on malformed arguments falls back to _raw wrapper."""
         response = {
             "id": "resp_bad",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "completed",
             "output": [
                 {
@@ -808,7 +815,7 @@ class TestTranslationRobustness:
         """Empty string arguments parses to empty dict."""
         response = {
             "id": "resp_empty",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "completed",
             "output": [
                 {

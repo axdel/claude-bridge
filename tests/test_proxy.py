@@ -247,7 +247,7 @@ def _codex_text_sse(
     text: str,
     *,
     resp_id: str = "resp_test123",
-    model: str = "gpt-5.5",
+    model: str = "gpt-5.6-sol",
     input_tokens: int = 10,
     output_tokens: int = 5,
 ) -> bytes:
@@ -297,7 +297,7 @@ def _codex_tool_sse(
     name: str = "get_weather",
     arg_fragments: tuple[str, ...] = ('{"city":', '"NYC"}'),
     resp_id: str = "resp_tool1",
-    model: str = "gpt-5.5",
+    model: str = "gpt-5.6-sol",
 ) -> bytes:
     """A faithful Codex Responses SSE stream for a tool-call turn.
 
@@ -1598,7 +1598,7 @@ def _text_stream_events() -> list[dict]:
                     "type": "message",
                     "role": "assistant",
                     "content": [],
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "stop_reason": None,
                     "usage": {"input_tokens": 10, "output_tokens": 0},
                 },
@@ -1652,7 +1652,7 @@ def test_aggregate_stream_to_message_concatenates_text_deltas():
     # Oracle: "Hel" + "lo" = "Hello" by the streaming spec (deltas concatenate).
     assert message["content"] == [{"type": "text", "text": "Hello"}]
     assert message["id"] == "msg_bridge_resp_x"
-    assert message["model"] == "gpt-5.5"
+    assert message["model"] == "gpt-5.6-sol"
     assert message["role"] == "assistant"
     assert message["type"] == "message"
     assert message["stop_reason"] == "end_turn"
@@ -1671,7 +1671,7 @@ def test_aggregate_stream_to_message_parses_tool_use_json():
                 "type": "message_start",
                 "message": {
                     "id": "msg_bridge_t",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "usage": {"input_tokens": 7, "output_tokens": 0},
                 },
             },
@@ -1738,7 +1738,7 @@ def test_aggregate_stream_to_message_preserves_block_order():
                 "type": "message_start",
                 "message": {
                     "id": "msg_bridge_o",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "usage": {"input_tokens": 1, "output_tokens": 0},
                 },
             },
@@ -1812,7 +1812,7 @@ def test_aggregate_stream_to_message_malformed_tool_json_keeps_raw():
                 "type": "message_start",
                 "message": {
                     "id": "msg_bridge_m",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "usage": {"input_tokens": 1, "output_tokens": 0},
                 },
             },
@@ -1878,7 +1878,7 @@ async def test_forward_via_provider_codex_empty_output_populates_text(_codex_sse
     # Oracle: the two deltas of "hello from codex deltas" reassemble verbatim.
     assert response["content"] == [{"type": "text", "text": "hello from codex deltas"}]
     assert response["stop_reason"] == "end_turn"
-    assert response["model"] == "gpt-5.5"
+    assert response["model"] == "gpt-5.6-sol"
     # The auto-compact signal uses the OpenAI provider compatibility multiplier.
     assert response["usage"]["input_tokens"] == 12
     assert response["usage"]["output_tokens"] == 6

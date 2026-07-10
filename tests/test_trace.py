@@ -203,7 +203,7 @@ class TestSummarizeProviderRequest:
         from claude_bridge.proxy import _summarize_provider_request
 
         translated = {
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "input": [],
             "tools": [{"type": "function", "name": "Read"}],
             "tool_choice": {"type": "function", "name": "Read"},
@@ -234,7 +234,7 @@ class TestSummarizeProviderRequest:
         from claude_bridge.proxy import _summarize_provider_request
 
         translated = {
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "input": [
                 {"type": "reasoning", "id": "rs_1", "encrypted_content": "SECRET_REASONING"},
                 {"type": "function_call", "id": "fc_1", "call_id": "fc_1", "name": "Read"},
@@ -330,7 +330,7 @@ class TestMediaTraceSummary:
 
         img_b64 = base64.b64encode(b"\x89PNG" + b"\x00" * 400).decode()
         translated = {
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "input": [
                 {
                     "role": "user",

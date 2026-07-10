@@ -106,7 +106,7 @@ class TestOpenAIToAnthropicSSETranslation:
                 "type": "response.created",
                 "response": {
                     "id": "resp_123",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "in_progress",
                     "usage": {"input_tokens": 42, "output_tokens": 0},
                 },
@@ -134,7 +134,7 @@ class TestOpenAIToAnthropicSSETranslation:
                 "type": "response.created",
                 "response": {
                     "id": "resp_flt_start",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "in_progress",
                     "usage": {"input_tokens": 42.0, "output_tokens": 0},
                 },
@@ -208,7 +208,7 @@ class TestOpenAIToAnthropicSSETranslation:
                 "type": "response.completed",
                 "response": {
                     "id": "resp_456",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "completed",
                     "usage": {"input_tokens": 10, "output_tokens": 25},
                 },
@@ -248,7 +248,7 @@ class TestOpenAIToAnthropicSSETranslation:
                 "type": "response.completed",
                 "response": {
                     "id": "resp_flt",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "completed",
                     "usage": {"input_tokens": 10.0, "output_tokens": 25.7},
                 },
@@ -289,7 +289,7 @@ class TestTerminalStreamEvents:
                 "type": "response.incomplete",
                 "response": {
                     "id": "resp_inc",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "incomplete",
                     "incomplete_details": {"reason": "max_output_tokens"},
                     "usage": {"input_tokens": 5, "output_tokens": 100},
@@ -313,7 +313,7 @@ class TestTerminalStreamEvents:
                 "type": "response.incomplete",
                 "response": {
                     "id": "resp_inc_cf",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "incomplete",
                     "incomplete_details": {"reason": "content_filter"},
                     "usage": {"input_tokens": 5, "output_tokens": 2},
@@ -350,7 +350,7 @@ class TestTerminalStreamEvents:
                 "type": "response.incomplete",
                 "response": {
                     "id": "resp_inc_nodetails",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "incomplete",
                     "usage": {"input_tokens": 5, "output_tokens": 100},
                 },
@@ -506,7 +506,7 @@ class TestTranslateStream:
                 "type": "response.created",
                 "response": {
                     "id": "resp_1",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "in_progress",
                     "usage": {"input_tokens": 10, "output_tokens": 0},
                 },
@@ -527,7 +527,7 @@ class TestTranslateStream:
                 "type": "response.completed",
                 "response": {
                     "id": "resp_1",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "completed",
                     "usage": {"input_tokens": 10, "output_tokens": 5},
                 },
@@ -680,7 +680,7 @@ class TestTranslateStream:
                 "type": "response.incomplete",
                 "response": {
                     "id": "resp_cf3",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "incomplete",
                     "incomplete_details": {"reason": "content_filter"},
                     "usage": {"input_tokens": 5, "output_tokens": 2},
@@ -724,7 +724,7 @@ class TestTranslateStream:
                 "type": "response.created",
                 "response": {
                     "id": "resp_inc_stream",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "in_progress",
                     "usage": {"input_tokens": 10, "output_tokens": 0},
                 },
@@ -745,7 +745,7 @@ class TestTranslateStream:
                 "type": "response.incomplete",
                 "response": {
                     "id": "resp_inc_stream",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "incomplete",
                     "incomplete_details": {"reason": "max_output_tokens"},
                     "usage": {"input_tokens": 10, "output_tokens": 4096},
@@ -782,7 +782,7 @@ class TestTranslateStream:
                 "type": "response.created",
                 "response": {
                     "id": "resp_tool_drop",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "in_progress",
                     "usage": {"input_tokens": 10, "output_tokens": 0},
                 },
@@ -826,7 +826,7 @@ class TestTranslateStream:
                 "type": "response.created",
                 "response": {
                     "id": "resp_drop",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "in_progress",
                     "usage": {"input_tokens": 10, "output_tokens": 0},
                 },
@@ -864,7 +864,7 @@ class TestTranslateStream:
                 "type": "response.created",
                 "response": {
                     "id": "resp_fail_stream",
-                    "model": "gpt-5.5",
+                    "model": "gpt-5.6-sol",
                     "status": "in_progress",
                     "usage": {"input_tokens": 10, "output_tokens": 0},
                 },

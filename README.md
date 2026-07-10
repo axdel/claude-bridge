@@ -139,7 +139,7 @@ You'll see:
 | (__| | (_| | |_| | (_| |  __/|___||(_| (_) | (_| |  __/>  <
  \___|_|\__,_|\__,_|\__,_|\___|     \___\___/ \__,_|\___/_/\_\
 
- port:9472  pid:12345  model:gpt-5.5  version:0.7.0
+ port:9472  pid:12345  model:gpt-5.6-sol  version:0.7.0
  by axdel  github.com/axdel/claude-bridge
 ```
 
@@ -241,7 +241,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
     "started_at": "2026-03-20T10:00:00+00:00",
     "uptime_seconds": 3600.0,
     "provider_name": "openai",
-    "model": "gpt-5.5"
+    "model": "gpt-5.6-sol"
 }
 ```
 

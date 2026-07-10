@@ -122,12 +122,13 @@ async def refresh_access_token(refresh_token: str, auth_path: Path | None = None
 # Anthropic <-> OpenAI translation (pure functions, no I/O)
 # ---------------------------------------------------------------------------
 
-MODEL_MAP: dict[str, str] = {
-    "claude-opus-4-6": "gpt-5.5",
-    "claude-sonnet-4-6": "gpt-5.5",
-    "claude-haiku-4-5-20251001": "gpt-5.5",
-}
-DEFAULT_MODEL = "gpt-5.5"
+# Every Anthropic model Claude Code sends is routed to one upstream OpenAI model.
+# There are no per-model overrides, so this map is empty and DEFAULT_MODEL applies
+# to every request — the routing is not keyed on exact opus/sonnet/haiku versions,
+# so new Claude releases need no change here. (Add an entry only to override a
+# specific model to a different upstream target.)
+MODEL_MAP: dict[str, str] = {}
+DEFAULT_MODEL = "gpt-5.6-sol"
 GPT_TOKEN_COUNT_MULTIPLIER = 1.2
 
 _STRIPPED_KEYS = ("output_config",)
@@ -626,7 +627,7 @@ def anthropic_to_openai(
     # its required reasoning item".
     result: dict = {
         "model": translated_model,
-        "reasoning": {"effort": "xhigh"},
+        "reasoning": {"effort": "max"},
         "store": False,
         "stream": True,
         "include": ["reasoning.encrypted_content"],

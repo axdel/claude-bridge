@@ -116,7 +116,7 @@ OPENAI_TEXT_THEN_TOOL_STREAM: bytes = (
             "type": "response.created",
             "response": {
                 "id": "resp_1",
-                "model": "gpt-5.5",
+                "model": "gpt-5.6-sol",
                 "usage": {"input_tokens": 50, "output_tokens": 0},
             },
         },
@@ -159,7 +159,7 @@ OPENAI_TEXT_THEN_TOOL_STREAM: bytes = (
             "type": "response.completed",
             "response": {
                 "id": "resp_1",
-                "model": "gpt-5.5",
+                "model": "gpt-5.6-sol",
                 "status": "completed",
                 "output": [{"type": "function_call", "name": "Read"}],
                 "usage": {"input_tokens": 50, "output_tokens": 12},
@@ -235,7 +235,7 @@ class TestSystemContextContract:
 
 
 class TestMediaContentContract:
-    """A pasted image/PDF must reach gpt-5.5 as a real Responses content part when the
+    """A pasted image/PDF must reach gpt-5.6-sol as a real Responses content part when the
     provider declares the modality, and degrade to a redacted placeholder (never
     echoing base64) otherwise. Expected shapes are the OpenAI Responses spec:
     ``input_image.image_url`` is a STRING data URL; ``input_file`` carries
@@ -587,7 +587,7 @@ class TestRequestInvariants:
         # Privacy posture (store=False) and streaming are contract invariants.
         assert result["store"] is False
         assert result["stream"] is True
-        assert result["model"] == "gpt-5.5"
+        assert result["model"] == "gpt-5.6-sol"
 
     def test_tools_use_flat_function_shape_with_strict_false(self):
         result, _ = anthropic_to_openai(CLAUDE_CODE_TOOL_LOOP)
@@ -838,7 +838,7 @@ class TestOracleEnvelopeShape:
         """A minimal completed Responses payload: one assistant text turn."""
         return {
             "id": "resp_oracle",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "status": "completed",
             "output": [{"type": "message", "content": [{"type": "output_text", "text": "Done."}]}],
             "usage": {"input_tokens": 12, "output_tokens": 3},
