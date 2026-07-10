@@ -2,6 +2,28 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-07-10
+
+### feat: swap Gemini provider for Grok (xAI) ([PR #14](https://github.com/axdel/claude-bridge/pull/14))
+Remove the Gemini provider and add a Grok (xAI) provider mirroring the Codex subscription-OAuth model (~/.grok bearer + OIDC refresh, no API key); provision the six architecture-primitive registries with import-linter enforcement.
+
+- [`9c08410`](https://github.com/axdel/claude-bridge/commit/9c08410) Record D-XAI-007 pinning the xAI OIDC issuer against SSRF
+- [`713d52d`](https://github.com/axdel/claude-bridge/commit/713d52d) Harden xAI credential handling and sanitize reasoning fixture
+- [`2b5be1d`](https://github.com/axdel/claude-bridge/commit/2b5be1d) Harden claude-grok launcher startup path and liveness
+- [`e7203d7`](https://github.com/axdel/claude-bridge/commit/e7203d7) Document xAI Grok provider, remove Gemini from docs, bump to 0.9.0
+- [`f1f8d35`](https://github.com/axdel/claude-bridge/commit/f1f8d35) Record the xAI provider and Gemini-removal decision set
+- [`8bb5f24`](https://github.com/axdel/claude-bridge/commit/8bb5f24) Add cross-layer contract coverage for the xAI provider
+- [`403ca8f`](https://github.com/axdel/claude-bridge/commit/403ca8f) Wire xAI Grok provider — capabilities, registration, launcher
+- [`3682472`](https://github.com/axdel/claude-bridge/commit/3682472) Carry xAI encrypted reasoning across tool turns
+- [`6225444`](https://github.com/axdel/claude-bridge/commit/6225444) Translate xAI Responses SSE streams to Anthropic Messages events
+- [`81edc38`](https://github.com/axdel/claude-bridge/commit/81edc38) Translate xAI Responses objects to Anthropic Messages responses
+- [`039fe78`](https://github.com/axdel/claude-bridge/commit/039fe78) Forward image and document media to xAI Responses parts
+- [`c7928fa`](https://github.com/axdel/claude-bridge/commit/c7928fa) Translate Anthropic requests to xAI Responses format
+- [`11178bb`](https://github.com/axdel/claude-bridge/commit/11178bb) Add xAI model + client-version config resolvers
+- [`2e4d836`](https://github.com/axdel/claude-bridge/commit/2e4d836) Add xAI subscription-OAuth token module
+- [`071ccdc`](https://github.com/axdel/claude-bridge/commit/071ccdc) Capture xAI Grok wire fixtures (live characterization)
+- [`9e32101`](https://github.com/axdel/claude-bridge/commit/9e32101) Remove Gemini provider
+
 ## 2026-06-19
 
 ### v0.8.1 — Lockfile Version Sync

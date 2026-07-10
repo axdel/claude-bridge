@@ -502,6 +502,59 @@ async def test_direct_mode_skips_anthropic(_openai_mock_url: str):
         await server.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_direct_mode_binds_real_registered_xai_provider():
+    """start_proxy(provider_name='xai') instantiates the REAL registered provider.
+
+    Closes the gap between the entry-point wiring test (which stubs start_proxy) and the
+    cache/fallback routing tests (which never exercise the direct-mode branch): here the
+    real ``start_proxy`` resolves ``PROVIDERS['xai']`` → XAIProvider, instantiates it no-arg,
+    and validates it against the Provider protocol. Oracle: a running server is returned
+    (no ``ValueError('Unknown provider')`` and no protocol-validation failure). A dead
+    upstream guarantees the bind never depends on Anthropic.
+    """
+    import claude_bridge.providers.xai  # importing registers "xai" in PROVIDERS
+
+    # Precondition: the import above registered the real provider (not a stub).
+    assert PROVIDERS["xai"] is claude_bridge.providers.xai.XAIProvider
+    proxy_port = _find_free_port()
+    dead_upstream = f"http://127.0.0.1:{_find_free_port()}"
+    server = await start_proxy(
+        host="127.0.0.1",
+        port=proxy_port,
+        upstream_url=dead_upstream,
+        provider_name="xai",
+    )
+    try:
+        assert server.is_serving()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_direct_mode_threads_provider_kwargs_to_real_xai_constructor():
+    """Direct mode passes provider_kwargs into XAIProvider's real constructor.
+
+    Oracle: XAIProvider's keyword-only signature (``*, auth_path=None``) rejects an unknown
+    keyword, so an unexpected kwarg raises TypeError out of ``provider_cls(**provider_kwargs)``.
+    A direct-mode branch that ignored provider_kwargs — or routed to a ``**kwargs``-accepting
+    provider — would bind silently instead of raising. Proves the kwargs the entry point
+    resolves ({} for xai) genuinely reach the real provider constructor, not a discarded copy.
+    """
+    import claude_bridge.providers.xai  # importing registers "xai" in PROVIDERS
+
+    # Precondition: the import above registered the real provider (not a stub).
+    assert PROVIDERS["xai"] is claude_bridge.providers.xai.XAIProvider
+    with pytest.raises(TypeError):
+        await start_proxy(
+            host="127.0.0.1",
+            port=_find_free_port(),
+            provider_name="xai",
+            provider_kwargs={"unexpected_kwarg": True},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Provider cache + configurable fallback tests
 # ---------------------------------------------------------------------------
@@ -526,26 +579,23 @@ def test_provider_cache_unknown_returns_none():
 
 
 @pytest.mark.asyncio
-async def test_xai_stub_is_not_registered_for_cache_fallback_or_direct_mode(monkeypatch):
-    """The discoverable xAI stub is not a routable runtime provider."""
-    import importlib
-
+async def test_xai_is_registered_and_cache_and_fallback_routable(monkeypatch):
+    """xAI is a registered runtime provider, resolvable via the cache and the fallback chain."""
+    import claude_bridge.providers.xai  # importing registers "xai" in PROVIDERS
     from claude_bridge.proxy import _get_cached_provider, _get_fallback_provider, _provider_cache
 
-    PROVIDERS.pop("xai", None)
     _provider_cache.pop("xai", None)
     monkeypatch.setenv("LLM_BRIDGE_FALLBACK", "xai")
 
     try:
-        xai_module = importlib.import_module("claude_bridge.providers.xai")
-        importlib.reload(xai_module)
-        assert "xai" not in PROVIDERS
-        assert _get_cached_provider("xai") is None
-        assert _get_fallback_provider() is None
-        with pytest.raises(ValueError, match=r"Unknown provider 'xai'\. Available:"):
-            await start_proxy(host="127.0.0.1", port=_find_free_port(), provider_name="xai")
+        assert PROVIDERS["xai"] is claude_bridge.providers.xai.XAIProvider
+        cached = _get_cached_provider("xai")
+        assert cached is not None
+        assert cached.name == "xai"
+        fallback = _get_fallback_provider()
+        assert fallback is not None
+        assert fallback.name == "xai"
     finally:
-        PROVIDERS.pop("xai", None)
         _provider_cache.pop("xai", None)
 
 
@@ -587,11 +637,11 @@ def test_get_fallback_provider_warns_for_unknown_provider(monkeypatch):
 
     stream = io.StringIO()
     configure_logging(level="WARNING", stream=stream)
-    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "xai")
+    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "ghost-provider")
 
     assert _get_fallback_provider() is None
 
-    assert "Fallback provider 'xai' is not registered" in stream.getvalue()
+    assert "Fallback provider 'ghost-provider' is not registered" in stream.getvalue()
 
 
 # ---------------------------------------------------------------------------

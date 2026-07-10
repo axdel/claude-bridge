@@ -39,7 +39,7 @@ Claude Code  -->  Claude Bridge (localhost:9999)  -->  Anthropic (passthrough)
                            |
                      circuit breaker
                            |
-                     Provider adapter  -->  OpenAI / Gemini / ...
+                     Provider adapter  -->  OpenAI / xAI / ...
 ```
 
 1. Claude Code sends an Anthropic Messages API request to `localhost:9999`
@@ -56,11 +56,11 @@ of leaking provider-incompatible content.
 ## Features
 
 - **Zero dependencies** — stdlib-only Python, no `pip install`
-- **Direct API key auth** — set `OPENAI_API_KEY` or `GEMINI_API_KEY` for official APIs
-- **Subscription OAuth** — no API key? Falls back to Codex OAuth (OpenAI) or Gemini CLI OAuth (Google) automatically
-- **OpenAI reasoning continuity** — encrypted reasoning blobs are cached in memory and echoed across tool turns
-- **Reasoning passthrough controls** — OpenAI can preserve or drop thinking blocks; Gemini strips them with a warning
-- **Non-text input** — image and document (PDF) blocks forward to OpenAI as `input_image`/`input_file`, including media nested in `tool_result`; unsupported media degrades to a redacted placeholder with a warning (never echoes the payload)
+- **Direct API key auth** — set `OPENAI_API_KEY` for the official OpenAI Responses API
+- **Subscription OAuth** — no API key? Uses Codex OAuth (OpenAI, `~/.codex/auth.json`) or Grok CLI OAuth (xAI, `~/.grok/auth.json`) automatically — xAI is subscription-only, no API key
+- **Reasoning continuity** — encrypted reasoning blobs are cached in memory and echoed across tool turns (OpenAI and xAI)
+- **Reasoning passthrough controls** — `REASONING_MODE` preserves or drops thinking blocks (OpenAI and xAI)
+- **Non-text input** — image and document (PDF) blocks forward to OpenAI and xAI as `input_image`/`input_file`, including media nested in `tool_result`; unsupported media degrades to a redacted placeholder with a warning (never echoes the payload)
 - **Auto-failover** — circuit breaker routes Anthropic 429/500/502/503 to the first available fallback provider
 - **Retry with backoff** — transient HTTP errors retried once with 0.5s exponential backoff
 - **Mid-turn failover guard** — blocks provider switch during active tool-use turns
@@ -73,7 +73,7 @@ of leaking provider-incompatible content.
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
 - **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
 - **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
-- **398 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **558 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -81,31 +81,34 @@ of leaking provider-incompatible content.
 
 - **Anthropic account** — for Claude Code ([console.anthropic.com](https://console.anthropic.com/))
 - **OpenAI access** — either `OPENAI_API_KEY` for the standard Responses API or ChatGPT Plus for Codex OAuth
-- **Gemini access** — either `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey) or Google One AI Premium for Gemini CLI OAuth
+- **xAI access** — a Grok subscription, reached through xAI's grok CLI (`grok login` → `~/.grok/auth.json`); no API key
 
 ### Software (macOS)
 
 ```bash
-brew install python claude-code codex gemini
+brew install python claude-code codex
+
+# xAI's grok CLI self-installs its own binary under ~/.grok/bin (not via brew).
+# Install it per xAI's grok CLI instructions, then it is on your PATH as `grok`.
 
 # Verify
 python3 --version    # 3.12+
 claude --version
 codex --version
-gemini --version
+grok --version
 
 # Optional: authenticate with subscriptions when not using API keys
 codex login                        # ChatGPT Plus OAuth path
-gemini login                       # Google One AI Premium OAuth path
+grok login                         # xAI Grok subscription OAuth path
 cat ~/.codex/auth.json             # should show access_token
-cat ~/.gemini/oauth_creds.json     # should show access_token
+cat ~/.grok/auth.json              # should show an xAI OAuth entry (keyed by issuer)
 ```
 
 > **macOS only** for now (brew dependencies). Linux support is untested.
 > **No `pip install` needed** — the bridge is stdlib-only Python.
-> Codex CLI is for the OpenAI OAuth path, Gemini CLI is for the Gemini OAuth path.
-> If you set `OPENAI_API_KEY` or `GEMINI_API_KEY`, the matching direct provider mode uses
-> the official API instead.
+> Codex CLI is for the OpenAI OAuth path, grok CLI is for the xAI OAuth path.
+> If you set `OPENAI_API_KEY`, direct OpenAI mode uses the official API instead. xAI has no
+> API-key mode — it always reuses the grok CLI subscription credentials.
 
 ## Install
 
@@ -116,10 +119,10 @@ cd claude-bridge
 # Make the launchers available system-wide
 mkdir -p ~/.local/bin
 ln -sf "$(pwd)/claude-codex" ~/.local/bin/claude-codex
-ln -sf "$(pwd)/claude-gemini" ~/.local/bin/claude-gemini
+ln -sf "$(pwd)/claude-grok" ~/.local/bin/claude-grok
 
 # Verify
-which claude-codex claude-gemini || echo 'Add to PATH: echo "export PATH=\$HOME/.local/bin:\$PATH" >> ~/.zshrc && source ~/.zshrc'
+which claude-codex claude-grok || echo 'Add to PATH: echo "export PATH=\$HOME/.local/bin:\$PATH" >> ~/.zshrc && source ~/.zshrc'
 ```
 
 ## Usage
@@ -128,7 +131,7 @@ which claude-codex claude-gemini || echo 'Add to PATH: echo "export PATH=\$HOME/
 
 ```bash
 claude-codex     # use OpenAI GPT-5.5 (ChatGPT Plus subscription or OPENAI_API_KEY)
-claude-gemini    # use Gemini 3 Flash OAuth by default, or API key mode with GEMINI_API_KEY
+claude-grok      # use xAI Grok (grok-4.20) via your Grok subscription
 ```
 
 You'll see:
@@ -139,27 +142,26 @@ You'll see:
 | (__| | (_| | |_| | (_| |  __/|___||(_| (_) | (_| |  __/>  <
  \___|_|\__,_|\__,_|\__,_|\___|     \___\___/ \__,_|\___/_/\_\
 
- port:9472  pid:12345  model:gpt-5.6-sol  version:0.7.0
+ port:9472  pid:12345  model:gpt-5.6-sol  version:0.9.0
  by axdel  github.com/axdel/claude-bridge
 ```
 
 or
 
 ```
-      _                 _                                _       _
-  ___| | __ _ _   _  __| | ___       __ _  ___ _ __ ___ (_)_ __ (_)
- / __| |/ _` | | | |/ _` |/ _ \ ___ / _` |/ _ \ '_ ` _ \| | '_ \| |
-| (__| | (_| | |_| | (_| |  __/|___| (_| |  __/ | | | | | | | | | |
- \___|_|\__,_|\__,_|\__,_|\___|     \__, |\___|_| |_| |_|_|_| |_|_|
-                                    |___/
- port:9738  pid:59952  model:gemini-3-flash-preview  version:0.7.0
+      _                 _                            _
+  ___| | __ _ _   _  __| | ___        __ _ _ __ ___ | | __
+ / __| |/ _` | | | |/ _` |/ _ \_____ / _` | '__/ _ \| |/ /
+| (__| | (_| | |_| | (_| |  __/_____| (_| | | | (_) |   <
+ \___|_|\__,_|\__,_|\__,_|\___|      \__, |_|  \___/|_|\_\
+                                     |___/
+ port:9738  pid:59952  model:grok-4.20  version:0.9.0
  by axdel  github.com/axdel/claude-bridge
 ```
 
 > Claude Code's banner still says "Sonnet 4.6" — it doesn't know about the bridge.
 > For `claude-codex`, the actual model is the GPT-5.5 model shown in the bridge banner.
-> For `claude-gemini`, the banner shows the `GEMINI_MODEL` launcher value; API-key mode
-> defaults to `gemini-2.5-pro` unless you set `GEMINI_MODEL`.
+> For `claude-grok`, the model is `grok-4.20` (override with `XAI_MODEL`).
 
 The bridge starts on a random port, launches Claude Code through it, and cleans up on exit.
 
@@ -167,21 +169,20 @@ The bridge starts on a random port, launches Claude Code through it, and cleans 
 
 ```bash
 claude-codex              # OpenAI/Codex (GPT-5.5)
-claude-gemini             # Google Gemini OAuth (gemini-3-flash-preview)
+claude-grok               # xAI Grok subscription (grok-4.20)
 claude-codex --debug      # show bridge translation logs
-claude-gemini --debug     # same for Gemini
+claude-grok --debug       # same for Grok
 claude-codex -- -p opus   # pass flags through to claude
 ```
 
-Override the Gemini model:
+Override the Grok model:
 ```bash
-GEMINI_MODEL=gemini-2.5-pro claude-gemini      # stable pro model
-GEMINI_MODEL=gemini-3.1-pro-preview claude-gemini  # latest pro (may have capacity limits)
+XAI_MODEL=grok-4.20 claude-grok    # default; set to any model your Grok subscription exposes
 ```
 
 ### Verify it works
 
-After launching with `claude-codex` or `claude-gemini`, paste this into Claude Code:
+After launching with `claude-codex` or `claude-grok`, paste this into Claude Code:
 
 > Verify Claude Code uses the local bridge: check ANTHROPIC_BASE_URL, find the bridge port, hit /stats, send one test request, compare stats.
 
@@ -219,7 +220,7 @@ claude
 The bridge uses the first registered provider in the list; it does not cascade across
 later providers after a provider-side failure.
 ```bash
-LLM_BRIDGE_FALLBACK=gemini,openai ./start.sh
+LLM_BRIDGE_FALLBACK=xai,openai ./start.sh
 ```
 
 ## Metrics
@@ -250,9 +251,9 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | Env Var | Default | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
-| `GEMINI_API_KEY` | _(none)_ | Google Gemini API key — direct Gemini mode uses the public API when set; otherwise it uses Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) |
-| `GEMINI_MODEL` | API-key: `gemini-2.5-pro`; OAuth: `gemini-3-flash-preview` | Gemini model override. Both auth modes honor the same env var; when unset, API-key mode uses the API-key default and OAuth mode uses the OAuth default |
-| `REASONING_MODE` | `passthrough` | OpenAI thinking-block handling: `passthrough` preserves tagged thinking text, `drop` strips it. Gemini strips thinking blocks because it has no equivalent |
+| `XAI_MODEL` | `grok-4.20` | xAI Grok model id used by the `xai` provider |
+| `XAI_CLIENT_VERSION` | highest installed grok CLI bundle (floor `0.1.202`) | Override for the `x-grok-client-version` header the cli-chat-proxy gates on; when unset, resolved from the newest `~/.grok/downloads/grok-<ver>-*` bundle |
+| `REASONING_MODE` | `passthrough` | Thinking-block handling for OpenAI and xAI: `passthrough` preserves tagged thinking text, `drop` strips it |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `UPSTREAM_TIMEOUT` | caller default (`60` sync / `120` streaming) | Upstream request timeout in seconds; invalid, zero, or negative values fall back to the caller default |
 | `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10 MiB) |
@@ -276,8 +277,7 @@ src/claude_bridge/
 └── providers/
     ├── __init__.py   # Provider registration notes
     ├── openai.py     # OpenAI: API key + Codex OAuth + Responses API translation
-    ├── gemini.py     # Gemini: API key + Gemini CLI OAuth + generateContent translation
-    └── xai.py        # xAI Grok: unregistered placeholder, not implemented
+    └── xai.py        # xAI Grok: grok CLI subscription OAuth + cli-chat-proxy Responses translation
 ```
 
 ### Adding a New Provider
@@ -296,7 +296,7 @@ src/claude_bridge/
 
 Capability modes are explicit: `stream_request_mode="body_parameter"` means the proxy sets `stream: true` in the provider request body, while `stream_request_mode="url"` means streaming is selected by endpoint URL. `sync_response_mode="sse"` keeps the current SSE aggregation path for non-streaming Anthropic clients; `sync_response_mode="json"` parses provider JSON and calls `translate_response()` directly.
 
-Unimplemented placeholders should stay unregistered and unimported, like the current xAI stub.
+Unimplemented placeholders should stay unregistered and unimported until their translation is built.
 
 ### OpenAI Translation Map
 
@@ -317,27 +317,28 @@ Unimplemented placeholders should stay unregistered and unimported, like the cur
 > Uses OpenAI's **Responses API** (not Chat Completions) — richer tool call semantics
 > with `call_id`/`id` separation.
 
-### Gemini Translation Map
+### xAI Grok Translation
 
-| Anthropic | Gemini generateContent API |
+xAI Grok speaks the same **Responses API** shape as OpenAI — reached through the grok CLI's
+own subscription-metered proxy — so the Anthropic ↔ Responses translation is identical to the
+OpenAI map above. The provider is deliberately **self-contained**: it duplicates the Responses
+translation rather than importing OpenAI's, because cross-provider imports are forbidden (see
+[`DECISIONS.md`](DECISIONS.md) D-XAI-002). Grok-specific details:
+
+| Aspect | xAI Grok |
 |---|---|
-| `system` (str/blocks) | `system_instruction.parts[].text` |
-| `messages[role=user]` | `contents[role=user].parts[].text` |
-| `messages[role=assistant]` | `contents[role=model].parts[].text` |
-| `messages[].content[type=tool_use]` | `contents[].parts[].functionCall` |
-| `messages[].content[type=tool_result]` | `contents[].parts[].functionResponse` |
-| `tools[].input_schema` | `tools[0].function_declarations[].parameters` |
-| Tool ID: `toolu_xxx` | Tool ID: `toolu_gemini_xxx` (legacy `call_gemini_xxx` accepted; thoughtSignature encoded) |
-| SSE: `content_block_delta` | SSE: `data:` chunks (complete JSON per chunk) |
-| `stop_reason: tool_use` | `finishReason: STOP` + functionCall in parts |
+| Endpoint | `https://cli-chat-proxy.grok.com/v1/responses` (subscription-metered) |
+| Auth | `~/.grok/auth.json` OIDC bearer + refresh (`grok login`); no API key |
+| Client gate | `x-grok-client-version` (auto-resolved from the installed grok CLI, floor `0.1.202`) + `grok-cli` client identifier |
+| Reasoning continuity | encrypted reasoning cached in memory, keyed by `call_id`, echoed across tool turns (never persisted or logged) |
+| Tool linkage | `call_id` alone — cli-chat-proxy has no separate `id`, and 400s if a `reasoning` key is sent |
+| Token multiplier | `1.0` — subscription-metered, so no OpenAI-compat scaling |
+| Media | image + document (PDF) input and array-form tool output forwarded as `input_image` / `input_file` |
 
-> Uses Gemini's **generateContent API** via the Code Assist endpoint for OAuth
-> (subscription) or the public API for API key auth. `$schema`, `propertyNames`,
-> and other unsupported JSON Schema keywords are automatically stripped from tool definitions.
->
-> Non-text input (image/document) is **not** forwarded to Gemini — media degrades to a
-> text placeholder. OpenAI is the supported media path; Gemini media support is not
-> implemented (see [`DECISIONS.md`](DECISIONS.md) D-SCOPE-001).
+> The subscription bearer rides **only** in the `Authorization` header — never in the
+> version or client-identifier headers. See [`DECISIONS.md`](DECISIONS.md) D-XAI-001,
+> D-XAI-003..006 for the backend, credential-handling, reasoning, usage, and
+> client-version decisions.
 
 ## Decision Records
 
@@ -348,15 +349,14 @@ tracked registry instead of duplicating decision rows.
 ## Known Limitations
 
 - Claude Code's startup banner always shows "Sonnet 4.6" regardless of actual model
-- OpenAI `thinking` blocks are passed through as tagged text by default — set `REASONING_MODE=drop` to strip them; Gemini strips thinking blocks with a warning
+- OpenAI and xAI `thinking` blocks are passed through as tagged text by default — set `REASONING_MODE=drop` to strip them
 - `output_config` and `cache_control` hints are stripped with a warning
 - Token estimation is approximate (~bytes/3.5), not exact tokenization
 - Streaming stats don't include token counts (only latency)
 - Failover is blocked during active tool-use turns (by design — prevents broken tool state)
 - Rate limit headers (`x-ratelimit-*`, `retry-after`) forwarded on sync responses only — streaming responses cannot include HTTP headers after SSE begins
 - Retry applies to sync HTTP calls only — streaming connections are not retried (SSE state replay is too complex)
-- xAI remains an unregistered extensibility placeholder; `xai` is not a runtime provider until implemented
-- Image/document input forwards to **OpenAI only**; Gemini degrades media to a text placeholder (D-SCOPE-001)
+- Image/document input forwards to **OpenAI and xAI**; unsupported media degrades to a redacted text placeholder
 - Document forwarding is limited to `application/pdf`; other document MIME types degrade to a redacted placeholder
 - On the Codex OAuth (chatgpt.com) backend, tool-returned media (images/PDFs inside `tool_result`) is redacted to a text placeholder with a warning — tool-output content arrays are enabled only for the API-key backend (D-MODALITY-001)
 - Media input size is bounded only by the overall request-body cap (`MAX_REQUEST_BODY`), not a separate per-media limit (D-MEDIA-001)
@@ -498,7 +498,7 @@ suite.
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 343 | Minimal | Some |
+| Tests | 558 | Minimal | Some |
 
 ## Terms of Service Considerations
 
@@ -521,21 +521,14 @@ through a proxy **may fall outside intended use**. This is the same approach tak
 1rgs/claude-code-proxy (3.3k stars) and others — none taken down as of March 2026,
 but past tolerance doesn't guarantee future acceptance.
 
-### Google (Gemini CLI / Google One AI Premium)
+### xAI (grok CLI / Grok subscription)
 
-The Gemini provider uses the Gemini CLI OAuth flow (Google One AI Premium subscription).
-Per [Google's Terms](https://policies.google.com/terms), using the Code Assist endpoint
-through a proxy **may fall outside intended use**. This is the same approach as the OpenAI/Codex
-provider — reusing subscription credentials through a local proxy. The Gemini CLI OAuth
-credentials (client ID and secret) are intentionally public per
-[Google's OAuth documentation for installed applications](https://developers.google.com/identity/protocols/oauth2#installed).
-
-When using `GEMINI_API_KEY` instead, this is a standard API client within normal API terms.
-
-### xAI
-
-When implemented, uses standard API endpoints with your own API keys — straightforward
-client implementation within normal API terms.
+The xAI provider uses the grok CLI OAuth flow (Grok subscription), reusing the credentials
+the grok CLI stores at `~/.grok/auth.json` to reach xAI's `cli-chat-proxy` Responses endpoint.
+Per [xAI's Terms](https://x.ai/legal/terms-of-service), using this subscription endpoint through
+a proxy **may fall outside intended use** — the same approach as the OpenAI/Codex provider:
+reusing subscription credentials through a local proxy. There is no API-key mode; you bring your
+own Grok subscription.
 
 ### Your Responsibility
 
@@ -546,7 +539,7 @@ for compliance with each provider's terms, costs incurred, and all consequences 
 
 **Research project.** Provided as-is for educational and experimental purposes.
 
-- **Not affiliated** with Anthropic, OpenAI, xAI, Google, or any AI company
+- **Not affiliated** with Anthropic, OpenAI, xAI, or any AI company
 - **No liability** for API terms violations, service disruptions, data loss, or costs
 - **No proprietary code** — translates between publicly documented APIs
 - Claude Code banner is rendered by the Claude Code binary (your install, your agreement)

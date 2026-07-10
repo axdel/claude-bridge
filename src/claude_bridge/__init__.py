@@ -13,7 +13,7 @@ Architecture::
                         |
                     provider.py (protocol)
                         |
-          providers/openai.py / providers/gemini.py
+          providers/openai.py / providers/xai.py
 
 Adding a new provider:
     1. Create ``providers/<name>.py`` implementing the ``Provider`` protocol
@@ -23,4 +23,4 @@ Adding a new provider:
     5. Set ``LLM_BRIDGE_FALLBACK=<name>`` or ``--provider <name>``
 """
 
-__version__ = "0.7.0"
+__version__ = "0.9.0"

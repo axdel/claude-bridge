@@ -1,8 +1,22 @@
 [project]
 name = "claude-bridge"
-version = "0.8.1"
+version = "0.9.0"
 description = "Use your Claude Code setup with any LLM provider — transparent API translation proxy"
 requires-python = ">=3.12"
+dependencies = []
+
+# Build backend exists so the src-layout package is editable-installable into the
+# venv. This keeps the runtime stdlib-only (hatchling is a build-time tool, not a
+# runtime dependency — D-RUNTIME-001 holds) while making `claude_bridge` importable
+# to dev tooling that resolves via sys.path (import-linter/grimp for the
+# boundary-map architecture gate). Launchers still run `python -m claude_bridge`
+# with explicit PYTHONPATH=src and are unaffected.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_bridge"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -20,6 +34,7 @@ dev = [
     "pytest-gremlins>=1.8.1",
     "bandit>=1.9.4",
     "pip-audit>=2.10.0",
+    "import-linter>=2.13",
 ]
 
 [tool.ruff]
@@ -38,3 +53,47 @@ pythonPlatform = "All"
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
+
+# Architecture-boundary contracts (import-linter). Encodes the one-way import DAG
+# the proxy relies on: providers are self-contained and mutually independent, the
+# proxy dispatches only through the provider abstraction, and leaf utilities never
+# reach back into orchestration. Enforced by the boundary-map primitive gate.
+[tool.importlinter]
+root_package = "claude_bridge"
+
+[[tool.importlinter.contracts]]
+name = "Providers are mutually independent (no cross-provider imports)"
+type = "independence"
+modules = [
+    "claude_bridge.providers.openai",
+    "claude_bridge.providers.xai",
+]
+
+[[tool.importlinter.contracts]]
+name = "Proxy dispatches via the provider abstraction, never concrete providers"
+type = "forbidden"
+source_modules = ["claude_bridge.proxy"]
+forbidden_modules = [
+    "claude_bridge.providers.openai",
+    "claude_bridge.providers.xai",
+]
+
+[[tool.importlinter.contracts]]
+name = "Leaf utilities never import orchestration"
+type = "forbidden"
+source_modules = [
+    "claude_bridge.config",
+    "claude_bridge.content",
+    "claude_bridge.auth",
+    "claude_bridge.stream",
+    "claude_bridge.provider",
+    "claude_bridge.stats",
+    "claude_bridge.log",
+]
+forbidden_modules = [
+    "claude_bridge.proxy",
+    "claude_bridge.router",
+    "claude_bridge.__main__",
+    "claude_bridge.providers.openai",
+    "claude_bridge.providers.xai",
+]

@@ -128,12 +128,13 @@
 - **Invalidates:** README.md §Adding a New Provider, `provider.py` provider contract
 
 ### D-PROVIDER-002 — Keep xAI unregistered until a real provider implementation exists
-- **Status:** accepted
+- **Status:** superseded
 - **Date:** 2026-06-08
 - **Context:** feature/audit-drift-remediation
 - **Decision:** Keep xAI unregistered until a real provider implementation exists.
 - **Rationale:** A routable provider whose methods raise `NotImplementedError` breaks the provider contract and failover semantics.
 - **Invalidates:** README.md provider list and limitations
+- **Superseded by:** D-XAI-001
 
 ### D-LOG-001 — Log provider error status and extracted summaries instead of unredacted upstream payloads
 - **Status:** accepted
@@ -176,12 +177,13 @@
 - **Invalidates:** `openai.py` OpenAIProvider docstring; README.md §Auth modes / limitations; follow-up: codex tool-output-array tool-loop probe
 
 ### D-SCOPE-001 — Drop Gemini media translation from this feature and leave `gemini.py` text-only as-is
-- **Status:** accepted
+- **Status:** superseded
 - **Date:** 2026-06-09
 - **Context:** feature/nontext-content-translation
 - **Decision:** Drop Gemini media translation from this feature and leave `gemini.py` text-only as-is.
 - **Rationale:** The user narrowed scope mid-branch — Gemini is no longer under active development for this bridge (no media support added; Grok will receive the canonical media treatment later), so building Gemini media support is unrequested scope; removing `gemini.py` was also not requested, so its existing text/tool path stays unchanged and media degrades observably there until Gemini is removed or revived.
 - **Invalidates:** CLAUDE.md Modules (`providers/gemini.py` documented media-unsupported, OpenAI is the supported media path)
+- **Superseded by:** D-GEMINI-001
 
 ### D-TOKEN-001 — Estimate media input tokens with a flat per-modality budget (image 1200, document 3000) computed inline in `proxy.py`
 - **Status:** accepted
@@ -213,6 +215,96 @@
 - **Context:** bugfix/stream-terminal-events (silent mid-work halt on GPT-5.5 incomplete/failed turns)
 - **Decision:** Enforce a termination invariant in `translate_stream` independent of the upstream event taxonomy.
 - **Rationale:** Mapping each known terminal event (D-STREAM-001) fixes the observed cases but not the class of bug: any future unhandled terminal, or a dropped upstream connection, would again leave a started turn without a closer. `translate_stream` tracks whether a `message_start` was emitted and whether a terminator (`message_stop`/`error`) followed; if a started stream ends without one, it synthesizes `message_delta` + `message_stop` (`stop_reason = tool_use` when tool calls were already emitted so Claude Code runs them, else `end_turn` — never `max_tokens`, which would trigger an auto-compact retry loop). The invariant fires ONLY when a `message_start` was sent (a stream that produced no output stays empty) and never when a real terminator already arrived (no duplicate terminator). This makes "started stream with no closer" structurally impossible regardless of what the upstream sends.
+- **Invalidates:** —
+
+### D-XAI-001 — Back the xAI provider with the subscription-metered cli-chat-proxy, not api.x.ai
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Route the xAI provider to `https://cli-chat-proxy.grok.com/v1/responses`, authenticated with the grok CLI subscription bearer (OIDC refresh) plus the `x-grok-client-version` / `x-grok-client-identifier` gate headers.
+- **Rationale:** The subscription proxy meters against the existing Grok subscription and speaks the Responses wire verbatim, so it mirrors the Codex OAuth model with no API key; rejected `api.x.ai/v1/responses` because it bills as a separate metered API per xAI docs.
+- **Invalidates:** README.md provider list, CLAUDE.md Modules (`providers/xai.py`), CLAUDE.md Resource Ownership (`~/.grok/auth.json`)
+- **Replaces:** D-PROVIDER-002
+
+### D-XAI-002 — Implement `xai.py` as a self-contained duplicate of the Responses translation (time-bounded debt)
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Duplicate the OpenAI Responses request/response/stream translation into a self-contained `xai.py` with no cross-provider imports, rather than extracting a shared Responses core.
+- **Rationale:** The user refused to re-touch the proven `openai.py` path, and the one-file-per-provider boundary preserves failure isolation; accepted as time-bounded duplication debt whose extraction trigger is the 3rd Responses-family provider (Rule of Three).
+- **Invalidates:** CLAUDE.md Known Tech Debt (record ~800 LOC Responses duplication + `openai.py` snapshot provenance)
+
+### D-XAI-003 — Resolve the grok credential from `~/.grok/auth.json` with re-read-before-write atomic replacement
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Read the subscription bearer/refresh from `~/.grok/auth.json` (test-overridable `auth_path`), refresh via OIDC on expiry, and persist a rotated token by re-reading then atomically replacing the file at owner-only (0600) perms.
+- **Rationale:** The grok CLI may refresh the same file concurrently, so re-read-before-write plus atomic rename plus 0600 perms reduce (do not eliminate) lost-update risk without a long-lived handle; no credential value is ever logged or placed in error messages.
+- **Invalidates:** CLAUDE.md Resource Ownership (`~/.grok/auth.json` reader/rotator)
+
+### D-XAI-004 — Key encrypted-reasoning continuity by the exact upstream `call_id`, characterized from live fixtures
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Re-inject each turn's encrypted reasoning item keyed by the VERBATIM upstream `call_id` (no `_to_openai_id` rewrite), holding the blobs in memory only.
+- **Rationale:** Captured cli-chat-proxy fixtures show the proxy echoes the client's exact `call_id`, so rewriting it would break multi-turn tool continuity; the encrypted reasoning is opaque and must never be persisted, logged, or returned to Claude Code (qualifies the translation-purity rule per D-REASON-001).
+- **Invalidates:** —
+
+### D-XAI-005 — Report xAI usage as flat Anthropic totals with an identity token-count multiplier
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Flat-map xAI Responses `input_tokens`/`output_tokens` to Anthropic totals and set `token_count_multiplier = 1.0` (identity).
+- **Rationale:** The subscription proxy is metered by xAI and not re-tokenized by the bridge, so no OpenAI-compat 1.2 scaling applies; Grok's 1M context does not change Claude Code's local auto-compact math, which keys off the reported totals (parallels D-USAGE-001).
+- **Invalidates:** —
+
+### D-XAI-006 — Source the `x-grok-client-version` gate dynamically from the installed CLI, with a pinned floor and env override
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Resolve `x-grok-client-version` at runtime from the installed grok CLI (glob), fall back to a pinned floor `0.1.202`, and allow an `XAI_CLIENT_VERSION` env override.
+- **Rationale:** cli-chat-proxy rejects requests below its required client version and may raise the floor over time; sourcing from the auto-updating CLI tracks the gate, the pinned floor still clears today's gate when the CLI is absent, and the env override is the manual escape hatch — an accepted maintenance dependency.
+- **Invalidates:** CLAUDE.md Known Tech Debt (record the client-version gate as a maintenance dependency)
+
+### D-GEMINI-001 — Remove the Gemini provider entirely, preserving only immutable historical references
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Delete `providers/gemini.py` with its tests and fixtures and unregister the provider, leaving Gemini named only in immutable history (CHANGELOG entries and superseded-decision tombstones).
+- **Rationale:** The user requested a complete removal of Gemini alongside the Grok addition, and a residual text-only provider nobody maintains is dead weight; CHANGELOG history and reversed-decision tombstones stay verbatim per the never-delete rule.
+- **Invalidates:** CLAUDE.md Modules (remove `providers/gemini.py`), README.md provider list
+- **Replaces:** D-SCOPE-001
+
+### D-XAI-007 — Pin the xAI OIDC issuer and refuse cross-host or non-HTTPS token refresh
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Pin the refresh issuer to the hardcoded HTTPS constant `https://auth.x.ai`, ignore any `oidc_issuer` field carried in `~/.grok/auth.json`, and refuse to POST the refresh_token to a non-HTTPS scheme or a cross-host endpoint.
+- **Rationale:** A poisoned `auth.json` could otherwise redirect the refresh_token and client_id to an attacker-controlled or internal host (SSRF / credential exfiltration, CWE-918/200); the issuer is a fixed xAI endpoint, so trusting a file-provided `oidc_issuer` buys nothing and only opens the exfil path — rejected honoring it.
+- **Invalidates:** —
+
+### D-BUILD-001 — Make `claude_bridge` editable-installable via a `[build-system]`, not a PYTHONPATH hack
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Add a hatchling `[build-system]` and `[tool.hatch.build.targets.wheel]` targeting `src/claude_bridge`, alongside an empty `[project] dependencies`, so `uv sync` editable-installs the package and venv tooling can import `claude_bridge` from `sys.path`.
+- **Rationale:** The boundary-map gate runs import-linter/grimp, which needs `root_package` importable; the alternative — teaching the protocol's `tool_env` to prepend `PYTHONPATH=src` — was rejected as a per-tool hack the exemplar (claude-protocol itself) avoids by shipping a build backend, and hatchling is build-time only so the stdlib-only runtime (D-RUNTIME-001) is untouched.
+- **Invalidates:** —
+
+### D-DEPS-002 — Add import-linter as a dev-only architecture gate
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Add `import-linter` to `[dependency-groups] dev` and declare three `[tool.importlinter]` contracts — providers mutually independent, proxy dispatches via the abstraction, leaf utilities never import orchestration — enforcing the module import DAG.
+- **Rationale:** The boundary-map primitive delegates to `lint-imports`, so the DAG documented in BOUNDARY_MAP.md needs a mechanical enforcer; import-linter is the Python standard for this and, like Bandit and pip-audit (D-DEPS-001), is dev-only — the runtime stays zero-dependency.
+- **Invalidates:** —
+
+### D-GOV-002 — Provision the six mandatory architecture-primitive registries on this branch
+- **Status:** accepted
+- **Date:** 2026-07-10
+- **Context:** feature/swap-gemini-for-grok
+- **Decision:** Author CANONICAL_GLOSSARY, BOUNDARY_MAP, DERIVATION_MAP, RESOURCE_OWNERSHIP, INVARIANTS, and MEMORY_GOVERNANCE at the repo root, grounded in the shipped code, rather than merging with the primitive gap waived.
+- **Rationale:** The review merge gate reported the six mandatory primitives as blocking STUB; provisioning them here — versus deferring to a separate prerequisite track or merging under a waiver — closes the gap in the same branch that first exercised the gate, and the registries derive from the existing architecture so they carry no invented facts.
 - **Invalidates:** —
 
 ## Archive
