@@ -27,6 +27,7 @@ from claude_bridge.auth import decode_jwt_exp
 from claude_bridge.content import parse_media_source
 from claude_bridge.provider import ProviderCapabilities
 from claude_bridge.providers.xai import (
+    _MAX_SSE_BUFFER,
     XAIProvider,
     _iso_to_timestamp,
     _safe_document_filename,
@@ -38,6 +39,7 @@ from claude_bridge.providers.xai import (
     get_xai_bearer_token,
     read_xai_auth,
     refresh_xai_token,
+    translate_xai_sse_event,
     xai_to_anthropic,
 )
 
@@ -1409,3 +1411,484 @@ class TestResponseTranslation:
         assert result["stop_reason"] == "end_turn"
         assert result["content"] == [{"type": "text", "text": "pong"}]
         assert result["usage"] == {"input_tokens": 192, "output_tokens": 309}
+
+
+# --- B6: SSE stream translation helpers ---
+
+
+async def _aiter_bytes(chunks: list[bytes]):
+    """Yield raw byte chunks as an async iterator (a fake provider stream)."""
+    for chunk in chunks:
+        yield chunk
+
+
+def _run_stream(chunks: list[bytes]) -> list[dict]:
+    """Drive XAIProvider.translate_stream over byte chunks, collecting Anthropic events."""
+
+    async def _collect() -> list[dict]:
+        return [event async for event in XAIProvider().translate_stream(_aiter_bytes(chunks))]
+
+    return asyncio.run(_collect())
+
+
+def _event_names(events: list[dict]) -> list[str]:
+    return [e["event"] for e in events]
+
+
+def _sse_blob(event_type: str, data: dict) -> bytes:
+    """Serialize one provider SSE event to wire bytes for the stream driver."""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+def _terminal_blob(event_type: str, response: dict) -> bytes:
+    """Wrap a full Responses object in a terminal SSE event (completed/incomplete)."""
+    return _sse_blob(event_type, {"type": event_type, "response": response})
+
+
+_CREATED_BLOB = _terminal_blob(
+    "response.created", {"id": "r", "model": "grok-4.20-0309-reasoning", "status": "in_progress"}
+)
+
+
+class TestSseEventTranslation:
+    """translate_xai_sse_event: one Responses SSE event -> Anthropic SSE events (B6).
+
+    Oracles are the golden stream capture (text_stream.txt) event shapes plus the published
+    Responses streaming contract (cli-chat-proxy mirrors it identically). The divergence from
+    the openai provider: a streamed tool_use id is the upstream call_id VERBATIM, matching the
+    non-stream path so a call streamed and a call replayed share one id.
+    """
+
+    def test_response_created_yields_message_start_and_ping(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.created",
+                "data": {"response": {"id": "abc", "model": "grok-4.20", "usage": None}},
+            }
+        )
+        assert _event_names(events) == ["message_start", "ping"]
+        message = events[0]["data"]["message"]
+        assert message["id"] == "msg_bridge_abc"
+        assert message["model"] == "grok-4.20"
+        assert message["stop_reason"] is None
+        # created carries no usage yet -> zero, output always 0 at start.
+        assert message["usage"] == {"input_tokens": 0, "output_tokens": 0}
+
+    def test_response_created_scales_input_usage_when_present(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.created",
+                "data": {"response": {"id": "a", "usage": {"input_tokens": 10}}},
+            },
+            token_count_multiplier=2.0,
+        )
+        assert events[0]["data"]["message"]["usage"] == {"input_tokens": 20, "output_tokens": 0}
+
+    def test_content_part_added_opens_text_block(self):
+        events = translate_xai_sse_event(
+            {"event": "response.content_part.added", "data": {"content_index": 0}}
+        )
+        assert events == [
+            {
+                "event": "content_block_start",
+                "data": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            }
+        ]
+
+    def test_output_text_delta_maps_to_text_delta(self):
+        events = translate_xai_sse_event(
+            {"event": "response.output_text.delta", "data": {"content_index": 0, "delta": "hi"}}
+        )
+        assert events[0]["data"]["delta"] == {"type": "text_delta", "text": "hi"}
+
+    def test_output_text_done_closes_block(self):
+        events = translate_xai_sse_event(
+            {"event": "response.output_text.done", "data": {"content_index": 0}}
+        )
+        assert events[0]["event"] == "content_block_stop"
+        assert events[0]["data"]["index"] == 0
+
+    def test_function_call_item_opens_tool_use_with_verbatim_call_id(self):
+        # THE divergence, in the stream path: the tool_use id is the call_id EXACTLY, not the
+        # fc_ item id and not a rewritten form.
+        events = translate_xai_sse_event(
+            {
+                "event": "response.output_item.added",
+                "data": {
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call-xyz-0",
+                        "id": "fc_r_0",
+                        "name": "get_weather",
+                    },
+                },
+            }
+        )
+        block = events[0]["data"]["content_block"]
+        assert block == {
+            "type": "tool_use",
+            "id": "call-xyz-0",
+            "name": "get_weather",
+            "input": {},
+        }
+
+    def test_reasoning_output_item_added_is_dropped(self):
+        # A reasoning item is not surfaced as an Anthropic content block in the stream.
+        events = translate_xai_sse_event(
+            {
+                "event": "response.output_item.added",
+                "data": {"output_index": 0, "item": {"type": "reasoning", "id": "rs_r"}},
+            }
+        )
+        assert events == []
+
+    def test_function_call_arguments_delta_maps_to_input_json_delta(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.function_call_arguments.delta",
+                "data": {"output_index": 0, "delta": '{"city":'},
+            }
+        )
+        assert events[0]["data"]["delta"] == {
+            "type": "input_json_delta",
+            "partial_json": '{"city":',
+        }
+
+    def test_function_call_arguments_done_closes_block(self):
+        events = translate_xai_sse_event(
+            {"event": "response.function_call_arguments.done", "data": {"output_index": 2}}
+        )
+        assert events[0]["event"] == "content_block_stop"
+        assert events[0]["data"]["index"] == 2
+
+    def test_completed_terminal_yields_message_delta_and_stop(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.completed",
+                "data": {
+                    "response": {
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"output_tokens": 7},
+                    }
+                },
+            }
+        )
+        assert _event_names(events) == ["message_delta", "message_stop"]
+        assert events[0]["data"]["delta"] == {"stop_reason": "end_turn"}
+        assert events[0]["data"]["usage"]["output_tokens"] == 7
+
+    def test_incomplete_max_tokens_terminal_maps_to_max_tokens(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.incomplete",
+                "data": {
+                    "response": {
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "output": [],
+                    }
+                },
+            }
+        )
+        assert events[0]["data"]["delta"] == {"stop_reason": "max_tokens"}
+        assert events[-1]["event"] == "message_stop"
+
+    def test_incomplete_content_filter_terminal_synthesizes_refusal_block(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.incomplete",
+                "data": {
+                    "response": {
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "content_filter"},
+                        "output": [],
+                    }
+                },
+            }
+        )
+        # A refusal text block is synthesized before the terminal; stop_reason is end_turn.
+        assert _event_names(events)[:3] == [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+        ]
+        refusal = events[1]["data"]["delta"]["text"]
+        assert "content safety filters" in refusal
+        message_delta = next(e for e in events if e["event"] == "message_delta")
+        assert message_delta["data"]["delta"] == {"stop_reason": "end_turn"}
+        assert events[-1]["event"] == "message_stop"
+
+    def test_response_failed_maps_to_error_event(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.failed",
+                "data": {"response": {"error": {"code": "server_error", "message": "boom"}}},
+            }
+        )
+        assert events[0]["event"] == "error"
+        assert events[0]["data"]["error"]["message"] == "boom"
+        assert events[0]["data"]["error"]["type"] == "api_error"
+
+    def test_top_level_error_maps_to_error_event(self):
+        events = translate_xai_sse_event({"event": "error", "data": {"message": "kaboom"}})
+        assert events[0]["event"] == "error"
+        assert events[0]["data"]["error"]["message"] == "kaboom"
+
+    def test_error_message_is_length_bounded(self):
+        events = translate_xai_sse_event({"event": "error", "data": {"message": "x" * 1000}})
+        assert len(events[0]["data"]["error"]["message"]) == 500
+
+    def test_skipped_events_yield_nothing(self):
+        for event_type in (
+            "response.in_progress",
+            "response.queued",
+            "response.content_part.done",
+            "response.output_item.done",
+        ):
+            assert translate_xai_sse_event({"event": event_type, "data": {}}) == []
+
+    def test_unknown_event_yields_nothing(self):
+        assert (
+            translate_xai_sse_event({"event": "response.reasoning_summary_text.delta", "data": {}})
+            == []
+        )
+
+
+class TestStreamLifecycle:
+    """XAIProvider.translate_stream: full lifecycle over the golden capture + block remapping."""
+
+    def test_text_stream_full_lifecycle_matches_golden_capture(self):
+        raw = (_FIXTURES / "text_stream.txt").read_bytes()
+        events = _run_stream([raw])
+        assert _event_names(events) == [
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+
+    def test_text_stream_reconstructs_the_message(self):
+        raw = (_FIXTURES / "text_stream.txt").read_bytes()
+        events = _run_stream([raw])
+        deltas = [
+            e["data"]["delta"]["text"] for e in events if e["event"] == "content_block_delta"
+        ]
+        assert "".join(deltas) == "hi there"
+
+    def test_text_stream_terminal_carries_end_turn_and_full_usage(self):
+        raw = (_FIXTURES / "text_stream.txt").read_bytes()
+        events = _run_stream([raw])
+        message_delta = next(e for e in events if e["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "end_turn"
+        assert message_delta["data"]["usage"] == {"input_tokens": 189, "output_tokens": 333}
+
+    def test_message_start_id_and_model_from_created(self):
+        raw = (_FIXTURES / "text_stream.txt").read_bytes()
+        events = _run_stream([raw])
+        message = events[0]["data"]["message"]
+        assert message["id"] == "msg_bridge_322daa90-f2da-959b-88b8-4a968a6b4d54"
+        assert message["model"] == "grok-4.20-0309-reasoning"
+
+    def test_block_indices_are_sequential_from_zero(self):
+        raw = (_FIXTURES / "text_stream.txt").read_bytes()
+        events = _run_stream([raw])
+        block_start = next(e for e in events if e["event"] == "content_block_start")
+        assert block_start["data"]["index"] == 0
+        for e in events:
+            if e["event"] in ("content_block_delta", "content_block_stop"):
+                assert e["data"]["index"] == 0
+
+    def test_stream_survives_chunk_boundaries_mid_event(self):
+        # Splitting the raw bytes at an arbitrary offset (mid-event) must not change the
+        # translation — iter_sse_event_blobs reframes on \n\n regardless of chunk seams.
+        raw = (_FIXTURES / "text_stream.txt").read_bytes()
+        mid = len(raw) // 2
+        whole = _run_stream([raw])
+        split = _run_stream([raw[:mid], raw[mid:]])
+        assert _event_names(split) == _event_names(whole)
+
+    def test_streamed_tool_call_opens_tool_use_and_ends_tool_use(self):
+        # Spec-derived streaming tool-call sequence (Responses streaming contract). The
+        # tool_use id is the call_id verbatim; the terminal stop_reason is tool_use.
+        events = _run_stream(
+            [
+                _CREATED_BLOB,
+                _sse_blob(
+                    "response.output_item.added",
+                    {
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "call_id": "call-abc-0",
+                            "id": "fc_r_0",
+                            "name": "get_weather",
+                        },
+                    },
+                ),
+                _sse_blob(
+                    "response.function_call_arguments.delta",
+                    {"output_index": 0, "delta": '{"city":"Paris"}'},
+                ),
+                _sse_blob("response.function_call_arguments.done", {"output_index": 0}),
+                _terminal_blob(
+                    "response.completed",
+                    {
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "call_id": "call-abc-0",
+                                "name": "get_weather",
+                            }
+                        ],
+                        "usage": {"input_tokens": 5, "output_tokens": 6},
+                    },
+                ),
+            ]
+        )
+        tool_start = next(
+            e
+            for e in events
+            if e["event"] == "content_block_start"
+            and e["data"]["content_block"]["type"] == "tool_use"
+        )
+        assert tool_start["data"]["content_block"]["id"] == "call-abc-0"
+        json_delta = next(e for e in events if e["event"] == "content_block_delta")
+        assert json_delta["data"]["delta"]["partial_json"] == '{"city":"Paris"}'
+        message_delta = next(e for e in events if e["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "tool_use"
+
+    def test_streamed_tool_call_absent_from_terminal_output_still_stops_tool_use(self):
+        # Safety net: the stream ANNOUNCES a tool via output_item.added, but the terminal
+        # response.completed omits it from output[] (a stream/terminal mismatch). _stop_reason
+        # computes end_turn from the empty terminal output, but the driver remembers a tool
+        # block was streamed and upgrades the stop_reason to tool_use so Claude Code runs it.
+        events = _run_stream(
+            [
+                _CREATED_BLOB,
+                _sse_blob(
+                    "response.output_item.added",
+                    {
+                        "output_index": 0,
+                        "item": {"type": "function_call", "call_id": "call-q-0", "name": "f"},
+                    },
+                ),
+                _sse_blob("response.function_call_arguments.done", {"output_index": 0}),
+                _terminal_blob(
+                    "response.completed",
+                    {"status": "completed", "output": [], "usage": {"output_tokens": 1}},
+                ),
+            ]
+        )
+        message_delta = next(e for e in events if e["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "tool_use"
+        assert _event_names(events)[-1] == "message_stop"
+
+
+class TestStreamTerminatorInvariant:
+    """Lifecycle invariant: every stream that emits message_start ends in a terminator.
+
+    Universally quantified over the terminal-event enum the upstream can emit — a table
+    test, because an example cannot establish a 'for all terminals' property. Run against a
+    translate_stream that forgot any terminal, the missing row goes red.
+    """
+
+    @pytest.mark.parametrize(
+        ("terminal_blob", "expected_terminator"),
+        [
+            (
+                _terminal_blob("response.completed", {"status": "completed", "output": []}),
+                "message_stop",
+            ),
+            (
+                _terminal_blob(
+                    "response.incomplete",
+                    {
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "output": [],
+                    },
+                ),
+                "message_stop",
+            ),
+            (
+                _terminal_blob(
+                    "response.incomplete",
+                    {
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "content_filter"},
+                        "output": [],
+                    },
+                ),
+                "message_stop",
+            ),
+            (
+                _sse_blob(
+                    "response.failed",
+                    {"response": {"error": {"code": "server_error", "message": "boom"}}},
+                ),
+                "error",
+            ),
+            (_sse_blob("error", {"message": "kaboom"}), "error"),
+        ],
+    )
+    def test_every_terminal_event_closes_the_stream(self, terminal_blob, expected_terminator):
+        events = _run_stream([_CREATED_BLOB, terminal_blob])
+        assert _event_names(events)[0] == "message_start"
+        assert _event_names(events)[-1] == expected_terminator
+
+    def test_dropped_stream_after_start_synthesizes_message_stop(self):
+        # message_start emitted but the upstream dropped before any terminal -> a synthetic
+        # message_stop is appended so Claude Code finalizes the turn instead of hanging.
+        events = _run_stream([_CREATED_BLOB])
+        assert _event_names(events)[0] == "message_start"
+        assert _event_names(events)[-1] == "message_stop"
+
+    def test_dropped_stream_after_tool_call_synthesizes_tool_use_stop(self):
+        # A drop after a tool_use block must stop as tool_use (Claude Code must run the tool),
+        # never end_turn masquerading as completion nor max_tokens triggering a retry loop.
+        events = _run_stream(
+            [
+                _CREATED_BLOB,
+                _sse_blob(
+                    "response.output_item.added",
+                    {
+                        "output_index": 0,
+                        "item": {"type": "function_call", "call_id": "call-z-0", "name": "f"},
+                    },
+                ),
+            ]
+        )
+        message_delta = next(e for e in events if e["event"] == "message_delta")
+        assert message_delta["data"]["delta"]["stop_reason"] == "tool_use"
+        assert _event_names(events)[-1] == "message_stop"
+
+    def test_stream_that_never_started_gets_no_synthetic_terminator(self):
+        # A stream of only skipped events never emits message_start, so no fake terminator is
+        # invented — the invariant is guarded on 'started', not applied unconditionally.
+        events = _run_stream([_sse_blob("response.in_progress", {})])
+        assert events == []
+
+
+class TestStreamBufferCap:
+    """The 4MiB undrained-buffer abort — a terminator-less stream must not OOM."""
+
+    def test_max_sse_buffer_is_four_mebibytes(self):
+        # The cap is the spec value, derived from the doctrine (one partial event fits well
+        # under 4MiB); a terminator-less stream is malformed past it.
+        assert _MAX_SSE_BUFFER == 4 * 1024 * 1024
+
+    def test_oversized_terminatorless_stream_aborts(self):
+        oversized = b"x" * (_MAX_SSE_BUFFER + 1)  # no \n\n terminator, ever
+        with pytest.raises(RuntimeError, match="terminator"):
+            _run_stream([oversized])
