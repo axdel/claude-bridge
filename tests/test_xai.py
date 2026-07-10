@@ -28,7 +28,9 @@ from claude_bridge.content import parse_media_source
 from claude_bridge.provider import ProviderCapabilities
 from claude_bridge.providers.xai import (
     _MAX_SSE_BUFFER,
+    _REASONING_CACHE_MAX,
     XAIProvider,
+    _associate_reasoning_with_calls,
     _iso_to_timestamp,
     _safe_document_filename,
     _tool_result_parts,
@@ -1892,3 +1894,282 @@ class TestStreamBufferCap:
         oversized = b"x" * (_MAX_SSE_BUFFER + 1)  # no \n\n terminator, ever
         with pytest.raises(RuntimeError, match="terminator"):
             _run_stream([oversized])
+
+
+# ---------------------------------------------------------------------------
+# B7 — reasoning / tool continuity (encrypted-reasoning echo across turns)
+# ---------------------------------------------------------------------------
+
+_CID = "call-bb020360-5c8a-4760-a7e6-b9cff0c2e700-0"
+
+
+def _encrypted_reasoning_item() -> dict:
+    """The real captured reasoning item carrying an ``encrypted_content`` blob
+    (reasoning_encrypted.json output[0]) — the continuation state B7 must round-trip."""
+    return _load_fixture("reasoning_encrypted.json")["output"][0]
+
+
+def _real_function_call(call_id: str) -> dict:
+    """A real captured function_call item (single_tool_call.json output[1]), rekeyed to
+    ``call_id`` — its own item id stays the fixture's ``fc_...`` form."""
+    fc = dict(_load_fixture("single_tool_call.json")["output"][1])
+    fc["call_id"] = call_id
+    return fc
+
+
+def _encrypted_reasoning_tool_response(call_id: str = _CID, *, status: str = "completed") -> dict:
+    """Compose a store:false tool turn: a real encrypted reasoning item followed by a real
+    function_call.
+
+    xAI was captured emitting encrypted reasoning (reasoning_encrypted.json — a text turn) and
+    tool calls (single_tool_call.json — captured ``store:true``, so no encrypted blob) in
+    separate responses; under ``store:false`` + ``include:[reasoning.encrypted_content]`` a tool
+    turn carries both. This composes the two REAL captured pieces rather than inventing a wire
+    shape (Boundary Fixture Fidelity — schema-faithful composition of captured parts).
+    """
+    return {
+        "id": "resp_compose",
+        "model": "grok-4.20-0309-reasoning",
+        "status": status,
+        "output": [_encrypted_reasoning_item(), _real_function_call(call_id)],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+def _anthropic_tool_use_request(*call_ids: str) -> dict:
+    """An Anthropic request whose assistant turn issued the given ``tool_use`` call ids."""
+    return {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": cid,
+                        "name": "get_weather",
+                        "input": {"city": "Paris"},
+                    }
+                    for cid in call_ids
+                ],
+            }
+        ]
+    }
+
+
+def _run_stream_on(provider: XAIProvider, chunks: list[bytes]) -> list[dict]:
+    """Drive translate_stream on a GIVEN provider instance (so cache state persists)."""
+
+    async def _collect() -> list[dict]:
+        return [event async for event in provider.translate_stream(_aiter_bytes(chunks))]
+
+    return asyncio.run(_collect())
+
+
+def _reasoning_items(result: dict) -> list[dict]:
+    return [item for item in result["input"] if item.get("type") == "reasoning"]
+
+
+class TestReasoningAssociation:
+    """_associate_reasoning_with_calls: pair each function_call with its immediately-preceding
+    ENCRYPTED reasoning item, keyed by the VERBATIM call_id (B7).
+
+    Oracles: the real captures give the negative case (no ``encrypted_content`` → no
+    continuation state — single_tool_call/parallel were captured ``store:true``); the positive
+    case composes the real encrypted reasoning item with a real function_call.
+    """
+
+    def test_reasoning_then_message_yields_no_association(self):
+        # reasoning_encrypted.json: encrypted reasoning followed by a message, no tool call.
+        output = _load_fixture("reasoning_encrypted.json")["output"]
+        assert _associate_reasoning_with_calls(output) == {}
+
+    def test_tool_call_without_encrypted_reasoning_yields_no_association(self):
+        # single_tool_call.json (store:true) → its reasoning carries no encrypted_content.
+        output = _load_fixture("single_tool_call.json")["output"]
+        assert _associate_reasoning_with_calls(output) == {}
+
+    def test_parallel_tool_calls_without_encrypted_reasoning_yield_no_association(self):
+        output = _load_fixture("parallel_tool_calls.json")["output"]
+        assert _associate_reasoning_with_calls(output) == {}
+
+    def test_encrypted_reasoning_before_call_binds_by_verbatim_call_id(self):
+        reasoning = _encrypted_reasoning_item()
+        assoc = _associate_reasoning_with_calls([reasoning, _real_function_call(_CID)])
+        assert assoc == {_CID: reasoning}
+
+    def test_association_key_is_call_id_not_the_fc_item_id(self):
+        # The B7 divergence from the openai provider: the key is the call_id VERBATIM, never the
+        # function_call's own ``fc_...`` item id and never an ``fc_``-rewritten form.
+        reasoning = _encrypted_reasoning_item()
+        fc = _real_function_call(_CID)  # its item id is fc_c4de0fe3-..._0
+        assoc = _associate_reasoning_with_calls([reasoning, fc])
+        assert _CID in assoc
+        assert fc["id"] not in assoc
+        assert not any(key.startswith("fc_") for key in assoc)
+
+    def test_single_reasoning_binds_only_the_first_of_parallel_calls(self):
+        # One encrypted reasoning item is consumed by the first call; the second is unpaired.
+        reasoning = _encrypted_reasoning_item()
+        cid0 = "call-9b62d611-9755-4457-a20c-a1cb51b96c96-0"
+        cid1 = "call-9b62d611-9755-4457-a20c-a1cb51b96c96-1"
+        assoc = _associate_reasoning_with_calls(
+            [reasoning, _real_function_call(cid0), _real_function_call(cid1)]
+        )
+        assert assoc == {cid0: reasoning}
+
+    def test_intervening_message_clears_pending_reasoning(self):
+        # A non-call item between reasoning and the call breaks the pairing.
+        reasoning = _encrypted_reasoning_item()
+        message = _load_fixture("reasoning_encrypted.json")["output"][1]
+        assoc = _associate_reasoning_with_calls([reasoning, message, _real_function_call(_CID)])
+        assert assoc == {}
+
+    def test_non_dict_output_item_is_tolerated_and_clears_pending(self):
+        reasoning = _encrypted_reasoning_item()
+        # Malformed upstream output (a non-dict element) must not crash the single-pass walk.
+        malformed: list = [reasoning, "garbage", _real_function_call(_CID)]
+        assert _associate_reasoning_with_calls(malformed) == {}
+
+
+class TestReasoningRoundTrip:
+    """Encrypted reasoning captured from one response is echoed back before the matching
+    function_call on the NEXT request — keyed by the verbatim call_id, per provider instance,
+    and NEVER surfaced to Claude Code (B7)."""
+
+    def test_captured_reasoning_is_injected_before_its_function_call(self):
+        provider = XAIProvider()
+        reasoning = _encrypted_reasoning_item()
+        provider.translate_response(_encrypted_reasoning_tool_response(_CID))
+
+        result, _ = provider.translate_request(_anthropic_tool_use_request(_CID))
+        items = result["input"]
+        fc_index = next(i for i, it in enumerate(items) if it.get("type") == "function_call")
+        assert items[fc_index - 1] == reasoning
+        assert items[fc_index - 1].get("encrypted_content")
+
+    def test_no_prior_capture_leaves_request_input_unchanged(self):
+        provider = XAIProvider()
+        result, _ = provider.translate_request(_anthropic_tool_use_request(_CID))
+        assert _reasoning_items(result) == []
+
+    def test_unmatched_call_id_injects_nothing(self):
+        provider = XAIProvider()
+        provider.translate_response(_encrypted_reasoning_tool_response(_CID))
+        other = "call-ffffffff-0000-0000-0000-000000000000-0"
+        result, _ = provider.translate_request(_anthropic_tool_use_request(other))
+        assert _reasoning_items(result) == []
+
+    def test_capture_is_instance_scoped_not_shared_across_providers(self):
+        capturer = XAIProvider()
+        capturer.translate_response(_encrypted_reasoning_tool_response(_CID))
+        fresh = XAIProvider()
+        result, _ = fresh.translate_request(_anthropic_tool_use_request(_CID))
+        assert _reasoning_items(result) == []
+
+    def test_encrypted_blob_is_never_returned_to_claude_code(self):
+        # The opaque continuation blob is in-memory only: it must never appear in the Anthropic
+        # response handed back to Claude Code.
+        provider = XAIProvider()
+        blob = _encrypted_reasoning_item()["encrypted_content"]
+        anthropic = provider.translate_response(_encrypted_reasoning_tool_response(_CID))
+        assert blob not in json.dumps(anthropic)
+
+    def test_injection_tolerates_a_request_with_no_input_list(self):
+        # Defensive guard: a translated request lacking a list ``input`` is left untouched
+        # rather than crashing, even with a populated cache.
+        provider = XAIProvider()
+        provider.translate_response(_encrypted_reasoning_tool_response(_CID))
+        payload = {"model": "grok-4.20"}
+        provider._inject_reasoning(payload)
+        assert "input" not in payload
+
+
+class TestReasoningInjectionDedup:
+    """A reasoning item cached under multiple call_ids is echoed at most once, so parallel tool
+    calls that share one reasoning item never get a duplicate preceding copy (B7)."""
+
+    def test_shared_reasoning_injected_once_for_parallel_calls(self):
+        provider = XAIProvider()
+        cid0 = "call-9b62d611-9755-4457-a20c-a1cb51b96c96-0"
+        cid1 = "call-9b62d611-9755-4457-a20c-a1cb51b96c96-1"
+        # Two turns whose encrypted reasoning shares one id, one cached per parallel call.
+        provider.translate_response(_encrypted_reasoning_tool_response(cid0))
+        provider.translate_response(_encrypted_reasoning_tool_response(cid1))
+        result, _ = provider.translate_request(_anthropic_tool_use_request(cid0, cid1))
+        items = _reasoning_items(result)
+        assert len(items) == 1
+        assert items[0].get("id") == _encrypted_reasoning_item()["id"]
+
+
+class TestReasoningStreamCapture:
+    """Streamed terminal events capture encrypted reasoning for the next request — completed AND
+    incomplete, since an incomplete turn that still emitted a tool call needs its reasoning
+    echoed too; non-terminal events capture nothing (B7)."""
+
+    def _streamed_then_request(self, terminal_event: str, status: str) -> dict:
+        provider = XAIProvider()
+        response = _encrypted_reasoning_tool_response(_CID, status=status)
+        _run_stream_on(provider, [_CREATED_BLOB, _terminal_blob(terminal_event, response)])
+        result, _ = provider.translate_request(_anthropic_tool_use_request(_CID))
+        return result
+
+    def test_completed_stream_captures_reasoning_for_next_request(self):
+        result = self._streamed_then_request("response.completed", "completed")
+        assert len(_reasoning_items(result)) == 1
+
+    def test_incomplete_stream_also_captures_reasoning(self):
+        result = self._streamed_then_request("response.incomplete", "incomplete")
+        assert len(_reasoning_items(result)) == 1
+
+    def test_non_terminal_stream_events_capture_nothing(self):
+        provider = XAIProvider()
+        _run_stream_on(
+            provider,
+            [
+                _CREATED_BLOB,
+                _sse_blob(
+                    "response.output_text.delta",
+                    {"type": "response.output_text.delta", "delta": "hi", "content_index": 0},
+                ),
+            ],
+        )
+        result, _ = provider.translate_request(_anthropic_tool_use_request(_CID))
+        assert _reasoning_items(result) == []
+
+
+class TestReasoningCacheBound:
+    """The reasoning cache is a bounded LRU: it never grows past _REASONING_CACHE_MAX, evicts the
+    oldest entry first, and re-stashing an existing key refreshes its recency (B7)."""
+
+    @staticmethod
+    def _entry(index: int) -> dict:
+        return {"type": "reasoning", "id": f"rs_{index}", "encrypted_content": "x"}
+
+    def _fill(self, provider: XAIProvider, count: int) -> None:
+        for i in range(count):
+            provider._stash_reasoning({f"call-{i}": self._entry(i)})
+
+    def test_cache_max_is_256(self):
+        assert _REASONING_CACHE_MAX == 256
+
+    def test_cache_never_exceeds_the_bound(self):
+        provider = XAIProvider()
+        self._fill(provider, _REASONING_CACHE_MAX + 50)
+        assert len(provider._reasoning_by_call_id) == _REASONING_CACHE_MAX
+
+    def test_oldest_entry_is_evicted_first(self):
+        provider = XAIProvider()
+        self._fill(provider, _REASONING_CACHE_MAX)
+        provider._stash_reasoning({"call-new": self._entry(9999)})
+        assert "call-0" not in provider._reasoning_by_call_id
+        assert "call-new" in provider._reasoning_by_call_id
+        assert "call-1" in provider._reasoning_by_call_id
+
+    def test_restash_refreshes_recency_so_touched_entry_survives(self):
+        provider = XAIProvider()
+        self._fill(provider, _REASONING_CACHE_MAX)
+        # Touch call-0 → most-recent; the next insert must now evict call-1, not call-0.
+        provider._stash_reasoning({"call-0": self._entry(1000)})
+        provider._stash_reasoning({"call-new": self._entry(9999)})
+        assert "call-0" in provider._reasoning_by_call_id
+        assert "call-1" not in provider._reasoning_by_call_id

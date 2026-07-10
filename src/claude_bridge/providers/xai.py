@@ -20,6 +20,7 @@ import datetime
 import json
 import os
 import stat
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1202,33 +1203,140 @@ def _remap_block_index(
     return event, next_index, has_tool_calls
 
 
+# Bound on the in-memory encrypted-reasoning cache — an upper limit on distinct in-flight tool
+# calls whose reasoning continuation is retained. Oldest entry is evicted (LRU) once exceeded.
+_REASONING_CACHE_MAX = 256
+
+
+def _associate_reasoning_with_calls(output: list[dict]) -> dict[str, dict]:
+    """Map each tool call's ``call_id`` to the encrypted reasoning item that immediately
+    precedes it in a Responses ``output`` array.
+
+    Walks the output once: a reasoning item carrying ``encrypted_content`` becomes the pending
+    continuation state for the next function_call; once paired (or interrupted by any other
+    item) it is consumed. Unlike the openai provider, keys are the call's ``call_id`` (falling
+    back to ``id``) VERBATIM — xAI round-trips its own ``call-<uuid>-<idx>`` identity unchanged,
+    so the next request's function_calls look up by the same key with no ``fc_`` rewrite.
+
+    Pure function — no I/O, no state.
+    """
+    associations: dict[str, dict] = {}
+    pending: dict | None = None
+    for item in output:
+        if not isinstance(item, dict):
+            pending = None
+            continue
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            pending = item if item.get("encrypted_content") else None
+        elif item_type == "function_call":
+            if pending is not None:
+                key = item.get("call_id") or item.get("id", "")
+                if key:
+                    associations[key] = pending
+            pending = None
+        else:
+            pending = None
+    return associations
+
+
 class XAIProvider:
     """xAI Grok provider — subscription-OAuth backend on cli-chat-proxy.
 
     Request, non-stream response, and streaming translation are implemented
-    (``anthropic_to_xai``, ``xai_to_anthropic``, and ``translate_xai_sse_event`` above). Auth
-    headers are still a stub, and this module does not yet register ``XAIProvider`` in
-    ``PROVIDERS`` — both land with capability wiring in a later step.
+    (``anthropic_to_xai``, ``xai_to_anthropic``, and ``translate_xai_sse_event`` above), plus
+    encrypted-reasoning continuity: the reasoning item preceding each tool call is captured
+    (from a response or a streamed terminal) and echoed back before its function_call on the
+    next request, so Grok can resume its own chain of thought across tool turns. Auth headers
+    are still a stub, and this module does not yet register ``XAIProvider`` in ``PROVIDERS`` —
+    both land with capability wiring in a later step.
     """
 
     name = "xai"
     endpoint = "https://api.x.ai/v1/chat/completions"
     capabilities = _XAI_TEXT_ONLY_CAPABILITIES
 
+    def __init__(self) -> None:
+        # Encrypted reasoning items captured from each tool turn, keyed by the EXACT upstream
+        # call_id, so they can be re-injected before their function_calls on the next request.
+        # In-memory only — opaque, never persisted, never logged, never returned to Claude Code.
+        self._reasoning_by_call_id: dict[str, dict] = {}
+        self._reasoning_lock = threading.Lock()
+
     async def authenticate(self) -> dict[str, str]:
         """Return xAI auth headers. Requires XAI_API_KEY env var."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
 
+    def _stash_reasoning(self, associations: dict[str, dict]) -> None:
+        """Store captured reasoning blobs, refreshing recency and evicting the oldest entries
+        once the cache exceeds its bound (LRU)."""
+        if not associations:
+            return
+        with self._reasoning_lock:
+            for call_id, reasoning in associations.items():
+                self._reasoning_by_call_id.pop(call_id, None)
+                self._reasoning_by_call_id[call_id] = reasoning
+            while len(self._reasoning_by_call_id) > _REASONING_CACHE_MAX:
+                oldest = next(iter(self._reasoning_by_call_id))
+                del self._reasoning_by_call_id[oldest]
+
+    def _inject_reasoning(self, translated: dict) -> None:
+        """Insert each cached reasoning item immediately before the function_call it belongs to,
+        in-place on ``translated['input']``.
+
+        Each reasoning item is inserted at most once (dedup by its id), so parallel calls
+        sharing one reasoning item get a single preceding copy. Keys match by the verbatim
+        call_id — no ``fc_`` rewrite, mirroring the request-side function_call identity.
+        """
+        input_items = translated.get("input")
+        if not isinstance(input_items, list):
+            return
+        with self._reasoning_lock:
+            if not self._reasoning_by_call_id:
+                return
+            cache = dict(self._reasoning_by_call_id)
+        new_input: list[dict] = []
+        inserted: set = set()
+        for item in input_items:
+            if item.get("type") == "function_call":
+                key = item.get("call_id") or item.get("id", "")
+                reasoning = cache.get(key)
+                if reasoning is not None:
+                    dedup_key = reasoning.get("id") or id(reasoning)
+                    if dedup_key not in inserted:
+                        new_input.append(reasoning)
+                        inserted.add(dedup_key)
+            new_input.append(item)
+        translated["input"] = new_input
+
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
-        """Translate an Anthropic Messages request to an xAI Responses request."""
-        return anthropic_to_xai(anthropic_req, self.capabilities)
+        """Translate an Anthropic Messages request to an xAI Responses request, echoing any
+        captured encrypted reasoning back before its function_calls."""
+        result, warnings = anthropic_to_xai(anthropic_req, self.capabilities)
+        self._inject_reasoning(result)
+        return result, warnings
 
     def translate_response(self, provider_resp: dict) -> dict:
-        """Translate an xAI Responses object back to Anthropic Messages format."""
+        """Translate an xAI Responses object back to Anthropic Messages format, capturing each
+        function_call's preceding encrypted reasoning for the next request."""
+        self._stash_reasoning(_associate_reasoning_with_calls(provider_resp.get("output", [])))
         return xai_to_anthropic(
             provider_resp,
             token_count_multiplier=self.capabilities.token_count_multiplier,
         )
+
+    def _capture_stream_reasoning(self, parsed_event: dict) -> None:
+        """Capture encrypted reasoning from a streamed terminal event.
+
+        Both ``response.completed`` and ``response.incomplete`` carry the output array
+        (reasoning items with ``encrypted_content`` included); an incomplete turn that still
+        emitted a function_call needs its reasoning stashed too, or the next request's tool echo
+        loses its continuation state.
+        """
+        if parsed_event.get("event") not in ("response.completed", "response.incomplete"):
+            return
+        response_obj = (parsed_event.get("data") or {}).get("response") or {}
+        self._stash_reasoning(_associate_reasoning_with_calls(response_obj.get("output", [])))
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw xAI byte chunks to Anthropic-format SSE events.
@@ -1253,6 +1361,7 @@ class XAIProvider:
             nonlocal block_index, has_tool_calls, started, terminated
             out: list[dict] = []
             for parsed_event in parse_sse_events(event_bytes):
+                self._capture_stream_reasoning(parsed_event)
                 for translated in translate_xai_sse_event(
                     parsed_event,
                     token_count_multiplier=self.capabilities.token_count_multiplier,
