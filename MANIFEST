@@ -6,6 +6,7 @@ LICENSE
 MANIFEST
 README.md
 claude-codex
+claude-grok
 pyproject.toml
 scripts/mutate.sh
 scripts/probe_codex_modality.py
