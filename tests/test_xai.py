@@ -24,9 +24,15 @@ from pathlib import Path
 import pytest
 
 from claude_bridge.auth import decode_jwt_exp
+from claude_bridge.content import parse_media_source
+from claude_bridge.provider import ProviderCapabilities
 from claude_bridge.providers.xai import (
     XAIProvider,
     _iso_to_timestamp,
+    _safe_document_filename,
+    _tool_result_parts,
+    _translate_document_block,
+    _translate_image_block,
     _xai_token_expired,
     anthropic_to_xai,
     get_xai_bearer_token,
@@ -39,6 +45,21 @@ _ENTRY_KEY = f"https://auth.x.ai::{_CLIENT_ID}"
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "xai"
 
+# Media-capable capability objects for exercising the forward-vs-degrade seam directly.
+# xAI's PROVIDER instance declares its own (conservative until B8); these drive the
+# translation functions in isolation, mirroring how the openai media tests work.
+_MEDIA_CAPS = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+)
+_ARRAY_TOOL_CAPS = ProviderCapabilities(
+    stream_request_mode="body_parameter",
+    sync_response_mode="sse",
+    input_modalities=frozenset({"text", "image", "document"}),
+    supports_tool_output_content_parts=True,
+)
+
 
 def _load_fixture(name: str) -> dict:
     """Load a golden xAI wire-capture fixture (see tests/fixtures/xai/README.md)."""
@@ -48,6 +69,14 @@ def _load_fixture(name: str) -> dict:
 def _input_items(result: dict, item_type: str) -> list[dict]:
     """Return the translated input items of a given Responses ``type``."""
     return [item for item in result["input"] if item.get("type") == item_type]
+
+
+def _user_content_parts(result: dict) -> list[dict]:
+    """Return the nested content parts of the first user message input item."""
+    for item in result["input"]:
+        if item.get("role") == "user":
+            return item["content"]
+    return []
 
 
 def _make_jwt(payload: dict) -> str:
@@ -878,7 +907,11 @@ class TestRequestTranslation:
     # -- unsupported blocks (B3 is text+tools only) --------------------------
 
     def test_unsupported_message_block_degrades_without_leaking_content(self):
-        """An image block at message level (B3 is text-only) → redacted placeholder, no base64."""
+        """A block type with no xAI route (server_tool_use) → redacted placeholder, no leak.
+
+        The placeholder NEVER echoes the block's nested fields — a raw str(block) would
+        both pollute the request and leak whatever the special block carried.
+        """
         result, warnings = anthropic_to_xai(
             {
                 "messages": [
@@ -886,12 +919,10 @@ class TestRequestTranslation:
                         "role": "user",
                         "content": [
                             {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": "SECRETPNGPAYLOAD==",
-                                },
+                                "type": "server_tool_use",
+                                "id": "srvtoolu_x",
+                                "name": "web_search",
+                                "input": {"query": "SECRETQUERYPAYLOAD"},
                             }
                         ],
                     }
@@ -900,9 +931,9 @@ class TestRequestTranslation:
         )
         block = result["input"][0]["content"][0]
         assert block["type"] == "input_text"
-        assert block["text"] == "[unsupported content block: image]"
-        assert "SECRETPNGPAYLOAD" not in json.dumps(result)
-        assert any("image" in w for w in warnings)
+        assert block["text"] == "[unsupported content block: server_tool_use]"
+        assert "SECRETQUERYPAYLOAD" not in json.dumps(result)
+        assert any("server_tool_use" in w for w in warnings)
 
     def test_unsupported_block_type_is_truncated_when_oversized(self):
         """A hostile oversized block type is capped at 64 chars (CWE-117 / log-flood defense)."""
@@ -983,6 +1014,184 @@ class TestRequestTranslation:
             {"messages": [{"role": "user", "content": "hi"}]}
         )
         assert result["model"] == "grok-4.20"
-        assert result["input"] == [
-            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+
+
+class TestMediaForwarding:
+    """Anthropic image/document blocks -> xAI Responses input_image/input_file parts.
+
+    Oracle: the input_image ``data:`` URL shape proven accepted by image_input.json, and
+    the Responses input_image/input_file spec. Every degrade path asserts the base64
+    payload never leaks into the forwarded part or the warning.
+    """
+
+    _PNG_1PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCA',placeholder"
+
+    def _image_block(self, media_type: str = "image/png", data: str = "IMGDATA") -> dict:
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        }
+
+    def _doc_block(
+        self, media_type: str = "application/pdf", data: str = "DOCDATA", **extra
+    ) -> dict:
+        block: dict = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        }
+        block.update(extra)
+        return block
+
+    def _user_msg(self, *blocks: dict) -> dict:
+        return {"messages": [{"role": "user", "content": list(blocks)}]}
+
+    # -- image message path ---------------------------------------------------
+
+    def test_base64_png_forwarded_as_input_image_data_uri(self):
+        # Oracle: input_image.image_url is a data: URL (image_input.json proves the shape).
+        result, warnings = anthropic_to_xai(self._user_msg(self._image_block()), _MEDIA_CAPS)
+        assert _user_content_parts(result) == [
+            {"type": "input_image", "image_url": "data:image/png;base64,IMGDATA"}
         ]
+        assert warnings == []
+
+    def test_url_image_forwarded_as_input_image_url(self):
+        block = {"type": "image", "source": {"type": "url", "url": "https://ex.com/a.png"}}
+        result, _ = anthropic_to_xai(self._user_msg(block), _MEDIA_CAPS)
+        assert _user_content_parts(result) == [
+            {"type": "input_image", "image_url": "https://ex.com/a.png"}
+        ]
+
+    def test_base64_image_outside_mime_allowlist_degrades_without_leaking_base64(self):
+        # image/tiff is not a Responses input_image type -> redacted placeholder, never bytes.
+        block = self._image_block(media_type="image/tiff", data="SECRETIMGBYTES")
+        result, warnings = anthropic_to_xai(self._user_msg(block), _MEDIA_CAPS)
+        parts = _user_content_parts(result)
+        assert parts == [{"type": "input_text", "text": "[unsupported image: image/tiff]"}]
+        assert "SECRETIMGBYTES" not in json.dumps(parts)
+        assert "SECRETIMGBYTES" not in json.dumps(warnings)
+
+    def test_image_degrades_when_provider_lacks_image_modality(self):
+        # Default text-only capabilities -> no image forwarding.
+        block = self._image_block(data="SECRETIMGBYTES")
+        result, warnings = anthropic_to_xai(self._user_msg(block))
+        parts = _user_content_parts(result)
+        assert parts[0]["type"] == "input_text"
+        assert parts[0]["text"].startswith("[unsupported image:")
+        assert "SECRETIMGBYTES" not in json.dumps(parts) + json.dumps(warnings)
+
+    def test_file_source_image_degrades_no_bytes(self):
+        block = {"type": "image", "source": {"type": "file", "file_id": "file_123"}}
+        src = parse_media_source(block)
+        part, warnings = _translate_image_block(src, _MEDIA_CAPS)
+        assert part == {"type": "input_text", "text": "[unsupported image: file]"}
+        assert warnings
+
+    # -- document message path ------------------------------------------------
+
+    def test_base64_pdf_forwarded_as_input_file_data_uri(self):
+        block = self._doc_block(title="report.pdf")
+        result, warnings = anthropic_to_xai(self._user_msg(block), _MEDIA_CAPS)
+        assert _user_content_parts(result) == [
+            {
+                "type": "input_file",
+                "filename": "report.pdf",
+                "file_data": "data:application/pdf;base64,DOCDATA",
+            }
+        ]
+        assert warnings == []
+
+    def test_url_document_forwarded_as_input_file_url(self):
+        block = {"type": "document", "source": {"type": "url", "url": "https://ex.com/a.pdf"}}
+        result, _ = anthropic_to_xai(self._user_msg(block), _MEDIA_CAPS)
+        assert _user_content_parts(result) == [
+            {"type": "input_file", "file_url": "https://ex.com/a.pdf"}
+        ]
+
+    def test_base64_document_outside_mime_allowlist_degrades(self):
+        block = self._doc_block(media_type="text/csv", data="SECRETDOCBYTES")
+        part, warnings = _translate_document_block(parse_media_source(block), _MEDIA_CAPS)
+        assert part == {"type": "input_text", "text": "[unsupported document: text/csv]"}
+        assert "SECRETDOCBYTES" not in json.dumps(part) + json.dumps(warnings)
+
+    def test_document_filename_sanitized_strips_path(self):
+        # A client-controlled title with path separators is reduced to a basename.
+        assert _safe_document_filename("../../etc/passwd") == "passwd"
+        assert _safe_document_filename("C:\\Windows\\secret.pdf") == "secret.pdf"
+
+    def test_document_default_filename_when_title_absent(self):
+        assert _safe_document_filename(None) == "document.pdf"
+        assert _safe_document_filename("") == "document.pdf"
+
+    def test_document_degrades_when_provider_lacks_document_modality(self):
+        block = self._doc_block(data="SECRETDOCBYTES")
+        result, warnings = anthropic_to_xai(self._user_msg(block))  # text-only default
+        parts = _user_content_parts(result)
+        assert parts[0]["type"] == "input_text"
+        assert parts[0]["text"].startswith("[unsupported document:")
+        assert "SECRETDOCBYTES" not in json.dumps(parts) + json.dumps(warnings)
+
+    # -- tool_result media: array form (capability-gated) ---------------------
+
+    def test_tool_result_media_forwarded_as_content_part_array_when_supported(self):
+        # array-capable provider -> function_call_output.output is a LIST of real parts.
+        block = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_media_1",
+            "content": [
+                {"type": "text", "text": "here"},
+                self._image_block(),
+            ],
+        }
+        result, warnings = anthropic_to_xai(
+            {"messages": [{"role": "user", "content": [block]}]}, _ARRAY_TOOL_CAPS
+        )
+        outputs = _input_items(result, "function_call_output")
+        assert len(outputs) == 1
+        assert outputs[0]["output"] == [
+            {"type": "input_text", "text": "here"},
+            {"type": "input_image", "image_url": "data:image/png;base64,IMGDATA"},
+        ]
+        # The verbatim-call_id divergence is preserved in the array path.
+        assert outputs[0]["call_id"] == "toolu_media_1"
+        assert warnings == []
+
+    def test_tool_result_error_prepends_error_marker_part(self):
+        content = [{"type": "text", "text": "boom"}]
+        parts, _ = _tool_result_parts(content, _ARRAY_TOOL_CAPS, is_error=True)
+        assert parts[0] == {"type": "input_text", "text": "[Error]"}
+        assert parts[1] == {"type": "input_text", "text": "boom"}
+
+    def test_tool_result_media_degrades_to_string_when_array_unsupported(self):
+        # img/doc INPUT supported but tool-output arrays NOT -> media redacted to a string,
+        # never base64; call_id still verbatim.
+        block = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_media_2",
+            "content": [{"type": "text", "text": "cap"}, self._image_block(data="SECRETIMGBYTES")],
+        }
+        result, warnings = anthropic_to_xai(
+            {"messages": [{"role": "user", "content": [block]}]}, _MEDIA_CAPS
+        )
+        outputs = _input_items(result, "function_call_output")
+        assert isinstance(outputs[0]["output"], str)
+        assert "SECRETIMGBYTES" not in outputs[0]["output"]
+        assert outputs[0]["call_id"] == "toolu_media_2"
+        assert any("redacted" in w for w in warnings)
+
+    # -- capability threading -------------------------------------------------
+
+    def test_anthropic_to_xai_defaults_to_conservative_text_only(self):
+        # No capabilities argument => the pre-media conservative default (degrade image).
+        result, _ = anthropic_to_xai(self._user_msg(self._image_block()))
+        assert _user_content_parts(result)[0]["type"] == "input_text"
+
+    def test_translate_request_honors_provider_declared_capabilities(self):
+        # translate_request must thread self.capabilities: media forwards iff the provider
+        # declares the image modality (text-only until B8 wires media caps).
+        result, _ = XAIProvider().translate_request(self._user_msg(self._image_block()))
+        part = _user_content_parts(result)[0]
+        if "image" in XAIProvider.capabilities.input_modalities:
+            assert part == {"type": "input_image", "image_url": "data:image/png;base64,IMGDATA"}
+        else:
+            assert part["type"] == "input_text"

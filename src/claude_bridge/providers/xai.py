@@ -29,6 +29,7 @@ from pathlib import Path
 
 import claude_bridge.config as config
 from claude_bridge.auth import decode_jwt_exp
+from claude_bridge.content import MediaSource, parse_media_source
 from claude_bridge.provider import ProviderCapabilities
 
 # The grok CLI's OAuth client is a *public* OIDC client identifier (like Codex's),
@@ -256,10 +257,28 @@ _XAI_REASONING_MODE = config.reasoning_mode()
 # Top-level Anthropic request keys with no xAI Responses equivalent.
 _XAI_STRIPPED_KEYS = ("output_config",)
 
-# Content-block types that carry media inside a tool_result. B3 is text+tools only,
-# so a media block here degrades to a redacted string (never base64); real tool-output
-# media forwarding lands in B4.
+# Content-block types that carry media inside a tool_result. When the provider declares
+# ``supports_tool_output_content_parts`` the media is forwarded as real Responses content
+# parts; otherwise it degrades to a redacted string (never base64).
 _TOOL_RESULT_MEDIA_TYPES = frozenset({"image", "document"})
+
+# Image MIME types the Responses ``input_image`` part accepts. A base64 image whose
+# media_type is outside this set degrades to a placeholder rather than risking an upstream
+# 400 — the set is the contract, not a guess. Proven accepted by image_input.json.
+_IMAGE_MIME_ALLOWLIST = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+
+# Document MIME types the Responses ``input_file`` part accepts as base64 ``file_data``.
+# A base64 document outside this set degrades rather than interpolating an unvalidated,
+# client-controlled media_type into a data: URL — same allowlist discipline as images.
+_DOCUMENT_MIME_ALLOWLIST = frozenset({"application/pdf"})
+
+# Fallback filename for a document with no Anthropic ``title`` — the Responses
+# ``input_file`` part requires a filename.
+_DEFAULT_DOCUMENT_FILENAME = "document.pdf"
+
+# Upper bound on a forwarded filename. The Anthropic ``title`` is client-controlled and
+# reaches the provider as metadata; cap it so a hostile title cannot bloat the body.
+_FILENAME_MAX = 255
 
 # Upper bound on a user-controlled token (block / tool_choice ``type``) embedded in a
 # translation warning — caps log/trace line length against a hostile oversized type.
@@ -300,6 +319,83 @@ def _translate_thinking_block(block: dict) -> tuple[dict, list[str]]:
         ]
     thinking_text = block.get("thinking", "")
     return {"type": "input_text", "text": f"[thinking]\n{thinking_text}\n[/thinking]"}, []
+
+
+def _media_placeholder(kind: str, reason: str) -> tuple[dict, list[str]]:
+    """Build a redacted placeholder + warning for media that can't be forwarded.
+
+    ``reason`` must name only a safe token (media_type, source kind, modality) — never
+    the base64 payload, which must never reach the placeholder text or the warning.
+    """
+    safe_reason = _safe_token(reason)
+    return (
+        {"type": "input_text", "text": f"[unsupported {kind}: {safe_reason}]"},
+        [f"{kind} input degraded to placeholder: {safe_reason}"],
+    )
+
+
+def _translate_image_block(
+    source: MediaSource, capabilities: ProviderCapabilities
+) -> tuple[dict, list[str]]:
+    """Forward an image as a Responses ``input_image`` part, or degrade if unforwardable.
+
+    Spec: ``input_image.image_url`` is a STRING — a ``data:`` URL for base64 (proven
+    accepted by image_input.json) or the source URL directly. Base64 outside the MIME
+    allowlist, or a file/unknown source (no bytes), degrades to a redacted placeholder
+    (never echoes the payload).
+    """
+    if "image" not in capabilities.input_modalities:
+        return _media_placeholder("image", "not supported by this provider/auth mode")
+    if source.source_kind == "url":
+        return {"type": "input_image", "image_url": source.url}, []
+    if source.source_kind == "base64":
+        if source.media_type not in _IMAGE_MIME_ALLOWLIST:
+            return _media_placeholder("image", source.media_type)
+        return {
+            "type": "input_image",
+            "image_url": f"data:{source.media_type};base64,{source.data}",
+        }, []
+    return _media_placeholder("image", source.source_kind)
+
+
+def _safe_document_filename(title: object) -> str:
+    """Sanitize a client-controlled document title into a safe input_file filename.
+
+    The Anthropic ``title`` is untrusted and forwarded to the provider as metadata.
+    Reduces it to a basename (drops POSIX and Windows path separators), strips
+    non-printable characters, and caps length; an empty or fully-stripped title
+    falls back to ``_DEFAULT_DOCUMENT_FILENAME``.
+    """
+    if not title:
+        return _DEFAULT_DOCUMENT_FILENAME
+    basename = str(title).replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(ch for ch in basename if ch.isprintable()).strip()
+    return cleaned[:_FILENAME_MAX] or _DEFAULT_DOCUMENT_FILENAME
+
+
+def _translate_document_block(
+    source: MediaSource, capabilities: ProviderCapabilities
+) -> tuple[dict, list[str]]:
+    """Forward a document as a Responses ``input_file`` part, or degrade if unforwardable.
+
+    Spec: ``input_file`` carries ``filename``+``file_data`` (a ``data:`` URL) for base64,
+    or ``file_url`` for a URL source. Base64 outside the document MIME allowlist, or a
+    file/unknown source (no bytes), degrades to a redacted placeholder (never echoes the
+    payload). The forwarded filename is sanitized — the title is client-controlled.
+    """
+    if "document" not in capabilities.input_modalities:
+        return _media_placeholder("document", "not supported by this provider/auth mode")
+    if source.source_kind == "url":
+        return {"type": "input_file", "file_url": source.url}, []
+    if source.source_kind == "base64":
+        if source.media_type not in _DOCUMENT_MIME_ALLOWLIST:
+            return _media_placeholder("document", source.media_type)
+        return {
+            "type": "input_file",
+            "filename": _safe_document_filename(source.filename),
+            "file_data": f"data:{source.media_type};base64,{source.data}",
+        }, []
+    return _media_placeholder("document", source.source_kind)
 
 
 def _translate_tool_use_block(block: dict) -> dict:
@@ -351,23 +447,63 @@ def _tool_result_string(content: object, is_error: bool) -> str:
     return f"[Error] {text}" if is_error else text
 
 
-def _translate_tool_result_block(block: dict) -> tuple[dict, list[str]]:
+def _tool_result_parts(
+    content: list, capabilities: ProviderCapabilities, is_error: bool
+) -> tuple[list[dict], list[str]]:
+    """Build the array form of tool_result output: real Responses content parts.
+
+    Text becomes ``input_text``; image/document delegate to the same media helpers as
+    the message path (so an unforwardable modality degrades to a redacted part). An
+    error result is prefixed with a leading ``[Error]`` marker part so the model can
+    distinguish failure from success carrying the same parts.
+    """
+    parts: list[dict] = []
+    warnings: list[str] = []
+    for b in content:
+        btype = b.get("type")
+        if btype == "text":
+            parts.append({"type": "input_text", "text": b.get("text", "")})
+        elif btype == "image":
+            part, warns = _translate_image_block(parse_media_source(b), capabilities)
+            parts.append(part)
+            warnings.extend(warns)
+        elif btype == "document":
+            part, warns = _translate_document_block(parse_media_source(b), capabilities)
+            parts.append(part)
+            warnings.extend(warns)
+    if is_error:
+        parts.insert(0, {"type": "input_text", "text": "[Error]"})
+    return parts, warnings
+
+
+def _translate_tool_result_block(
+    block: dict, capabilities: ProviderCapabilities
+) -> tuple[dict, list[str]]:
     """Translate an Anthropic tool_result to a top-level ``function_call_output`` item.
 
     ``call_id`` is the Anthropic ``tool_use_id`` VERBATIM — the same exact-linkage rule
     as ``_translate_tool_use_block``, and the property tool_result_replay_exact.json
-    proves the model consumes. ``output`` is a string; media in the content degrades to
-    a redacted placeholder (never base64) with a warning.
+    proves the model consumes. ``output`` is ``str | list[dict]``: when the content
+    carries media AND the provider declares ``supports_tool_output_content_parts``, it is
+    an ARRAY of real content parts (so tool-returned screenshots/PDFs reach a vision
+    model); otherwise it is a string, and media in a string-only backend is redacted
+    (never base64).
     """
     content = block.get("content", "")
     is_error = bool(block.get("is_error"))
-    output = _tool_result_string(content, is_error)
-    warnings: list[str] = []
-    if _tool_result_has_media(content):
-        warnings = [
-            "tool_result media redacted to string "
-            "(provider/auth mode does not support tool-output media)"
-        ]
+    if (
+        isinstance(content, list)
+        and _tool_result_has_media(content)
+        and capabilities.supports_tool_output_content_parts
+    ):
+        output, warnings = _tool_result_parts(content, capabilities, is_error)
+    else:
+        output, warnings = _tool_result_string(content, is_error), []
+        if isinstance(content, list) and _tool_result_has_media(content):
+            warnings = [
+                "tool_result media redacted to string "
+                "(provider/auth mode does not support tool-output content arrays)"
+            ]
     return {
         "_toplevel": True,
         "type": "function_call_output",
@@ -391,28 +527,37 @@ def _translate_unsupported_block(block_type: str) -> tuple[dict, list[str]]:
     return {"type": "input_text", "text": f"[unsupported content block: {safe_type}]"}, [warning]
 
 
-def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
+def _translate_content_block(
+    block: dict, capabilities: ProviderCapabilities
+) -> tuple[dict, list[str]]:
     """Translate one Anthropic content block to an xAI Responses input block.
 
     Returns ``(translated_block, warnings)``. tool_use / tool_result carry a special
     ``_toplevel`` key signaling the caller to emit them as top-level input items rather
-    than nesting them inside a message's content array. Thin dispatcher — each type
-    delegates to a helper so this stays under the CCN ceiling as types grow (B4 adds
-    the image/document cases here).
+    than nesting them inside a message's content array. Media blocks (image/document)
+    become real Responses content parts when ``capabilities.input_modalities`` allows,
+    and degrade to a redacted placeholder (never echoing base64) otherwise. Thin
+    dispatcher — each type delegates to a helper so this stays under the CCN ceiling.
     """
     block_type = block.get("type", "unknown")
     if block_type == "text":
         return {"type": "input_text", "text": block["text"]}, []
     if block_type == "thinking":
         return _translate_thinking_block(block)
+    if block_type == "image":
+        return _translate_image_block(parse_media_source(block), capabilities)
+    if block_type == "document":
+        return _translate_document_block(parse_media_source(block), capabilities)
     if block_type == "tool_use":
         return _translate_tool_use_block(block), []
     if block_type == "tool_result":
-        return _translate_tool_result_block(block)
+        return _translate_tool_result_block(block, capabilities)
     return _translate_unsupported_block(block_type)
 
 
-def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
+def _translate_message(
+    message: dict, capabilities: ProviderCapabilities
+) -> tuple[list[dict], list[str]]:
     """Translate one Anthropic message to a list of xAI Responses input items.
 
     Anthropic nests everything in messages with content blocks; the Responses API uses
@@ -432,7 +577,7 @@ def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
     toplevel_items: list[dict] = []
 
     for block in content:
-        translated, block_warnings = _translate_content_block(block)
+        translated, block_warnings = _translate_content_block(block, capabilities)
         warnings.extend(block_warnings)
 
         if translated.pop("_toplevel", False):
@@ -492,11 +637,17 @@ def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
     return fields, warnings
 
 
-def anthropic_to_xai(request: dict) -> tuple[dict, list[str]]:
+def anthropic_to_xai(
+    request: dict, capabilities: ProviderCapabilities = _XAI_TEXT_ONLY_CAPABILITIES
+) -> tuple[dict, list[str]]:
     """Translate an Anthropic Messages request to an xAI (Grok) Responses request.
 
     Returns ``(translated_request, warnings)`` where warnings lists features stripped
     or degraded because they have no xAI equivalent. Pure function — no I/O.
+    ``capabilities`` gates media forwarding: image/document blocks forward as Responses
+    parts only when the modality is declared, else degrade to a redacted placeholder.
+    Defaults to the conservative text-only set; the real path threads
+    ``XAIProvider.capabilities`` via ``translate_request``.
 
     Two divergences from the OpenAI path are load-bearing: (1) tool ids are forwarded
     VERBATIM (no ``fc_`` rewrite, no synthesized item id) because xAI links by
@@ -557,7 +708,7 @@ def anthropic_to_xai(request: dict) -> tuple[dict, list[str]]:
 
     input_items: list[dict] = []
     for message in request.get("messages", []):
-        items, msg_warnings = _translate_message(message)
+        items, msg_warnings = _translate_message(message, capabilities)
         input_items.extend(items)
         warnings.extend(msg_warnings)
     result["input"] = input_items
@@ -588,7 +739,7 @@ class XAIProvider:
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
         """Translate an Anthropic Messages request to an xAI Responses request."""
-        return anthropic_to_xai(anthropic_req)
+        return anthropic_to_xai(anthropic_req, self.capabilities)
 
     def translate_response(self, _provider_resp: dict) -> dict:
         """Translate xAI response back to Anthropic format."""
