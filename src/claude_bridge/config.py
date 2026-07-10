@@ -7,7 +7,9 @@ Shell-launcher environment handling remains owned by the launcher scripts.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
+from pathlib import Path
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 REASONING_MODE_ENV = "REASONING_MODE"
@@ -17,12 +19,23 @@ MAX_REQUEST_BODY_ENV = "MAX_REQUEST_BODY"
 LLM_BRIDGE_FALLBACK_ENV = "LLM_BRIDGE_FALLBACK"
 ANTHROPIC_REAL_URL_ENV = "ANTHROPIC_REAL_URL"
 CLAUDE_BRIDGE_TRACE_PATH_ENV = "CLAUDE_BRIDGE_TRACE_PATH"
+XAI_MODEL_ENV = "XAI_MODEL"
+XAI_CLIENT_VERSION_ENV = "XAI_CLIENT_VERSION"
 
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_ANTHROPIC_REAL_URL = "https://api.anthropic.com"
 DEFAULT_MAX_REQUEST_BODY = 10_485_760
 DEFAULT_FALLBACK_CHAIN = ("openai",)
 DEFAULT_REASONING_MODE = "passthrough"
+DEFAULT_XAI_MODEL = "grok-4.20"
+
+# cli-chat-proxy.grok.com answers HTTP 426 below this x-grok-client-version; the
+# resolver never sends a header older than this floor. Bundle dir layout:
+# ``~/.grok/downloads/grok-<ver>-<platform>`` (the unversioned symlink target
+# ``grok-<platform>`` must not parse as a version).
+_XAI_CLIENT_VERSION_FLOOR = "0.1.202"
+_GROK_DOWNLOADS_DIR = Path.home() / ".grok" / "downloads"
+_GROK_BUNDLE_VERSION_RE = re.compile(r"^grok-(\d+\.\d+\.\d+)-")
 
 
 def _non_empty_stripped_env(name: str) -> str | None:
@@ -105,3 +118,43 @@ def anthropic_real_url() -> str:
 def trace_path() -> str | None:
     """Return the redacted structural trace path, or None when tracing is disabled."""
     return os.environ.get(CLAUDE_BRIDGE_TRACE_PATH_ENV) or None
+
+
+def xai_model() -> str:
+    """Return the xAI Grok model id from XAI_MODEL, defaulting to grok-4.20."""
+    return _non_empty_stripped_env(XAI_MODEL_ENV) or DEFAULT_XAI_MODEL
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """Split a dotted numeric version into an int tuple for correct ordering."""
+    return tuple(int(part) for part in version.split("."))
+
+
+def _installed_grok_versions(downloads_dir: Path) -> list[str]:
+    """Return version strings parsed from ``~/.grok/downloads/grok-<ver>-*`` bundles."""
+    if not downloads_dir.is_dir():
+        return []
+    versions: list[str] = []
+    for entry in downloads_dir.iterdir():
+        match = _GROK_BUNDLE_VERSION_RE.match(entry.name)
+        if match:
+            versions.append(match.group(1))
+    return versions
+
+
+def xai_client_version(downloads_dir: Path | None = None) -> str:
+    """Resolve the ``x-grok-client-version`` header value.
+
+    Precedence: an explicit ``XAI_CLIENT_VERSION`` override wins (verbatim);
+    otherwise the highest installed grok CLI bundle version, floored at the
+    proxy's minimum (below which cli-chat-proxy answers HTTP 426); otherwise the
+    floor itself. Self-healing: a newer grok CLI bumps the header automatically.
+    """
+    override = _non_empty_stripped_env(XAI_CLIENT_VERSION_ENV)
+    if override:
+        return override
+    resolved = _XAI_CLIENT_VERSION_FLOOR
+    for version in _installed_grok_versions(downloads_dir or _GROK_DOWNLOADS_DIR):
+        if _version_tuple(version) > _version_tuple(resolved):
+            resolved = version
+    return resolved
