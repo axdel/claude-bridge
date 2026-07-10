@@ -719,8 +719,8 @@ class TestResponseStopReason:
 
     def test_incomplete_content_filter_does_not_mask_as_max_tokens(self):
         # A moderation block must NOT look like token exhaustion, or Claude Code
-        # auto-compacts a context that is nowhere near full. Anthropic convention
-        # (mirrors the Gemini provider): refusal text + end_turn.
+        # auto-compacts a context that is nowhere near full. Anthropic convention:
+        # refusal text + end_turn.
         response = {
             "status": "incomplete",
             "incomplete_details": {"reason": "content_filter"},

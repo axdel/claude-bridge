@@ -6,7 +6,6 @@ LICENSE
 MANIFEST
 README.md
 claude-codex
-claude-gemini
 pyproject.toml
 scripts/mutate.sh
 scripts/probe_codex_modality.py
@@ -18,7 +17,6 @@ src/claude_bridge/content.py
 src/claude_bridge/log.py
 src/claude_bridge/provider.py
 src/claude_bridge/providers/__init__.py
-src/claude_bridge/providers/gemini.py
 src/claude_bridge/providers/openai.py
 src/claude_bridge/providers/xai.py
 src/claude_bridge/proxy.py

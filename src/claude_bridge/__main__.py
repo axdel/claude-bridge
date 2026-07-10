@@ -8,7 +8,6 @@ import asyncio
 import claude_bridge.config as config
 
 # Import implemented providers so they register themselves in the PROVIDERS dict.
-import claude_bridge.providers.gemini
 import claude_bridge.providers.openai  # noqa: F401
 from claude_bridge.log import configure_logging, get_logger
 from claude_bridge.proxy import start_proxy
@@ -27,19 +26,6 @@ def _detect_openai_auth_mode() -> tuple[str, str | None]:
     if api_key:
         return "api_key", api_key
     return "codex_oauth", None
-
-
-def _detect_gemini_auth_mode() -> tuple[str, str | None]:
-    """Detect Gemini auth mode from the environment.
-
-    Returns ``(auth_mode, api_key)`` where:
-    - ``("api_key", "<key>")`` when ``GEMINI_API_KEY`` is set and non-empty
-    - ``("gemini_oauth", None)`` otherwise
-    """
-    api_key = config.gemini_api_key()
-    if api_key:
-        return "api_key", api_key
-    return "gemini_oauth", None
 
 
 def main() -> None:
@@ -77,24 +63,14 @@ def main() -> None:
     provider = args.provider
     provider_kwargs: dict = {}
 
-    if provider == "gemini":
-        auth_mode, api_key = _detect_gemini_auth_mode()
-        provider_kwargs["auth_mode"] = auth_mode
-        if api_key:
-            provider_kwargs["api_key"] = api_key
-        if auth_mode == "api_key":
-            logger.info("Gemini auth: api_key (GEMINI_API_KEY detected)")
-        else:
-            logger.info("Gemini auth: gemini_oauth (using Gemini CLI subscription)")
+    auth_mode, api_key = _detect_openai_auth_mode()
+    provider_kwargs["auth_mode"] = auth_mode
+    if api_key:
+        provider_kwargs["api_key"] = api_key
+    if auth_mode == "api_key":
+        logger.info("Auth mode: api_key (OPENAI_API_KEY detected)")
     else:
-        auth_mode, api_key = _detect_openai_auth_mode()
-        provider_kwargs["auth_mode"] = auth_mode
-        if api_key:
-            provider_kwargs["api_key"] = api_key
-        if auth_mode == "api_key":
-            logger.info("Auth mode: api_key (OPENAI_API_KEY detected)")
-        else:
-            logger.info("Auth mode: codex_oauth (no OPENAI_API_KEY — falling back to Codex OAuth)")
+        logger.info("Auth mode: codex_oauth (no OPENAI_API_KEY — falling back to Codex OAuth)")
 
     asyncio.run(
         _run(

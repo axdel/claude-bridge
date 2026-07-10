@@ -323,7 +323,7 @@ class TestTerminalStreamEvents:
         results = translate_openai_sse_event(event)
         # A bare end_turn with empty content would render as a blank assistant turn
         # in Claude Code; a visible refusal text block must precede the terminator so
-        # the user learns why the turn stopped (mirrors the Gemini SAFETY path).
+        # the user learns why the turn stopped.
         assert [r["event"] for r in results] == [
             "content_block_start",
             "content_block_delta",

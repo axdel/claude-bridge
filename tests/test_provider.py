@@ -152,15 +152,3 @@ def test_openai_codex_oauth_instance_declares_image_document_without_tool_arrays
         supports_tool_output_content_parts=False,
         token_count_multiplier=GPT_TOKEN_COUNT_MULTIPLIER,
     )
-
-
-def test_gemini_declares_url_streaming_and_sse_sync_response():
-    """Gemini exposes URL-selected streaming and SSE sync-response folding."""
-    from claude_bridge.provider import ProviderCapabilities
-    from claude_bridge.providers.gemini import GeminiProvider
-
-    assert GeminiProvider.capabilities == ProviderCapabilities(
-        stream_request_mode="url",
-        sync_response_mode="sse",
-        token_count_multiplier=1.0,
-    )

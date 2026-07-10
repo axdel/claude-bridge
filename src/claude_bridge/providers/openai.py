@@ -692,8 +692,7 @@ def anthropic_to_openai(
 _CONTENT_FILTER_REASON = "content_filter"
 
 # Surfaced to Claude Code when a turn is content-filtered with no model text, so the turn
-# renders as a visible refusal rather than a blank assistant message. Mirrors the Gemini
-# provider's ``_SAFETY_REFUSAL``.
+# renders as a visible refusal rather than a blank assistant message.
 _CONTENT_FILTER_REFUSAL = (
     "I cannot complete this response because it was blocked by content safety filters. "
     "Please rephrase your request."

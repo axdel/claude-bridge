@@ -52,8 +52,8 @@ def test_fallback_chain_default_blank_and_csv(monkeypatch):
     monkeypatch.delenv(config.LLM_BRIDGE_FALLBACK_ENV, raising=False)
     assert config.fallback_chain() == ["openai"]
 
-    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "gemini, openai,,xai")
-    assert config.fallback_chain() == ["gemini", "openai", "xai"]
+    monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, " xai, openai,,")
+    assert config.fallback_chain() == ["xai", "openai"]
 
     monkeypatch.setenv(config.LLM_BRIDGE_FALLBACK_ENV, "")
     assert config.fallback_chain() == []
@@ -65,24 +65,18 @@ def test_optional_path_and_api_key_accessors_trim_empty_values(monkeypatch):
 
     monkeypatch.delenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, raising=False)
     monkeypatch.delenv(config.OPENAI_API_KEY_ENV, raising=False)
-    monkeypatch.delenv(config.GEMINI_API_KEY_ENV, raising=False)
     assert config.trace_path() is None
     assert config.openai_api_key() is None
-    assert config.gemini_api_key() is None
 
     monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, "/tmp/trace.jsonl")
     monkeypatch.setenv(config.OPENAI_API_KEY_ENV, "  sk-test-placeholder  ")
-    monkeypatch.setenv(config.GEMINI_API_KEY_ENV, "  gemini-test-placeholder  ")
     assert config.trace_path() == "/tmp/trace.jsonl"
     assert config.openai_api_key() == "sk-test-placeholder"
-    assert config.gemini_api_key() == "gemini-test-placeholder"
 
     monkeypatch.setenv(config.CLAUDE_BRIDGE_TRACE_PATH_ENV, "")
     monkeypatch.setenv(config.OPENAI_API_KEY_ENV, "   ")
-    monkeypatch.setenv(config.GEMINI_API_KEY_ENV, "   ")
     assert config.trace_path() is None
     assert config.openai_api_key() is None
-    assert config.gemini_api_key() is None
 
 
 def test_reasoning_mode_default_and_lowercase_override(monkeypatch):
@@ -94,16 +88,3 @@ def test_reasoning_mode_default_and_lowercase_override(monkeypatch):
 
     monkeypatch.setenv(config.REASONING_MODE_ENV, "DROP")
     assert config.reasoning_mode() == "drop"
-
-
-def test_gemini_model_defaults_share_one_override(monkeypatch):
-    """Gemini API-key and OAuth model defaults are explicit and share GEMINI_MODEL."""
-    import claude_bridge.config as config
-
-    monkeypatch.delenv(config.GEMINI_MODEL_ENV, raising=False)
-    assert config.gemini_api_key_model() == "gemini-2.5-pro"
-    assert config.gemini_oauth_model() == "gemini-3-flash-preview"
-
-    monkeypatch.setenv(config.GEMINI_MODEL_ENV, "gemini-3.1-pro-preview")
-    assert config.gemini_api_key_model() == "gemini-3.1-pro-preview"
-    assert config.gemini_oauth_model() == "gemini-3.1-pro-preview"

@@ -10,8 +10,6 @@ import os
 from collections.abc import Callable
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
-GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
-GEMINI_MODEL_ENV = "GEMINI_MODEL"
 REASONING_MODE_ENV = "REASONING_MODE"
 LOG_LEVEL_ENV = "LOG_LEVEL"
 UPSTREAM_TIMEOUT_ENV = "UPSTREAM_TIMEOUT"
@@ -25,8 +23,6 @@ DEFAULT_ANTHROPIC_REAL_URL = "https://api.anthropic.com"
 DEFAULT_MAX_REQUEST_BODY = 10_485_760
 DEFAULT_FALLBACK_CHAIN = ("openai",)
 DEFAULT_REASONING_MODE = "passthrough"
-GEMINI_API_KEY_DEFAULT_MODEL = "gemini-2.5-pro"
-GEMINI_OAUTH_DEFAULT_MODEL = "gemini-3-flash-preview"
 
 
 def _non_empty_stripped_env(name: str) -> str | None:
@@ -38,11 +34,6 @@ def _non_empty_stripped_env(name: str) -> str | None:
 def openai_api_key() -> str | None:
     """Return the configured OpenAI API key, or None when unset or blank."""
     return _non_empty_stripped_env(OPENAI_API_KEY_ENV)
-
-
-def gemini_api_key() -> str | None:
-    """Return the configured Gemini API key, or None when unset or blank."""
-    return _non_empty_stripped_env(GEMINI_API_KEY_ENV)
 
 
 def reasoning_mode() -> str:
@@ -114,13 +105,3 @@ def anthropic_real_url() -> str:
 def trace_path() -> str | None:
     """Return the redacted structural trace path, or None when tracing is disabled."""
     return os.environ.get(CLAUDE_BRIDGE_TRACE_PATH_ENV) or None
-
-
-def gemini_api_key_model() -> str:
-    """Return the Gemini model for API-key mode, honoring GEMINI_MODEL override."""
-    return os.environ.get(GEMINI_MODEL_ENV, GEMINI_API_KEY_DEFAULT_MODEL)
-
-
-def gemini_oauth_model() -> str:
-    """Return the Gemini model for OAuth mode, honoring GEMINI_MODEL override."""
-    return os.environ.get(GEMINI_MODEL_ENV, GEMINI_OAUTH_DEFAULT_MODEL)
