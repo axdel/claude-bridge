@@ -502,6 +502,59 @@ async def test_direct_mode_skips_anthropic(_openai_mock_url: str):
         await server.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_direct_mode_binds_real_registered_xai_provider():
+    """start_proxy(provider_name='xai') instantiates the REAL registered provider.
+
+    Closes the gap between the entry-point wiring test (which stubs start_proxy) and the
+    cache/fallback routing tests (which never exercise the direct-mode branch): here the
+    real ``start_proxy`` resolves ``PROVIDERS['xai']`` → XAIProvider, instantiates it no-arg,
+    and validates it against the Provider protocol. Oracle: a running server is returned
+    (no ``ValueError('Unknown provider')`` and no protocol-validation failure). A dead
+    upstream guarantees the bind never depends on Anthropic.
+    """
+    import claude_bridge.providers.xai  # importing registers "xai" in PROVIDERS
+
+    # Precondition: the import above registered the real provider (not a stub).
+    assert PROVIDERS["xai"] is claude_bridge.providers.xai.XAIProvider
+    proxy_port = _find_free_port()
+    dead_upstream = f"http://127.0.0.1:{_find_free_port()}"
+    server = await start_proxy(
+        host="127.0.0.1",
+        port=proxy_port,
+        upstream_url=dead_upstream,
+        provider_name="xai",
+    )
+    try:
+        assert server.is_serving()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_direct_mode_threads_provider_kwargs_to_real_xai_constructor():
+    """Direct mode passes provider_kwargs into XAIProvider's real constructor.
+
+    Oracle: XAIProvider's keyword-only signature (``*, auth_path=None``) rejects an unknown
+    keyword, so an unexpected kwarg raises TypeError out of ``provider_cls(**provider_kwargs)``.
+    A direct-mode branch that ignored provider_kwargs — or routed to a ``**kwargs``-accepting
+    provider — would bind silently instead of raising. Proves the kwargs the entry point
+    resolves ({} for xai) genuinely reach the real provider constructor, not a discarded copy.
+    """
+    import claude_bridge.providers.xai  # importing registers "xai" in PROVIDERS
+
+    # Precondition: the import above registered the real provider (not a stub).
+    assert PROVIDERS["xai"] is claude_bridge.providers.xai.XAIProvider
+    with pytest.raises(TypeError):
+        await start_proxy(
+            host="127.0.0.1",
+            port=_find_free_port(),
+            provider_name="xai",
+            provider_kwargs={"unexpected_kwarg": True},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Provider cache + configurable fallback tests
 # ---------------------------------------------------------------------------

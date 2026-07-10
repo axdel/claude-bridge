@@ -152,3 +152,26 @@ def test_openai_codex_oauth_instance_declares_image_document_without_tool_arrays
         supports_tool_output_content_parts=False,
         token_count_multiplier=GPT_TOKEN_COUNT_MULTIPLIER,
     )
+
+
+def test_xai_declares_full_media_capabilities_at_class_level():
+    """xAI forwards image+document input and array-form tool output, at the class level.
+
+    Unlike OpenAI (conservative text-only class default, media enabled per auth-mode
+    instance), xAI has a single subscription backend with no auth-mode variance, so the
+    CLASS attribute IS the full declaration — nothing shadows it per instance. Oracle: the
+    cli-chat-proxy Responses contract (image+document input, array-form
+    ``function_call_output.output``) and subscription-metered billing (the identity
+    token-count multiplier — no OpenAI-compat scaling). The multiplier oracle references
+    the canonical ``_XAI_TOKEN_COUNT_MULTIPLIER`` owner rather than re-encoding 1.0.
+    """
+    from claude_bridge.provider import ProviderCapabilities
+    from claude_bridge.providers.xai import _XAI_TOKEN_COUNT_MULTIPLIER, XAIProvider
+
+    assert XAIProvider.capabilities == ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+        input_modalities=frozenset({"text", "image", "document"}),
+        supports_tool_output_content_parts=True,
+        token_count_multiplier=_XAI_TOKEN_COUNT_MULTIPLIER,
+    )

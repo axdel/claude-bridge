@@ -7,9 +7,11 @@ grok CLI's own credential file, ``~/.grok/auth.json``: a single
 a refresh. There is no API-key mode — the only credential source is the grok
 subscription login.
 
-Request translation (Anthropic Messages -> xAI Responses) is implemented below;
-response and stream translation are still stubs (see ``XAIProvider``). This module
-intentionally does not register ``XAIProvider`` in ``PROVIDERS`` yet.
+Request, response, and stream translation (Anthropic Messages <-> xAI Responses)
+are all implemented on ``XAIProvider``, which registers itself in ``PROVIDERS``
+under ``"xai"`` at import time. The backend is the grok CLI's subscription-metered
+proxy (``cli-chat-proxy.grok.com``), reached with the subscription bearer plus the
+``x-grok-client-version`` / ``x-grok-client-identifier`` gate headers.
 """
 
 from __future__ import annotations
