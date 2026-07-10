@@ -7,8 +7,9 @@ grok CLI's own credential file, ``~/.grok/auth.json``: a single
 a refresh. There is no API-key mode — the only credential source is the grok
 subscription login.
 
-Request/response/stream translation is still a stub (see ``XAIProvider`` below);
-this module intentionally does not register ``XAIProvider`` in ``PROVIDERS`` yet.
+Request translation (Anthropic Messages -> xAI Responses) is implemented below;
+response and stream translation are still stubs (see ``XAIProvider``). This module
+intentionally does not register ``XAIProvider`` in ``PROVIDERS`` yet.
 """
 
 from __future__ import annotations
@@ -26,7 +27,9 @@ import urllib.request
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import claude_bridge.config as config
 from claude_bridge.auth import decode_jwt_exp
+from claude_bridge.provider import ProviderCapabilities
 
 # The grok CLI's OAuth client is a *public* OIDC client identifier (like Codex's),
 # not a secret. The token endpoint is derived from the entry's ``oidc_issuer``;
@@ -240,19 +243,352 @@ async def refresh_xai_token(
     return await asyncio.to_thread(_do_refresh)
 
 
+# ---------------------------------------------------------------------------
+# Anthropic -> xAI (Grok) request translation (pure functions, no I/O)
+# ---------------------------------------------------------------------------
+
+# Reasoning mode (shared REASONING_MODE env): "passthrough" keeps a replayed
+# Anthropic thinking block as bracketed text, "drop" strips it. xAI reasoning
+# *continuity* rides on encrypted reasoning items (include=reasoning.encrypted_content),
+# replayed by the provider — not this text path. Read once at import, like openai.py.
+_XAI_REASONING_MODE = config.reasoning_mode()
+
+# Top-level Anthropic request keys with no xAI Responses equivalent.
+_XAI_STRIPPED_KEYS = ("output_config",)
+
+# Content-block types that carry media inside a tool_result. B3 is text+tools only,
+# so a media block here degrades to a redacted string (never base64); real tool-output
+# media forwarding lands in B4.
+_TOOL_RESULT_MEDIA_TYPES = frozenset({"image", "document"})
+
+# Upper bound on a user-controlled token (block / tool_choice ``type``) embedded in a
+# translation warning — caps log/trace line length against a hostile oversized type.
+_XAI_SAFE_TOKEN_MAX = 64
+
+# Instruction sent to xAI when the Anthropic request carries no system prompt (the
+# cli-chat-proxy Responses endpoint expects an instructions string).
+_DEFAULT_XAI_INSTRUCTIONS = "You are a helpful assistant."
+
+# Text-only capabilities for the provider instance. B4 adds image/document input
+# modalities and array-form tool output; B8 finalizes the capability set and the
+# token-count multiplier. Declared here so ``XAIProvider`` satisfies the Provider
+# protocol and the proxy can read its stream/response modes.
+_XAI_TEXT_ONLY_CAPABILITIES = ProviderCapabilities(
+    stream_request_mode="body_parameter", sync_response_mode="sse"
+)
+
+
+def _safe_token(value: object) -> str:
+    """Neutralize an attacker-controlled token for safe embedding in a log line or trace.
+
+    A block / tool_choice ``type`` comes straight from the client request and is
+    interpolated into a translation warning that reaches the human log and the
+    structural trace. Strips non-printable characters (CWE-117 log injection) and caps
+    the length so a hostile type cannot forge log records or flood the trace.
+    """
+    cleaned = "".join(ch for ch in str(value) if ch.isprintable())
+    if len(cleaned) > _XAI_SAFE_TOKEN_MAX:
+        return cleaned[:_XAI_SAFE_TOKEN_MAX] + "..."
+    return cleaned
+
+
+def _translate_thinking_block(block: dict) -> tuple[dict, list[str]]:
+    """Translate an Anthropic thinking block per the configured reasoning mode."""
+    if _XAI_REASONING_MODE == "drop":
+        return {"type": "input_text", "text": ""}, [
+            "Stripped thinking block (reasoning_mode=drop)"
+        ]
+    thinking_text = block.get("thinking", "")
+    return {"type": "input_text", "text": f"[thinking]\n{thinking_text}\n[/thinking]"}, []
+
+
+def _translate_tool_use_block(block: dict) -> dict:
+    """Translate an Anthropic tool_use block to a top-level xAI ``function_call`` item.
+
+    xAI's cli-chat-proxy links a call to its result by ``call_id`` ALONE and accepts
+    the id VERBATIM (proved by tool_result_replay_exact.json). So — unlike the OpenAI
+    path, which rewrites ids to the ``fc_`` form — the Anthropic tool id is forwarded
+    unchanged and NO separate item ``id`` is synthesized: the id surfaced on the
+    response IS xAI's ``call_id``, and it must round-trip byte-for-byte.
+    """
+    return {
+        "_toplevel": True,
+        "type": "function_call",
+        "call_id": block["id"],
+        "name": block["name"],
+        "arguments": json.dumps(block["input"]),
+    }
+
+
+def _tool_result_has_media(content: object) -> bool:
+    """Report whether tool_result content carries an image/document block."""
+    if not isinstance(content, list):
+        return False
+    return any(b.get("type") in _TOOL_RESULT_MEDIA_TYPES for b in content)
+
+
+def _tool_result_string(content: object, is_error: bool) -> str:
+    """Flatten tool_result content to a string, redacting media by type (never base64).
+
+    A media block degrades to a bounded ``[media omitted: <type> — …]`` placeholder
+    naming only the block type: B3's text-only backend cannot carry the bytes, and
+    echoing the base64 payload would leak the tool's output. Real tool-output media
+    forwarding lands in B4.
+    """
+    if isinstance(content, list):
+        rendered = []
+        for b in content:
+            if b.get("type") == "text":
+                rendered.append(b.get("text", ""))
+            elif b.get("type") in _TOOL_RESULT_MEDIA_TYPES:
+                rendered.append(
+                    f"[media omitted: {_safe_token(b.get('type'))} — "
+                    "provider/auth mode does not support tool-output media]"
+                )
+        text = "\n".join(rendered)
+    else:
+        text = str(content) if content else ""
+    return f"[Error] {text}" if is_error else text
+
+
+def _translate_tool_result_block(block: dict) -> tuple[dict, list[str]]:
+    """Translate an Anthropic tool_result to a top-level ``function_call_output`` item.
+
+    ``call_id`` is the Anthropic ``tool_use_id`` VERBATIM — the same exact-linkage rule
+    as ``_translate_tool_use_block``, and the property tool_result_replay_exact.json
+    proves the model consumes. ``output`` is a string; media in the content degrades to
+    a redacted placeholder (never base64) with a warning.
+    """
+    content = block.get("content", "")
+    is_error = bool(block.get("is_error"))
+    output = _tool_result_string(content, is_error)
+    warnings: list[str] = []
+    if _tool_result_has_media(content):
+        warnings = [
+            "tool_result media redacted to string "
+            "(provider/auth mode does not support tool-output media)"
+        ]
+    return {
+        "_toplevel": True,
+        "type": "function_call_output",
+        "call_id": block["tool_use_id"],
+        "output": output,
+    }, warnings
+
+
+def _translate_unsupported_block(block_type: str) -> tuple[dict, list[str]]:
+    """Degrade an unsupported block to a redacted, type-named placeholder.
+
+    B3 is text+tools only, so image/document (until B4) and any special block
+    (server_tool_use, ...) land here. The placeholder NEVER echoes the block's nested
+    content: a raw ``str(block)`` would pollute the request AND leak media/tool inputs.
+    """
+    safe_type = _safe_token(block_type)
+    warning = (
+        f"Unsupported content block type '{safe_type}' replaced with a redacted "
+        "placeholder (no provider equivalent)"
+    )
+    return {"type": "input_text", "text": f"[unsupported content block: {safe_type}]"}, [warning]
+
+
+def _translate_content_block(block: dict) -> tuple[dict, list[str]]:
+    """Translate one Anthropic content block to an xAI Responses input block.
+
+    Returns ``(translated_block, warnings)``. tool_use / tool_result carry a special
+    ``_toplevel`` key signaling the caller to emit them as top-level input items rather
+    than nesting them inside a message's content array. Thin dispatcher — each type
+    delegates to a helper so this stays under the CCN ceiling as types grow (B4 adds
+    the image/document cases here).
+    """
+    block_type = block.get("type", "unknown")
+    if block_type == "text":
+        return {"type": "input_text", "text": block["text"]}, []
+    if block_type == "thinking":
+        return _translate_thinking_block(block)
+    if block_type == "tool_use":
+        return _translate_tool_use_block(block), []
+    if block_type == "tool_result":
+        return _translate_tool_result_block(block)
+    return _translate_unsupported_block(block_type)
+
+
+def _translate_message(message: dict) -> tuple[list[dict], list[str]]:
+    """Translate one Anthropic message to a list of xAI Responses input items.
+
+    Anthropic nests everything in messages with content blocks; the Responses API uses
+    a flat input array where user text → ``input_text``, assistant text → ``output_text``,
+    and tool_use / tool_result become TOP-LEVEL ``function_call`` / ``function_call_output``
+    items sitting outside any message wrapper.
+    """
+    warnings: list[str] = []
+    role = message.get("role", "user")
+    content = message.get("content", [])
+
+    # String shorthand → a single text block.
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+
+    nested_content: list[dict] = []
+    toplevel_items: list[dict] = []
+
+    for block in content:
+        translated, block_warnings = _translate_content_block(block)
+        warnings.extend(block_warnings)
+
+        if translated.pop("_toplevel", False):
+            toplevel_items.append(translated)
+        else:
+            # Assistant text is output_text, not input_text.
+            if role == "assistant" and translated.get("type") == "input_text":
+                translated = {"type": "output_text", "text": translated["text"]}
+            nested_content.append(translated)
+
+    items: list[dict] = []
+    if nested_content:
+        items.append({"role": role, "content": nested_content})
+    items.extend(toplevel_items)
+    return items, warnings
+
+
+def _has_cache_control(request: dict) -> bool:
+    """Return True if any part of the request carries cache_control hints."""
+    system = request.get("system")
+    if isinstance(system, list) and any("cache_control" in b for b in system):
+        return True
+    if any("cache_control" in t for t in request.get("tools", [])):
+        return True
+    for msg in request.get("messages", []):
+        content = msg.get("content", [])
+        if isinstance(content, list) and any("cache_control" in b for b in content):
+            return True
+    return False
+
+
+def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
+    """Map an Anthropic ``tool_choice`` to xAI Responses request fields.
+
+    Returns ``(fields, warnings)``: ``tool_choice`` becomes ``"auto"`` / ``"none"`` /
+    ``"required"`` or a forced ``{"type": "function", "name": ...}`` object, and
+    ``parallel_tool_calls`` is set False when Anthropic's ``disable_parallel_tool_use``
+    is on. An unknown choice type is omitted with a warning rather than guessed.
+    """
+    fields: dict = {}
+    warnings: list[str] = []
+    choice_type = tool_choice.get("type")
+    if choice_type == "auto":
+        fields["tool_choice"] = "auto"
+    elif choice_type == "none":
+        fields["tool_choice"] = "none"
+    elif choice_type == "any":
+        fields["tool_choice"] = "required"
+    elif choice_type == "tool":
+        fields["tool_choice"] = {"type": "function", "name": tool_choice["name"]}
+    else:
+        warnings.append(
+            f"Unsupported tool_choice type '{_safe_token(choice_type)}', omitting tool_choice"
+        )
+    if tool_choice.get("disable_parallel_tool_use"):
+        fields["parallel_tool_calls"] = False
+    return fields, warnings
+
+
+def anthropic_to_xai(request: dict) -> tuple[dict, list[str]]:
+    """Translate an Anthropic Messages request to an xAI (Grok) Responses request.
+
+    Returns ``(translated_request, warnings)`` where warnings lists features stripped
+    or degraded because they have no xAI equivalent. Pure function — no I/O.
+
+    Two divergences from the OpenAI path are load-bearing: (1) tool ids are forwarded
+    VERBATIM (no ``fc_`` rewrite, no synthesized item id) because xAI links by
+    ``call_id`` alone; (2) NO ``reasoning`` key is sent — cli-chat-proxy 400s on
+    ``reasoning.effort`` (field_effort_low.json), and encrypted reasoning arrives via
+    ``include=reasoning.encrypted_content`` with ``store=false`` instead.
+    """
+    warnings: list[str] = []
+
+    for key in _XAI_STRIPPED_KEYS:
+        if key in request:
+            warnings.append(f"Stripped unsupported key '{key}' from request")
+
+    if "thinking" in request:
+        if _XAI_REASONING_MODE == "drop":
+            warnings.append("Stripped 'thinking' config (reasoning_mode=drop)")
+        else:
+            warnings.append("Thinking config passed through (reasoning_mode=passthrough)")
+
+    # include=reasoning.encrypted_content + store=false: the stateless model returns
+    # each reasoning item's encrypted continuation blob, replayed before its
+    # function_call on the next turn (reasoning continuity — B7). No ``reasoning`` key:
+    # ``reasoning.effort`` 400s (field_effort_low.json); xAI applies its own default.
+    result: dict = {
+        "model": config.xai_model(),
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+    }
+
+    system = request.get("system")
+    if isinstance(system, str):
+        result["instructions"] = system
+    elif isinstance(system, list):
+        result["instructions"] = "\n".join(block.get("text", "") for block in system)
+    else:
+        result["instructions"] = _DEFAULT_XAI_INSTRUCTIONS
+
+    # Tools — flat Responses structure. strict:false because Anthropic marks ALL params
+    # required but Claude Code only fills the truly needed ones (single_tool_call.json).
+    if "tools" in request:
+        result["tools"] = [
+            {
+                "type": "function",
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {}),
+                "strict": False,
+            }
+            for tool in request["tools"]
+        ]
+
+    tool_choice = request.get("tool_choice")
+    if tool_choice is not None:
+        tc_fields, tc_warnings = _translate_tool_choice(tool_choice)
+        result.update(tc_fields)
+        warnings.extend(tc_warnings)
+
+    input_items: list[dict] = []
+    for message in request.get("messages", []):
+        items, msg_warnings = _translate_message(message)
+        input_items.extend(items)
+        warnings.extend(msg_warnings)
+    result["input"] = input_items
+
+    if _has_cache_control(request):
+        warnings.append(
+            "Stripped cache_control hints (no provider equivalent — caching is automatic)"
+        )
+
+    return result, warnings
+
+
 class XAIProvider:
-    """xAI Grok provider — stub for extensibility proof."""
+    """xAI Grok provider — subscription-OAuth backend on cli-chat-proxy.
+
+    Request translation is implemented (``anthropic_to_xai`` above). Auth headers,
+    response, and stream translation are still stubs; this module does not yet register
+    ``XAIProvider`` in ``PROVIDERS``.
+    """
 
     name = "xai"
     endpoint = "https://api.x.ai/v1/chat/completions"
+    capabilities = _XAI_TEXT_ONLY_CAPABILITIES
 
     async def authenticate(self) -> dict[str, str]:
         """Return xAI auth headers. Requires XAI_API_KEY env var."""
         raise NotImplementedError("xAI Grok provider not yet implemented")
 
-    def translate_request(self, _anthropic_req: dict) -> tuple[dict, list[str]]:
-        """Translate Anthropic request to xAI format."""
-        raise NotImplementedError("xAI Grok provider not yet implemented")
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        """Translate an Anthropic Messages request to an xAI Responses request."""
+        return anthropic_to_xai(anthropic_req)
 
     def translate_response(self, _provider_resp: dict) -> dict:
         """Translate xAI response back to Anthropic format."""
