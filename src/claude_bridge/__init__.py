@@ -23,4 +23,4 @@ Adding a new provider:
     5. Set ``LLM_BRIDGE_FALLBACK=<name>`` or ``--provider <name>``
 """
 
-__version__ = "0.7.0"
+__version__ = "0.9.0"
