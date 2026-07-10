@@ -721,12 +721,156 @@ def anthropic_to_xai(
     return result, warnings
 
 
+# xAI Grok is billed through the subscription-metered cli-chat-proxy, so its token counts
+# need no OpenAI-compat scaling — the multiplier is the identity. Kept as a named constant
+# (not a bare 1.0) so B8's capability declaration references one owner. See D-XAI-005.
+_XAI_TOKEN_COUNT_MULTIPLIER = 1.0
+
+# Responses ``incomplete_details.reason`` that signals a moderation block, not token-budget
+# exhaustion. Mapping a content-filtered turn to ``max_tokens`` makes Claude Code auto-compact
+# a context nowhere near full and retry endlessly, so the two are disambiguated here.
+_CONTENT_FILTER_REASON = "content_filter"
+
+# Surfaced to Claude Code when a turn is content-filtered with no model text, so the turn
+# renders as a visible refusal rather than a blank assistant message.
+_CONTENT_FILTER_REFUSAL = (
+    "I cannot complete this response because it was blocked by content safety filters. "
+    "Please rephrase your request."
+)
+
+
+def _coerce_token_count(value: object) -> int:
+    """Coerce a provider token count to a non-negative int.
+
+    Provider usage may carry floats or nulls; Anthropic's usage fields are integers that
+    Claude Code's ``/context`` math divides by. Non-numeric values default to 0.
+    """
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    return 0
+
+
+def _scale_token_count(value: object, multiplier: float) -> int:
+    """Return a non-negative token count adjusted by the provider multiplier (half-up)."""
+    return int(_coerce_token_count(value) * multiplier + 0.5)
+
+
+def _anthropic_usage(
+    xai_usage: object,
+    *,
+    token_count_multiplier: float = _XAI_TOKEN_COUNT_MULTIPLIER,
+) -> dict:
+    """Project xAI Responses usage onto Anthropic's flat integer shape.
+
+    ``input_tokens`` already includes cached tokens and ``output_tokens`` already includes
+    reasoning tokens (both subsets, per the Responses contract), so each maps to Anthropic's
+    corresponding total. Cached tokens are deliberately NOT split into
+    ``cache_read_input_tokens`` — Anthropic's totals are non-overlapping, so splitting would
+    double-count. Missing or non-numeric fields default to 0.
+    """
+    usage = xai_usage if isinstance(xai_usage, dict) else {}
+    return {
+        "input_tokens": _scale_token_count(usage.get("input_tokens", 0), token_count_multiplier),
+        "output_tokens": _scale_token_count(usage.get("output_tokens", 0), token_count_multiplier),
+    }
+
+
+def _incomplete_reason(response: dict) -> str:
+    """Return ``incomplete_details.reason`` from a Responses object, or ``""`` if absent.
+
+    A ``status: "incomplete"`` with a null ``incomplete_details`` reads as token exhaustion
+    (the conservative default).
+    """
+    details = response.get("incomplete_details")
+    return details.get("reason", "") if isinstance(details, dict) else ""
+
+
+def _stop_reason(status: str, has_tool_calls: bool, incomplete_reason: str) -> str:
+    """Map an xAI Responses terminal status to an Anthropic ``stop_reason``.
+
+    Tool calls win — Claude Code must run the tool rather than compact. A content-filtered
+    completion ends the turn cleanly (``end_turn``); any other ``incomplete`` is treated as
+    output-token exhaustion (``max_tokens``), the signal Claude Code auto-compacts on.
+    """
+    if has_tool_calls:
+        return "tool_use"
+    if status == "incomplete":
+        return "end_turn" if incomplete_reason == _CONTENT_FILTER_REASON else "max_tokens"
+    return "end_turn"
+
+
+def xai_to_anthropic(
+    response: dict,
+    *,
+    token_count_multiplier: float = _XAI_TOKEN_COUNT_MULTIPLIER,
+) -> dict:
+    """Translate an xAI Responses API response to an Anthropic Messages API response.
+
+    Pure function — no I/O. Diverges from the OpenAI provider on one point: a tool_use ``id``
+    is the upstream ``call_id`` VERBATIM (no ``fc_``/``call_`` rewrite), so it round-trips to
+    the request-side ``function_call_output`` call_id unchanged. Reasoning-continuity capture
+    is layered on separately (that is the ``translate_response`` wrapper's job), not here.
+    """
+    status = response.get("status", "completed")
+    output_items = response.get("output", [])
+    has_tool_calls = any(i.get("type") == "function_call" for i in output_items)
+    incomplete_reason = _incomplete_reason(response)
+    stop_reason = _stop_reason(status, has_tool_calls, incomplete_reason)
+
+    content: list[dict] = []
+    for item in output_items:
+        item_type = item.get("type")
+
+        if item_type == "message":
+            for block in item.get("content", []):
+                if block.get("type") == "output_text":
+                    content.append({"type": "text", "text": block["text"]})
+
+        elif item_type == "refusal":
+            content.append({"type": "text", "text": item.get("refusal", "")})
+
+        elif item_type == "function_call":
+            raw_args = item.get("arguments", "{}")
+            try:
+                parsed_args = json.loads(raw_args)
+            except (json.JSONDecodeError, ValueError):
+                parsed_args = {"_raw": raw_args}
+            # xAI: expose the call_id EXACTLY as captured (no rewrite) so it round-trips.
+            call_id = item.get("call_id") or item.get("id", "")
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": item["name"],
+                    "input": parsed_args,
+                }
+            )
+
+    # Content-filtered turn with no model text -> synthesize a visible refusal so the turn
+    # never renders as a blank assistant message.
+    has_text = any(b.get("type") == "text" and b.get("text") for b in content)
+    if incomplete_reason == _CONTENT_FILTER_REASON and not has_text:
+        content.append({"type": "text", "text": _CONTENT_FILTER_REFUSAL})
+
+    usage = _anthropic_usage(response.get("usage"), token_count_multiplier=token_count_multiplier)
+
+    return {
+        "id": f"msg_bridge_{response.get('id', 'unknown')}",
+        "type": "message",
+        "role": "assistant",
+        "model": response.get("model", ""),
+        "stop_reason": stop_reason,
+        "content": content,
+        "usage": usage,
+    }
+
+
 class XAIProvider:
     """xAI Grok provider — subscription-OAuth backend on cli-chat-proxy.
 
-    Request translation is implemented (``anthropic_to_xai`` above). Auth headers,
-    response, and stream translation are still stubs; this module does not yet register
-    ``XAIProvider`` in ``PROVIDERS``.
+    Request and non-stream response translation are implemented (``anthropic_to_xai`` and
+    ``xai_to_anthropic`` above). Auth headers and stream translation are still stubs; this
+    module does not yet register ``XAIProvider`` in ``PROVIDERS``.
     """
 
     name = "xai"
@@ -741,9 +885,12 @@ class XAIProvider:
         """Translate an Anthropic Messages request to an xAI Responses request."""
         return anthropic_to_xai(anthropic_req, self.capabilities)
 
-    def translate_response(self, _provider_resp: dict) -> dict:
-        """Translate xAI response back to Anthropic format."""
-        raise NotImplementedError("xAI Grok provider not yet implemented")
+    def translate_response(self, provider_resp: dict) -> dict:
+        """Translate an xAI Responses object back to Anthropic Messages format."""
+        return xai_to_anthropic(
+            provider_resp,
+            token_count_multiplier=self.capabilities.token_count_multiplier,
+        )
 
     def translate_stream(self, _raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         """Translate raw xAI byte chunks to Anthropic-format SSE events."""

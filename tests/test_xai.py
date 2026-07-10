@@ -38,6 +38,7 @@ from claude_bridge.providers.xai import (
     get_xai_bearer_token,
     read_xai_auth,
     refresh_xai_token,
+    xai_to_anthropic,
 )
 
 _CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -1195,3 +1196,216 @@ class TestMediaForwarding:
             assert part == {"type": "input_image", "image_url": "data:image/png;base64,IMGDATA"}
         else:
             assert part["type"] == "input_text"
+
+
+class TestResponseTranslation:
+    """xai_to_anthropic: Responses object -> Anthropic Messages response (B5).
+
+    Oracles are the golden wire captures (text_nonstream / single_tool_call /
+    incomplete_max_tokens) for structure, plus the published Responses contract for
+    content_filter, refusal, and malformed-argument handling (cli-chat-proxy mirrors the
+    Responses API identically — the same source the openai provider translates). Every
+    expected value is derived from the fixture bytes or the contract, never from running
+    the translator. The load-bearing divergence from the openai provider: a tool_use `id`
+    is the upstream ``call_id`` VERBATIM (no ``fc_``/``call_`` rewrite), so it round-trips
+    to the request-side ``function_call_output`` call_id unchanged.
+    """
+
+    # -- completed text -------------------------------------------------------
+
+    def test_completed_text_maps_to_single_text_block_end_turn(self):
+        # Golden completed response -> one text block "pong"; the reasoning item is dropped
+        # (only message output_text becomes content), status completed -> end_turn.
+        result = xai_to_anthropic(_load_fixture("text_nonstream.json"))
+        assert result["stop_reason"] == "end_turn"
+        assert result["content"] == [{"type": "text", "text": "pong"}]
+
+    def test_completed_text_envelope_id_role_model(self):
+        result = xai_to_anthropic(_load_fixture("text_nonstream.json"))
+        assert result["id"] == "msg_bridge_b9c3e6c4-1384-9c9e-8141-d292fdd48011"
+        assert result["type"] == "message"
+        assert result["role"] == "assistant"
+        assert result["model"] == "grok-4.20-0309-reasoning"
+
+    def test_completed_text_usage_flat_mapped_multiplier_one(self):
+        # usage.input_tokens=192, output_tokens=309 in the fixture; xAI multiplier is 1.0,
+        # so they pass through unscaled. Cached tokens (128) are NOT split out (Anthropic
+        # totals are non-overlapping).
+        result = xai_to_anthropic(_load_fixture("text_nonstream.json"))
+        assert result["usage"] == {"input_tokens": 192, "output_tokens": 309}
+
+    def test_usage_multiplier_scales_and_rounds_half_up(self):
+        # A non-default multiplier proves the scale threads AND the +0.5 half-up rounding:
+        # 192*1.5 = 288.0 -> 288; 309*1.5 = 463.5 -> 464 (a truncating int() would give 463).
+        result = xai_to_anthropic(_load_fixture("text_nonstream.json"), token_count_multiplier=1.5)
+        assert result["usage"] == {"input_tokens": 288, "output_tokens": 464}
+
+    def test_usage_coerces_float_down_and_clamps_negative_to_zero(self):
+        # 10.9 -> int 10 (truncate before scale); -5 -> max(0, -5) = 0. A missing max(0,...)
+        # would surface a negative token count that Claude Code's /context math divides by.
+        response = {
+            "status": "completed",
+            "id": "x",
+            "output": [],
+            "usage": {"input_tokens": 10.9, "output_tokens": -5},
+        }
+        assert xai_to_anthropic(response)["usage"] == {"input_tokens": 10, "output_tokens": 0}
+
+    def test_usage_non_numeric_defaults_to_zero(self):
+        response = {"status": "completed", "id": "x", "output": [], "usage": {"input_tokens": "?"}}
+        assert xai_to_anthropic(response)["usage"] == {"input_tokens": 0, "output_tokens": 0}
+
+    def test_missing_usage_defaults_to_zero(self):
+        response = {"status": "completed", "id": "x", "output": []}
+        assert xai_to_anthropic(response)["usage"] == {"input_tokens": 0, "output_tokens": 0}
+
+    # -- tool calls -----------------------------------------------------------
+
+    def test_completed_tool_call_maps_to_tool_use_and_stop_reason(self):
+        result = xai_to_anthropic(_load_fixture("single_tool_call.json"))
+        assert result["stop_reason"] == "tool_use"
+        tool_uses = [b for b in result["content"] if b["type"] == "tool_use"]
+        assert len(tool_uses) == 1
+
+    def test_tool_use_id_is_upstream_call_id_verbatim(self):
+        # THE xAI divergence: expose the call_id EXACTLY as captured, not the fc_ item id
+        # and not any rewritten form. This is what makes the request-side call_id round-trip.
+        result = xai_to_anthropic(_load_fixture("single_tool_call.json"))
+        tool_use = next(b for b in result["content"] if b["type"] == "tool_use")
+        assert tool_use["id"] == "call-bb020360-5c8a-4760-a7e6-b9cff0c2e700-0"
+
+    def test_tool_use_name_and_parsed_input(self):
+        result = xai_to_anthropic(_load_fixture("single_tool_call.json"))
+        tool_use = next(b for b in result["content"] if b["type"] == "tool_use")
+        assert tool_use["name"] == "get_weather"
+        assert tool_use["input"] == {"city": "Paris"}
+
+    def test_tool_call_id_falls_back_to_item_id_when_call_id_absent(self):
+        # No call_id on the item -> fall back to the item id, still verbatim.
+        response = {
+            "status": "completed",
+            "id": "r",
+            "output": [
+                {"type": "function_call", "id": "fc_solo", "name": "ping", "arguments": "{}"}
+            ],
+        }
+        tool_use = next(
+            b for b in xai_to_anthropic(response)["content"] if b["type"] == "tool_use"
+        )
+        assert tool_use["id"] == "fc_solo"
+
+    def test_malformed_tool_arguments_preserved_as_raw(self):
+        # Unparseable arguments must not crash or be silently dropped; the raw string is
+        # preserved under _raw so nothing is lost.
+        response = {
+            "status": "completed",
+            "id": "r",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call-x",
+                    "name": "f",
+                    "arguments": "not json{",
+                }
+            ],
+        }
+        tool_use = next(
+            b for b in xai_to_anthropic(response)["content"] if b["type"] == "tool_use"
+        )
+        assert tool_use["input"] == {"_raw": "not json{"}
+
+    def test_tool_call_wins_over_incomplete_status(self):
+        # has_tool_calls outranks an incomplete terminal: Claude Code must run the tool,
+        # not treat the turn as truncated.
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "id": "r",
+            "output": [{"type": "function_call", "call_id": "c", "name": "f", "arguments": "{}"}],
+        }
+        assert xai_to_anthropic(response)["stop_reason"] == "tool_use"
+
+    # -- incomplete / stop_reason mapping ------------------------------------
+
+    def test_incomplete_max_tokens_maps_to_max_tokens_with_partial_text(self):
+        result = xai_to_anthropic(_load_fixture("incomplete_max_tokens.json"))
+        assert result["stop_reason"] == "max_tokens"
+        assert result["content"] == [
+            {"type": "text", "text": "**Quantum Chromodynamics (QCD)** is the SU(3) gauge theory"}
+        ]
+
+    def test_incomplete_null_details_reads_as_max_tokens(self):
+        # status incomplete with a null incomplete_details (the GPT-5 quirk) -> the
+        # conservative token-exhaustion default, not content_filter.
+        response = {"status": "incomplete", "incomplete_details": None, "id": "r", "output": []}
+        assert xai_to_anthropic(response)["stop_reason"] == "max_tokens"
+
+    def test_missing_status_defaults_to_completed_end_turn(self):
+        response = {
+            "id": "r",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+        }
+        assert xai_to_anthropic(response)["stop_reason"] == "end_turn"
+
+    # -- content_filter (Responses contract, spec-derived) -------------------
+
+    def test_content_filter_without_text_synthesizes_visible_refusal(self):
+        # A content-filtered turn with no model text ends cleanly (end_turn, NOT max_tokens
+        # -> Claude Code must not auto-compact and retry) and renders a visible refusal
+        # rather than a blank assistant message.
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "id": "r",
+            "output": [],
+        }
+        result = xai_to_anthropic(response)
+        assert result["stop_reason"] == "end_turn"
+        assert len(result["content"]) == 1
+        assert result["content"][0]["type"] == "text"
+        assert "content safety filters" in result["content"][0]["text"]
+
+    def test_content_filter_with_text_does_not_synthesize_refusal(self):
+        # When the filtered turn still produced text, surface only that text (no synthetic
+        # refusal appended) — the has_text guard.
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "id": "r",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "partial"}]}
+            ],
+        }
+        result = xai_to_anthropic(response)
+        assert result["stop_reason"] == "end_turn"
+        assert result["content"] == [{"type": "text", "text": "partial"}]
+
+    # -- other output item kinds ---------------------------------------------
+
+    def test_refusal_item_surfaced_as_text(self):
+        # A Responses ``refusal`` output item carries human-readable text — surface it.
+        response = {
+            "status": "completed",
+            "id": "r",
+            "output": [{"type": "refusal", "refusal": "I won't do that."}],
+        }
+        assert xai_to_anthropic(response)["content"] == [
+            {"type": "text", "text": "I won't do that."}
+        ]
+
+    def test_empty_completed_output_yields_empty_content(self):
+        response = {"status": "completed", "id": "r", "output": []}
+        result = xai_to_anthropic(response)
+        assert result["content"] == []
+        assert result["stop_reason"] == "end_turn"
+
+    # -- provider delegation --------------------------------------------------
+
+    def test_provider_translate_response_delegates_to_xai_to_anthropic(self):
+        # XAIProvider.translate_response threads self.capabilities.token_count_multiplier
+        # (1.0) and returns the same translation. Asserts the stable outcome, not object
+        # identity, so it survives B7 adding reasoning stashing on top.
+        result = XAIProvider().translate_response(_load_fixture("text_nonstream.json"))
+        assert result["stop_reason"] == "end_turn"
+        assert result["content"] == [{"type": "text", "text": "pong"}]
+        assert result["usage"] == {"input_tokens": 192, "output_tokens": 309}
