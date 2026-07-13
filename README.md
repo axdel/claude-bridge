@@ -17,7 +17,7 @@ We built a full development protocol on top of Claude Code — a finite state ma
 driving multi-agent workflows. Hundreds of hours of investment in `.claude/` configuration, hooks, CLAUDE.md conventions,
 and muscle memory.
 
-Then one day Claude is overloaded. Or rate-limited. Or you just want to see how GPT-5.5
+Then one day Claude is overloaded. Or rate-limited. Or you just want to see how GPT-5.6
 handles the same task with the same tools.
 
 **Without Claude Bridge:** your entire setup is useless. Claude Code only talks to Anthropic.
@@ -25,7 +25,7 @@ handles the same task with the same tools.
 **With Claude Bridge:** one command, same setup, different model.
 
 ```bash
-claude-codex    # your Claude Code + GPT-5.5
+claude-codex    # your Claude Code + GPT-5.6
 ```
 
 Core Claude Code flows work — tools, hooks, skills, streaming, multi-turn tool
@@ -73,7 +73,7 @@ of leaking provider-incompatible content.
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
 - **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
 - **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
-- **558 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **570 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -130,7 +130,7 @@ which claude-codex claude-grok || echo 'Add to PATH: echo "export PATH=\$HOME/.l
 ### One command (recommended)
 
 ```bash
-claude-codex     # use OpenAI GPT-5.5 (ChatGPT Plus subscription or OPENAI_API_KEY)
+claude-codex     # use OpenAI GPT-5.6 (ChatGPT Plus subscription or OPENAI_API_KEY)
 claude-grok      # use xAI Grok (grok-build) via your Grok subscription
 ```
 
@@ -160,7 +160,7 @@ or
 ```
 
 > Claude Code's banner still says "Sonnet 4.6" — it doesn't know about the bridge.
-> For `claude-codex`, the actual model is the GPT-5.5 model shown in the bridge banner.
+> For `claude-codex`, the actual model is the `gpt-5.6-sol` model shown in the bridge banner.
 > For `claude-grok`, the model is `grok-build` — xAI's rolling alias for the latest
 > Grok coding model (currently Grok 4.3), the grok CLI's own default (override with `XAI_MODEL`).
 
@@ -169,7 +169,7 @@ The bridge starts on a random port, launches Claude Code through it, and cleans 
 ### Options
 
 ```bash
-claude-codex              # OpenAI/Codex (GPT-5.5)
+claude-codex              # OpenAI/Codex (GPT-5.6)
 claude-grok               # xAI Grok subscription (grok-build)
 claude-codex --debug      # show bridge translation logs
 claude-grok --debug       # same for Grok
@@ -499,7 +499,7 @@ suite.
 | Metrics | `/stats` endpoint | No | No |
 | Token estimation | Structure-aware | No | No |
 | Multi-provider | Pluggable protocol | Via LiteLLM | OpenAI-only |
-| Tests | 558 | Minimal | Some |
+| Tests | 570 | Minimal | Some |
 
 ## Terms of Service Considerations
 
