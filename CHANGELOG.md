@@ -2,6 +2,11 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-07-13
+
+### Hotfixes
+- [`29431dd`](https://github.com/axdel/claude-bridge/commit/29431dd) Default the xAI Grok provider to grok-build (xAI's rolling alias for the latest coding model, currently Grok 4.3) instead of the pinned, now-stale grok-4.20; the claude-grok launcher banner now derives its model from config
+
 ## 2026-07-10
 
 ### feat: swap Gemini provider for Grok (xAI) ([PR #14](https://github.com/axdel/claude-bridge/pull/14))
