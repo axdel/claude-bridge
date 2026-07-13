@@ -77,7 +77,10 @@ cat <<'BANNER'
                                      |___/
 BANNER
 BRIDGE_VERSION=$(python3 -P -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
-echo " port:${PORT}  pid:${BRIDGE_PID}  model:grok-4.20  version:${BRIDGE_VERSION}"
+# Derive the model from the config owner (config.xai_model) rather than hardcoding it,
+# so the banner tracks DEFAULT_XAI_MODEL and any XAI_MODEL override instead of drifting.
+BRIDGE_MODEL=$(python3 -P -c "from claude_bridge import config; print(config.xai_model())" 2>/dev/null || echo "?")
+echo " port:${PORT}  pid:${BRIDGE_PID}  model:${BRIDGE_MODEL}  version:${BRIDGE_VERSION}"
 echo " by axdel  github.com/axdel/claude-bridge"
 echo ""
 

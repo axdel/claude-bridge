@@ -131,7 +131,7 @@ which claude-codex claude-grok || echo 'Add to PATH: echo "export PATH=\$HOME/.l
 
 ```bash
 claude-codex     # use OpenAI GPT-5.5 (ChatGPT Plus subscription or OPENAI_API_KEY)
-claude-grok      # use xAI Grok (grok-4.20) via your Grok subscription
+claude-grok      # use xAI Grok (grok-build) via your Grok subscription
 ```
 
 You'll see:
@@ -155,13 +155,14 @@ or
 | (__| | (_| | |_| | (_| |  __/_____| (_| | | | (_) |   <
  \___|_|\__,_|\__,_|\__,_|\___|      \__, |_|  \___/|_|\_\
                                      |___/
- port:9738  pid:59952  model:grok-4.20  version:0.9.0
+ port:9738  pid:59952  model:grok-build  version:0.9.0
  by axdel  github.com/axdel/claude-bridge
 ```
 
 > Claude Code's banner still says "Sonnet 4.6" — it doesn't know about the bridge.
 > For `claude-codex`, the actual model is the GPT-5.5 model shown in the bridge banner.
-> For `claude-grok`, the model is `grok-4.20` (override with `XAI_MODEL`).
+> For `claude-grok`, the model is `grok-build` — xAI's rolling alias for the latest
+> Grok coding model (currently Grok 4.3), the grok CLI's own default (override with `XAI_MODEL`).
 
 The bridge starts on a random port, launches Claude Code through it, and cleans up on exit.
 
@@ -169,7 +170,7 @@ The bridge starts on a random port, launches Claude Code through it, and cleans 
 
 ```bash
 claude-codex              # OpenAI/Codex (GPT-5.5)
-claude-grok               # xAI Grok subscription (grok-4.20)
+claude-grok               # xAI Grok subscription (grok-build)
 claude-codex --debug      # show bridge translation logs
 claude-grok --debug       # same for Grok
 claude-codex -- -p opus   # pass flags through to claude
@@ -177,7 +178,7 @@ claude-codex -- -p opus   # pass flags through to claude
 
 Override the Grok model:
 ```bash
-XAI_MODEL=grok-4.20 claude-grok    # default; set to any model your Grok subscription exposes
+XAI_MODEL=grok-build claude-grok   # default; set to any model your Grok subscription exposes
 ```
 
 ### Verify it works
@@ -251,7 +252,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | Env Var | Default | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
-| `XAI_MODEL` | `grok-4.20` | xAI Grok model id used by the `xai` provider |
+| `XAI_MODEL` | `grok-build` | xAI Grok model id used by the `xai` provider (rolling alias for the latest coding model) |
 | `XAI_CLIENT_VERSION` | highest installed grok CLI bundle (floor `0.1.202`) | Override for the `x-grok-client-version` header the cli-chat-proxy gates on; when unset, resolved from the newest `~/.grok/downloads/grok-<ver>-*` bundle |
 | `REASONING_MODE` | `passthrough` | Thinking-block handling for OpenAI and xAI: `passthrough` preserves tagged thinking text, `drop` strips it |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |

@@ -728,7 +728,7 @@ class TestRequestTranslation:
         """The base envelope pins model, store, stream, and the encrypted-reasoning include."""
         monkeypatch.delenv("XAI_MODEL", raising=False)
         result, _ = anthropic_to_xai({"messages": []})
-        assert result["model"] == "grok-4.20"
+        assert result["model"] == "grok-build"
         assert result["store"] is False
         assert result["stream"] is True
         assert result["include"] == ["reasoning.encrypted_content"]
@@ -1193,7 +1193,7 @@ class TestRequestTranslation:
         result, _ = XAIProvider().translate_request(
             {"messages": [{"role": "user", "content": "hi"}]}
         )
-        assert result["model"] == "grok-4.20"
+        assert result["model"] == "grok-build"
 
 
 class TestMediaForwarding:

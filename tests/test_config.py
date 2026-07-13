@@ -91,20 +91,20 @@ def test_reasoning_mode_default_and_lowercase_override(monkeypatch):
 
 
 def test_xai_model_default_and_env_override(monkeypatch):
-    """XAI_MODEL defaults to grok-4.20 and trims/normalizes blank overrides."""
+    """XAI_MODEL defaults to grok-build and trims/normalizes blank overrides."""
     import claude_bridge.config as config
 
     monkeypatch.delenv(config.XAI_MODEL_ENV, raising=False)
-    assert config.xai_model() == "grok-4.20"
+    assert config.xai_model() == "grok-build"
 
     monkeypatch.setenv(config.XAI_MODEL_ENV, "grok-3-mini")
     assert config.xai_model() == "grok-3-mini"
 
-    monkeypatch.setenv(config.XAI_MODEL_ENV, "  grok-4.20  ")
-    assert config.xai_model() == "grok-4.20"
+    monkeypatch.setenv(config.XAI_MODEL_ENV, "  grok-build  ")
+    assert config.xai_model() == "grok-build"
 
     monkeypatch.setenv(config.XAI_MODEL_ENV, "   ")
-    assert config.xai_model() == "grok-4.20"
+    assert config.xai_model() == "grok-build"
 
 
 def test_xai_client_version_env_override_wins_verbatim(monkeypatch, tmp_path):

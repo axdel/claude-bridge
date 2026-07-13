@@ -307,4 +307,12 @@
 - **Rationale:** The review merge gate reported the six mandatory primitives as blocking STUB; provisioning them here — versus deferring to a separate prerequisite track or merging under a waiver — closes the gap in the same branch that first exercised the gate, and the registries derive from the existing architecture so they carry no invented facts.
 - **Invalidates:** —
 
+### D-XAI-008 — Default xAI model = grok-build (rolling latest-coding alias), not pinned grok-4.20
+- **Status:** accepted
+- **Date:** 2026-07-13
+- **Context:** 2026-07-13 (hotfix)
+- **Decision:** Set the config-owned `DEFAULT_XAI_MODEL` to `grok-build` and derive the `claude-grok` launcher banner model from `config.xai_model()` instead of hardcoding a model literal.
+- **Rationale:** `grok-build` is xAI's rolling alias for the latest Grok coding model (currently Grok 4.3, 512K context) and the grok CLI's own default — verified against `~/.grok/models_cache.json` and the `cli-chat-proxy.grok.com` `/v1/models` origin — whereas the prior `grok-4.20` was a pinned, now-stale version (resolved upstream to `grok-4.20-0309-reasoning`), so pinning a version number was rejected for the alias that rolls forward with the subscription automatically.
+- **Invalidates:** —
+
 ## Archive
