@@ -1,10 +1,16 @@
 .claude-protocol.toml
 .pre-commit-config.yaml
+BOUNDARY_MAP.md
+CANONICAL_GLOSSARY.md
 CHANGELOG.md
 DECISIONS.md
+DERIVATION_MAP.md
+INVARIANTS.md
 LICENSE
 MANIFEST
+MEMORY_GOVERNANCE.md
 README.md
+RESOURCE_OWNERSHIP.md
 claude-codex
 claude-grok
 pyproject.toml

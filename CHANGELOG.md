@@ -4,6 +4,9 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-07-13
 
+### v0.9.0 — xAI Grok Provider
+Swap the Gemini provider for a Grok (xAI) provider: grok CLI subscription-OAuth via ~/.grok (no API key), self-contained Anthropic<->Responses translation with image/document media and encrypted-reasoning continuity, defaulting to grok-build (xAI's rolling latest-coding alias); provision the six architecture-primitive registries with import-linter enforcement.
+
 ### Hotfixes
 - [`29431dd`](https://github.com/axdel/claude-bridge/commit/29431dd) Default the xAI Grok provider to grok-build (xAI's rolling alias for the latest coding model, currently Grok 4.3) instead of the pinned, now-stale grok-4.20; the claude-grok launcher banner now derives its model from config
 
