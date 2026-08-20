@@ -103,12 +103,12 @@ def test_openai_declares_body_parameter_streaming_and_sse_sync_response():
     is declared on the instance — see the auth-mode tests below.
     """
     from claude_bridge.provider import ProviderCapabilities
-    from claude_bridge.providers.openai import OpenAIProvider
+    from claude_bridge.providers.openai import GPT_TOKEN_COUNT_MULTIPLIER, OpenAIProvider
 
     assert OpenAIProvider.capabilities == ProviderCapabilities(
         stream_request_mode="body_parameter",
         sync_response_mode="sse",
-        token_count_multiplier=1.2,
+        token_count_multiplier=GPT_TOKEN_COUNT_MULTIPLIER,
     )
 
 

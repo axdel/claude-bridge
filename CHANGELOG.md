@@ -2,6 +2,17 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-08-20
+
+### feat: grok-4.6 default, 300k launcher context, GPT multiplier 1.1 ([PR #15](https://github.com/axdel/claude-bridge/pull/15))
+Default claude-grok to grok-4.6 (D-XAI-009, superseding the grok-build alias in D-XAI-008); advertise a 300k context window to Claude Code from both launchers via CLAUDE_CODE_MAX_CONTEXT_TOKENS (D-CONTEXT-001); lower the OpenAI/GPT token-count multiplier from 1.2 to 1.1 (D-USAGE-004).
+
+- [`d9d2b32`](https://github.com/axdel/claude-bridge/commit/d9d2b32) Correct advertised Grok window to grok-4.6's 500K
+- [`645913c`](https://github.com/axdel/claude-bridge/commit/645913c) Reference GPT_TOKEN_COUNT_MULTIPLIER in class-capability test
+- [`11f5c72`](https://github.com/axdel/claude-bridge/commit/11f5c72) Lower OpenAI/GPT token-count multiplier from 1.2 to 1.1
+- [`63f3bfb`](https://github.com/axdel/claude-bridge/commit/63f3bfb) Advertise a 300k context window to Claude Code from both launchers
+- [`0ad3fc2`](https://github.com/axdel/claude-bridge/commit/0ad3fc2) Default xAI provider to grok-4.6, superseding the grok-build alias
+
 ## 2026-07-13
 
 ### v0.9.0 — xAI Grok Provider

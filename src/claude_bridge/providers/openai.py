@@ -129,7 +129,7 @@ async def refresh_access_token(refresh_token: str, auth_path: Path | None = None
 # specific model to a different upstream target.)
 MODEL_MAP: dict[str, str] = {}
 DEFAULT_MODEL = "gpt-5.6-sol"
-GPT_TOKEN_COUNT_MULTIPLIER = 1.2
+GPT_TOKEN_COUNT_MULTIPLIER = 1.1
 
 _STRIPPED_KEYS = ("output_config",)
 
