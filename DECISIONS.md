@@ -308,11 +308,20 @@
 - **Invalidates:** —
 
 ### D-XAI-008 — Default xAI model = grok-build (rolling latest-coding alias), not pinned grok-4.20
-- **Status:** accepted
+- **Status:** superseded
 - **Date:** 2026-07-13
 - **Context:** 2026-07-13 (hotfix)
 - **Decision:** Set the config-owned `DEFAULT_XAI_MODEL` to `grok-build` and derive the `claude-grok` launcher banner model from `config.xai_model()` instead of hardcoding a model literal.
 - **Rationale:** `grok-build` is xAI's rolling alias for the latest Grok coding model (currently Grok 4.3, 512K context) and the grok CLI's own default — verified against `~/.grok/models_cache.json` and the `cli-chat-proxy.grok.com` `/v1/models` origin — whereas the prior `grok-4.20` was a pinned, now-stale version (resolved upstream to `grok-4.20-0309-reasoning`), so pinning a version number was rejected for the alias that rolls forward with the subscription automatically.
+- **Invalidates:** —
+- **Superseded by:** D-XAI-009
+
+### D-XAI-009 — Pin default xAI model to grok-4.6 (explicit request), superseding the grok-build alias
+- **Status:** accepted
+- **Date:** 2026-08-20
+- **Context:** feature/model-defaults-300k
+- **Decision:** Set the config-owned `DEFAULT_XAI_MODEL` to the pinned `grok-4.6` instead of the rolling `grok-build` alias. The banner still derives from `config.xai_model()`, so it tracks the pin; `XAI_MODEL` still overrides per run.
+- **Rationale:** Requested explicitly to run `claude-grok` on Grok 4.6, newer than `grok-build`'s current Grok 4.3 target. `grok-4.6` was verified accepted by `cli-chat-proxy.grok.com`'s `/v1/responses` endpoint (the sibling `grok-4.6-build` 404s, and `grok models` lists only `grok-build`, but the backend accepts specific version ids too). Tradeoff vs D-XAI-008: pinning forfeits the alias's automatic roll-forward, so a future upstream deprecation (as befell `grok-4.20`) surfaces as a model error until the pin is bumped — a one-line, `XAI_MODEL`-overridable revert to `grok-build`.
 - **Invalidates:** —
 
 ## Archive

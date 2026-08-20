@@ -27,10 +27,11 @@ DEFAULT_ANTHROPIC_REAL_URL = "https://api.anthropic.com"
 DEFAULT_MAX_REQUEST_BODY = 10_485_760
 DEFAULT_FALLBACK_CHAIN = ("openai",)
 DEFAULT_REASONING_MODE = "passthrough"
-# xAI's rolling alias for the latest Grok coding model (the grok CLI's own default;
-# currently resolves to Grok 4.3). Keep the alias, not a version number, so the default
-# tracks upstream releases without a code change (D-XAI-008).
-DEFAULT_XAI_MODEL = "grok-build"
+# Pinned to Grok 4.6 (verified accepted by cli-chat-proxy.grok.com's /v1/responses), not the
+# rolling `grok-build` alias. Pinning trades the alias's auto-tracking of upstream releases for
+# a known model version; if the id is later deprecated (as `grok-4.20` was), reverting to
+# `grok-build` is a one-line change. Supersedes D-XAI-008. Override per run with XAI_MODEL.
+DEFAULT_XAI_MODEL = "grok-4.6"
 
 # cli-chat-proxy.grok.com answers HTTP 426 below this x-grok-client-version; the
 # resolver never sends a header older than this floor. Bundle dir layout:
@@ -124,7 +125,7 @@ def trace_path() -> str | None:
 
 
 def xai_model() -> str:
-    """Return the xAI Grok model id from XAI_MODEL, defaulting to grok-build."""
+    """Return the xAI Grok model id from XAI_MODEL, defaulting to grok-4.6."""
     return _non_empty_stripped_env(XAI_MODEL_ENV) or DEFAULT_XAI_MODEL
 
 
