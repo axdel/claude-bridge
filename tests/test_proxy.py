@@ -1930,7 +1930,7 @@ async def test_forward_via_provider_codex_empty_output_populates_text(_codex_sse
     assert response["stop_reason"] == "end_turn"
     assert response["model"] == "gpt-5.6-sol"
     # The auto-compact signal uses the OpenAI provider compatibility multiplier.
-    assert response["usage"]["input_tokens"] == 12
+    assert response["usage"]["input_tokens"] == 11
     assert response["usage"]["output_tokens"] == 6
 
 

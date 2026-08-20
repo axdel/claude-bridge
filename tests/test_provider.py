@@ -108,7 +108,7 @@ def test_openai_declares_body_parameter_streaming_and_sse_sync_response():
     assert OpenAIProvider.capabilities == ProviderCapabilities(
         stream_request_mode="body_parameter",
         sync_response_mode="sse",
-        token_count_multiplier=1.2,
+        token_count_multiplier=1.1,
     )
 
 

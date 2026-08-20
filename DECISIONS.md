@@ -71,12 +71,13 @@
 - **Superseded by:** D-USAGE-003
 
 ### D-USAGE-003 — Apply a provider token-count multiplier and set OpenAI/GPT to 1.2
-- **Status:** accepted
+- **Status:** superseded
 - **Date:** 2026-06-09
 - **Context:** bugfix/token-count-multiplier
 - **Decision:** Apply a provider token-count multiplier and set OpenAI/GPT to 1.2.
 - **Rationale:** The multiplier is an explicit compatibility knob for empirical Claude Code auto-compact tuning, kept at the provider capability boundary instead of re-estimating prompt structure in the proxy.
 - **Invalidates:** —
+- **Superseded by:** D-USAGE-004
 - **Replaces:** D-USAGE-002
 
 ### D-SRVTOOL-001 — Treat unsupported server-tool blocks as redacted unsupported content
@@ -330,6 +331,14 @@
 - **Context:** feature/model-defaults-300k
 - **Decision:** Export `CLAUDE_CODE_MAX_CONTEXT_TOKENS=300000` (overridable) in the `claude` subshell of both `claude-codex` and `claude-grok`.
 - **Rationale:** Claude Code sizes its auto-compact threshold from the assumed model context window; the default assumption is smaller than the Codex/Grok backends actually offer. 300k is a deliberate under-estimate of both real windows (GPT-5.6 larger; Grok 512K per D-XAI-008), so Claude Code defers compaction and uses more context per session without risking a real overflow. Set on the launcher (a Claude Code env var) rather than in the bridge, which never reads it. Kept `:-300000` so an operator can still override per run.
+- **Invalidates:** —
+
+### D-USAGE-004 — Lower the OpenAI/GPT token-count multiplier from 1.2 to 1.1
+- **Status:** accepted
+- **Date:** 2026-08-20
+- **Context:** feature/model-defaults-300k
+- **Decision:** Set `GPT_TOKEN_COUNT_MULTIPLIER` (the OpenAI provider's `token_count_multiplier` capability) to 1.1, down from 1.2.
+- **Rationale:** The multiplier inflates reported input/output token counts so Claude Code's auto-compact fires earlier; 1.2 was the initial empirical value (D-USAGE-003). Lowering to 1.1 reduces the inflation so compaction is deferred and more real context is used per session, consistent with the 300k window advertised in D-CONTEXT-001. Still a single knob at the provider capability boundary; xAI's identity 1.0 (D-XAI-005) is unaffected. Mild step (monitored via live usage) rather than removing the knob, since some inflation still hedges the Claude-vs-GPT tokenizer gap.
 - **Invalidates:** —
 
 ## Archive
