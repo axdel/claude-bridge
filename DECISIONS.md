@@ -330,7 +330,7 @@
 - **Date:** 2026-08-20
 - **Context:** feature/model-defaults-300k
 - **Decision:** Export `CLAUDE_CODE_MAX_CONTEXT_TOKENS=300000` (overridable) in the `claude` subshell of both `claude-codex` and `claude-grok`.
-- **Rationale:** Claude Code sizes its auto-compact threshold from the assumed model context window; the default assumption is smaller than the Codex/Grok backends actually offer. 300k is a deliberate under-estimate of both real windows (GPT-5.6 larger; Grok 512K per D-XAI-008), so Claude Code defers compaction and uses more context per session without risking a real overflow. Set on the launcher (a Claude Code env var) rather than in the bridge, which never reads it. Kept `:-300000` so an operator can still override per run.
+- **Rationale:** Claude Code sizes its auto-compact threshold from the assumed model context window; the default assumption is smaller than the Codex/Grok backends actually offer. 300k is a deliberate under-estimate of both real windows (GPT-5.6 larger; grok-4.6 500K per D-XAI-009), so Claude Code defers compaction and uses more context per session without risking a real overflow. Set on the launcher (a Claude Code env var) rather than in the bridge, which never reads it. Kept `:-300000` so an operator can still override per run.
 - **Invalidates:** —
 
 ### D-USAGE-004 — Lower the OpenAI/GPT token-count multiplier from 1.2 to 1.1
