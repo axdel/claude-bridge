@@ -718,8 +718,8 @@ class TestRequestTranslation:
     never from running the translator. The load-bearing divergence from the OpenAI
     path is proven here: xAI links a tool call to its result by ``call_id`` ALONE and
     accepts it verbatim, so the Anthropic tool id is forwarded unchanged (NO ``fc_``
-    rewrite, NO synthesized ``id`` field), and ``reasoning.effort`` is never sent
-    (field_effort_low.json shows it 400s).
+    rewrite, NO synthesized ``id`` field), and ``reasoning.effort`` is sent only to
+    models that accept it (grok-4.6+; grok-4.20 and earlier 400 — field_effort_low.json).
     """
 
     # -- request envelope -----------------------------------------------------
@@ -740,18 +740,74 @@ class TestRequestTranslation:
         result, _ = anthropic_to_xai({"messages": []})
         assert result["model"] == "grok-3-mini"
 
-    def test_request_omits_reasoning_key_entirely(self):
-        """xAI 400s on reasoning.effort (field_effort_low.json) — the key must be absent."""
+    def test_grok46_default_sends_reasoning_effort_low(self, monkeypatch):
+        """grok-4.6 accepts reasoning.effort (U-EFFORT: omit/low/medium/high all HTTP 200),
+        so the default request carries the config effort ``low`` (63 vs 146 reasoning tokens
+        at omit — a latency choice, not native-high parity)."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, _ = anthropic_to_xai({"messages": []})
+        assert result["reasoning"] == {"effort": "low"}
+
+    def test_gated_older_model_omits_reasoning_effort(self, monkeypatch):
+        """grok-4.20 (a pre-4.6 model) 400s on reasoning.effort (field_effort_low.json), so the
+        version gate omits the key. Decimal compare, not tuple: 4.20 == 4.2 < 4.6."""
+        monkeypatch.setenv("XAI_MODEL", "grok-4.20")
         result, _ = anthropic_to_xai({"messages": []})
         assert "reasoning" not in result
 
-    def test_thinking_config_warns_without_adding_reasoning_effort(self):
-        """A thinking config is acknowledged in warnings but never becomes reasoning.effort."""
+    def test_lower_boundary_model_omits_reasoning_effort(self, monkeypatch):
+        """A model just below the 4.6 floor is gated out — pins the >= 4.6 threshold."""
+        monkeypatch.setenv("XAI_MODEL", "grok-4.5")
+        result, _ = anthropic_to_xai({"messages": []})
+        assert "reasoning" not in result
+
+    def test_grok_build_alias_sends_reasoning_effort(self, monkeypatch):
+        """grok-build (the rolling latest-coding alias, no parseable version) is assumed modern
+        and carries reasoning.effort — only a model that parses below 4.6 is gated out, so an
+        XAI_MODEL override cannot silently lose effort on a supported model."""
+        monkeypatch.setenv("XAI_MODEL", "grok-build")
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, _ = anthropic_to_xai({"messages": []})
+        assert result["reasoning"] == {"effort": "low"}
+
+    def test_reasoning_effort_honors_env_override(self, monkeypatch):
+        """XAI_REASONING_EFFORT overrides the default effort on an accepting model."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.setenv("XAI_REASONING_EFFORT", "medium")
+        result, _ = anthropic_to_xai({"messages": []})
+        assert result["reasoning"] == {"effort": "medium"}
+
+    def test_thinking_config_does_not_drive_reasoning_effort(self, monkeypatch):
+        """A thinking config is acknowledged in warnings, but reasoning.effort comes from config,
+        never from the thinking budget (budget_tokens never becomes the effort value)."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
         result, warnings = anthropic_to_xai(
             {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 1024}}
         )
-        assert "reasoning" not in result
+        assert result["reasoning"] == {"effort": "low"}
         assert any("thinking" in w.lower() for w in warnings)
+
+    # -- max output tokens ----------------------------------------------------
+
+    def test_max_tokens_maps_to_max_output_tokens(self):
+        """Anthropic max_tokens becomes Responses max_output_tokens: grok-4.6 has no fixed text
+        cap, so forwarding Claude's limit keeps slow turns bounded. The Anthropic key name
+        does not survive."""
+        result, _ = anthropic_to_xai({"messages": [], "max_tokens": 4096})
+        assert result["max_output_tokens"] == 4096
+        assert "max_tokens" not in result
+
+    def test_absent_max_tokens_omits_max_output_tokens(self):
+        """No Anthropic max_tokens -> no cap forwarded; grok applies its own default."""
+        result, _ = anthropic_to_xai({"messages": []})
+        assert "max_output_tokens" not in result
+
+    def test_nonpositive_max_tokens_omits_max_output_tokens(self):
+        """A malformed non-positive max_tokens is ignored rather than forwarded as a cap."""
+        result, _ = anthropic_to_xai({"messages": [], "max_tokens": 0})
+        assert "max_output_tokens" not in result
 
     # -- system / instructions ------------------------------------------------
 

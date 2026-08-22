@@ -332,7 +332,8 @@ translation rather than importing OpenAI's, because cross-provider imports are f
 | Auth | `~/.grok/auth.json` OIDC bearer + refresh (`grok login`); no API key |
 | Client gate | `x-grok-client-version` (auto-resolved from the installed grok CLI, floor `0.1.202`) + `grok-cli` client identifier |
 | Reasoning continuity | encrypted reasoning cached in memory, keyed by `call_id`, echoed across tool turns (never persisted or logged) |
-| Tool linkage | `call_id` alone — cli-chat-proxy has no separate `id`, and 400s if a `reasoning` key is sent |
+| Reasoning effort | `reasoning.effort` (default `low`, a latency choice) sent to grok-4.6+; omitted for pre-4.6 models that 400 on it |
+| Tool linkage | `call_id` alone — cli-chat-proxy has no separate `id` |
 | Token multiplier | `1.0` — subscription-metered, so no OpenAI-compat scaling |
 | Media | image + document (PDF) input and array-form tool output forwarded as `input_image` / `input_file` |
 

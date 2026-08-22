@@ -125,6 +125,23 @@ def test_xai_model_default_and_env_override(monkeypatch):
     assert config.xai_model() == "grok-4.6"
 
 
+def test_xai_reasoning_effort_default_and_env_override(monkeypatch):
+    """XAI_REASONING_EFFORT defaults to low and trims/normalizes blank overrides."""
+    import claude_bridge.config as config
+
+    monkeypatch.delenv(config.XAI_REASONING_EFFORT_ENV, raising=False)
+    assert config.xai_reasoning_effort() == "low"
+
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "medium")
+    assert config.xai_reasoning_effort() == "medium"
+
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "  high  ")
+    assert config.xai_reasoning_effort() == "high"
+
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "   ")
+    assert config.xai_reasoning_effort() == "low"
+
+
 def test_xai_client_version_env_override_wins_verbatim(monkeypatch, tmp_path):
     """An explicit XAI_CLIENT_VERSION override is returned verbatim, ignoring bundles."""
     import claude_bridge.config as config

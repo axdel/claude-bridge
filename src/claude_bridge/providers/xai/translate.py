@@ -9,6 +9,7 @@ Responses translation by design — cross-provider imports are forbidden (D-XAI-
 from __future__ import annotations
 
 import json
+import re
 
 import claude_bridge.config as config
 from claude_bridge.content import MediaSource, parse_media_source
@@ -389,6 +390,37 @@ def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
     return fields, warnings
 
 
+# grok-4.6+ accept a ``reasoning.effort`` parameter (U-EFFORT: omit/low/medium/high all HTTP
+# 200); grok-4.20 and earlier 400 on it (field_effort_low.json). The model id is compared as a
+# DECIMAL, not a version tuple: ``grok-4.20`` is 4.2 (older than 4.6), which is what makes the
+# fixture consistent — 4.20 lacks the field, 4.6 has it, so 4.20 must rank older; a tuple would
+# rank (4,20) newer than (4,6). config._version_tuple is deliberately NOT reused for this reason
+# (client versions there are genuine semver tuples).
+_XAI_EFFORT_MIN_VERSION = 4.6
+
+
+def _parse_grok_version(model: str) -> float | None:
+    """Return the decimal version in a ``grok-<major>.<minor>`` id, or None if it has none.
+
+    ``grok-4.6`` -> 4.6, ``grok-4.20`` -> 4.2 (decimal), ``grok-build`` -> None.
+    """
+    match = re.search(r"grok-(\d+(?:\.\d+)?)", model)
+    return float(match.group(1)) if match else None
+
+
+def _model_accepts_reasoning_effort(model: str) -> bool:
+    """Whether the resolved model accepts a ``reasoning.effort`` parameter.
+
+    True for grok-4.6+ and for any non-versioned alias such as ``grok-build`` (the rolling
+    latest-coding model, assumed modern); False only for a model that parses to a version
+    below 4.6, which the proxy 400s on (field_effort_low.json). Gating on "provably old"
+    rather than "provably new" keeps effort working on supported models while still refusing
+    the one known-unsupported case, so an ``XAI_MODEL`` override cannot recreate the 4.20 400.
+    """
+    version = _parse_grok_version(model)
+    return version is None or version >= _XAI_EFFORT_MIN_VERSION
+
+
 def anthropic_to_xai(
     request: dict, capabilities: ProviderCapabilities = _XAI_TEXT_ONLY_CAPABILITIES
 ) -> tuple[dict, list[str]]:
@@ -403,9 +435,10 @@ def anthropic_to_xai(
 
     Two divergences from the OpenAI path are load-bearing: (1) tool ids are forwarded
     VERBATIM (no ``fc_`` rewrite, no synthesized item id) because xAI links by
-    ``call_id`` alone; (2) NO ``reasoning`` key is sent — cli-chat-proxy 400s on
-    ``reasoning.effort`` (field_effort_low.json), and encrypted reasoning arrives via
-    ``include=reasoning.encrypted_content`` with ``store=false`` instead.
+    ``call_id`` alone; (2) ``reasoning.effort`` is model-gated — sent to grok-4.6+ (which
+    accept it) and omitted for pre-4.6 models that 400 on it (field_effort_low.json), while
+    encrypted reasoning continuity always rides ``include=reasoning.encrypted_content`` with
+    ``store=false``.
     """
     warnings: list[str] = []
 
@@ -419,16 +452,28 @@ def anthropic_to_xai(
         else:
             warnings.append("Thinking config passed through (reasoning_mode=passthrough)")
 
-    # include=reasoning.encrypted_content + store=false: the stateless model returns
-    # each reasoning item's encrypted continuation blob, replayed before its
-    # function_call on the next turn (reasoning continuity — B7). No ``reasoning`` key:
-    # ``reasoning.effort`` 400s (field_effort_low.json); xAI applies its own default.
+    # include=reasoning.encrypted_content + store=false: the stateless model returns each
+    # reasoning item's encrypted continuation blob, replayed before its function_call on the
+    # next turn (reasoning continuity — B7). Orthogonal to reasoning.effort below — include
+    # controls whether the encrypted blob is returned, effort controls how much the model thinks.
+    model = config.xai_model()
     result: dict = {
-        "model": config.xai_model(),
+        "model": model,
         "store": False,
         "stream": True,
         "include": ["reasoning.encrypted_content"],
     }
+
+    # reasoning.effort tunes grok-4.6+ thinking length (low by default — a latency choice).
+    # Model-gated: pre-4.6 models 400 on the field (field_effort_low.json).
+    if _model_accepts_reasoning_effort(model):
+        result["reasoning"] = {"effort": config.xai_reasoning_effort()}
+
+    # Anthropic max_tokens -> Responses max_output_tokens. grok-4.6 has no fixed text cap, so
+    # forwarding Claude's limit keeps slow turns bounded; omitted when absent or non-positive.
+    max_tokens = request.get("max_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        result["max_output_tokens"] = max_tokens
 
     system = request.get("system")
     if isinstance(system, str):

@@ -20,6 +20,7 @@ ANTHROPIC_REAL_URL_ENV = "ANTHROPIC_REAL_URL"
 CLAUDE_BRIDGE_TRACE_PATH_ENV = "CLAUDE_BRIDGE_TRACE_PATH"
 XAI_MODEL_ENV = "XAI_MODEL"
 XAI_CLIENT_VERSION_ENV = "XAI_CLIENT_VERSION"
+XAI_REASONING_EFFORT_ENV = "XAI_REASONING_EFFORT"
 CONNECT_TIMEOUT_ENV = "CONNECT_TIMEOUT"
 STREAM_IDLE_TIMEOUT_ENV = "STREAM_IDLE_TIMEOUT"
 POOL_IDLE_ENV = "POOL_IDLE"
@@ -34,6 +35,12 @@ DEFAULT_REASONING_MODE = "passthrough"
 # a known model version; if the id is later deprecated (as `grok-4.20` was), reverting to
 # `grok-build` is a one-line change. Supersedes D-XAI-008. Override per run with XAI_MODEL.
 DEFAULT_XAI_MODEL = "grok-4.6"
+
+# xAI reasoning effort. grok-4.6 accepts omit/low/medium/high (all HTTP 200); `low` is a
+# latency choice (63 vs 146 reasoning tokens at omit), not native-high parity. Sent only to
+# models that accept the field (see anthropic_to_xai's version gate). Override with
+# XAI_REASONING_EFFORT.
+DEFAULT_XAI_REASONING_EFFORT = "low"
 
 # HTTP/2 transport split timeouts (seconds). A single urllib socket timeout fired on
 # every recv and killed long-thinking grok-4.6 streams at ~120s; these separate
@@ -165,6 +172,16 @@ def trace_path() -> str | None:
 def xai_model() -> str:
     """Return the xAI Grok model id from XAI_MODEL, defaulting to grok-4.6."""
     return _non_empty_stripped_env(XAI_MODEL_ENV) or DEFAULT_XAI_MODEL
+
+
+def xai_reasoning_effort() -> str:
+    """Return the xAI reasoning effort from XAI_REASONING_EFFORT, defaulting to low.
+
+    grok-4.6 accepts low/medium/high; the value is only stamped onto requests for models
+    that accept the field (the version gate lives in ``anthropic_to_xai``). ``low`` is the
+    latency default, not xAI's native ``high``.
+    """
+    return _non_empty_stripped_env(XAI_REASONING_EFFORT_ENV) or DEFAULT_XAI_REASONING_EFFORT
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
