@@ -11,7 +11,7 @@ set -eo pipefail
 BRIDGE_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 PORT=$((9000 + RANDOM % 999))
 BRIDGE_PID=""
-LOG_LEVEL="${LOG_LEVEL:-INFO}"
+LOG_LEVEL="${LOG_LEVEL:-WARNING}"
 
 # Parse our flags (before --)
 CLAUDE_ARGS=()
@@ -41,15 +41,12 @@ export LOG_LEVEL
 # cannot let a local `claude_bridge/__main__.py` shadow the real bridge and read
 # ~/.grok/auth.json (search-path injection, CWE-427). Our own trusted src dir is
 # still first on the explicit PYTHONPATH exported above.
-# In debug mode surface bridge logs on the terminal; otherwise stay quiet.
-# Without this the advertised `--debug` (LOG_LEVEL=DEBUG) would be a no-op —
-# every log line went to /dev/null, leaving no way to diagnose auth/refresh/
-# version-gate/stream failures.
-if [[ "$LOG_LEVEL" == "DEBUG" ]]; then
-    python3 -P -m claude_bridge --port "$PORT" --provider xai &
-else
-    python3 -P -m claude_bridge --port "$PORT" --provider xai 2>/dev/null &
-fi
+# Bridge logs go to stderr at LOG_LEVEL (WARNING+ by default), so upstream timeouts
+# and stalled-stream deaths are visible on the terminal without `--debug`; `--debug`
+# raises the level to DEBUG. No `2>/dev/null` here — discarding the whole stream is
+# what hid the 120s upstream deaths; INFO/DEBUG chatter is filtered by the log level
+# instead, so the terminal stays quiet in normal use but never silent on failure.
+python3 -P -m claude_bridge --port "$PORT" --provider xai &
 BRIDGE_PID=$!
 
 # Wait for bridge to accept connections (max 3s)
