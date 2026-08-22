@@ -706,6 +706,108 @@ class TestRefreshXaiToken:
         assert auth_file.read_bytes() == before
 
 
+# --- cross-process refresh serialization (advisory flock + double-check) ---
+
+
+class TestCrossProcessRefreshLock:
+    """The refresh serializes across separate bridge processes and skips a
+    now-redundant POST — the cross-process advisory lock plus its double-check.
+
+    Motivation: the process-local ``asyncio.Lock`` guards one event loop; three
+    separate ``claude-grok`` processes each hold their own, so without an OS-level
+    lock they stampede the refresh endpoint. RFC 6749 §6 permits single-use
+    refresh_token rotation (xAI rotates — see ``test_rotates_refresh_token``), so
+    the first POST consumes the token and the losers would ``400`` on the dead one.
+
+    Oracle: every expected value derives from that contract — a loser that
+    re-reads a freshly-rotated valid token MUST use it and skip its own POST —
+    never from running the refresh.
+    """
+
+    def _expired_file(self, tmp_path: Path) -> Path:
+        expired = _make_jwt({"exp": time.time() - 100})
+        return _write_grok_auth(
+            tmp_path, _grok_auth({"key": expired, "expires_at": _iso(time.time() - 100)})
+        )
+
+    @pytest.mark.asyncio
+    async def test_refresh_skips_network_when_token_already_valid(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Double-check under the lock: a valid on-disk token (another claude-grok
+        # rotated it while we waited for the lock) short-circuits — the network POST
+        # is skipped and the fresh token returned. Fails against unconditional-POST
+        # code (which would call _boom and raise).
+        valid = _make_jwt({"exp": time.time() + 3600})
+        auth_file = _write_grok_auth(
+            tmp_path, _grok_auth({"key": valid, "expires_at": _iso(time.time() + 3600)})
+        )
+
+        def _boom(*a, **kw):
+            raise AssertionError("network refresh must not run when the token is already valid")
+
+        monkeypatch.setattr("urllib.request.urlopen", _boom)
+        returned = await refresh_xai_token(
+            _ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file
+        )
+        assert returned == valid
+
+    @pytest.mark.asyncio
+    async def test_refresh_blocks_while_a_peer_holds_the_lock(self, monkeypatch, tmp_path: Path):
+        # Mutual exclusion: while a peer holds a SHARED lock on .xai-refresh.lock,
+        # the refresh's EXCLUSIVE acquire must block (exclusive is incompatible with a
+        # held shared lock), so wait_for times out. This single assertion kills two
+        # mutants: a dropped flock (would not block -> completes -> no TimeoutError)
+        # and LOCK_EX->LOCK_SH (shared is compatible with the held shared -> proceeds).
+        import fcntl
+
+        auth_file = self._expired_file(tmp_path)
+        lock_path = auth_file.parent / ".xai-refresh.lock"
+        new_token = _make_jwt({"exp": time.time() + 3600})
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
+        )
+        peer_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(peer_fd, fcntl.LOCK_SH)
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    refresh_xai_token(
+                        _ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file
+                    ),
+                    timeout=0.5,
+                )
+        finally:
+            fcntl.flock(peer_fd, fcntl.LOCK_UN)
+            os.close(peer_fd)
+
+    @pytest.mark.asyncio
+    async def test_lock_released_after_successful_refresh(self, monkeypatch, tmp_path: Path):
+        # After a successful refresh the lock is released — a subsequent non-blocking
+        # exclusive acquire succeeds (no BlockingIOError). Kills a mutant that leaks
+        # the fd/lock (dropped finally), which would deadlock every later refresh.
+        # The lock file is owner-only (0600), consistent with ~/.grok hygiene.
+        import fcntl
+
+        auth_file = self._expired_file(tmp_path)
+        new_token = _make_jwt({"exp": time.time() + 3600})
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
+        )
+        await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
+
+        lock_path = auth_file.parent / ".xai-refresh.lock"
+        assert stat.S_IMODE(os.stat(lock_path).st_mode) == 0o600
+        probe_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(probe_fd)
+
+
 # --- import decode_jwt_exp used to keep the oracle honest (no unused import) ---
 assert callable(decode_jwt_exp)
 
