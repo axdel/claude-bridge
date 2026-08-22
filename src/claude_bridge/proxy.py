@@ -17,12 +17,13 @@ import asyncio
 import json
 import secrets
 import time as _time
+import uuid
 
 import httpx
 
 import claude_bridge.config as config
 from claude_bridge.http_client import create_client, forward_request, post_provider
-from claude_bridge.log import get_logger, request_id_var
+from claude_bridge.log import get_logger, request_id_var, upstream_request_id_var
 from claude_bridge.provider import PROVIDERS, Provider, provider_capabilities, validate_provider
 from claude_bridge.proxy_streaming import (
     aggregate_stream_to_message,
@@ -233,6 +234,10 @@ async def _process_request(
 
     # Assign a short request ID for log correlation
     request_id_var.set(secrets.token_hex(4))
+    # Assign the per-request upstream id sent as x-grok-req-id. Set once here (not inside
+    # authenticate) so it stays stable across the transport and reactive-401 retries, letting
+    # the upstream dedup a retried request; a full uuid, distinct from the 8-hex log token.
+    upstream_request_id_var.set(str(uuid.uuid4()))
     request_start = _time.monotonic()
 
     try:

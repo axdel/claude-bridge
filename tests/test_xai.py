@@ -19,12 +19,14 @@ import json
 import os
 import stat
 import time
+import uuid
 from pathlib import Path
 
 import pytest
 
 from claude_bridge.auth import decode_jwt_exp
 from claude_bridge.content import parse_media_source
+from claude_bridge.log import upstream_request_id_var
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.providers.xai import (
     _MAX_SSE_BUFFER,
@@ -2613,18 +2615,24 @@ class TestAuthenticate:
         monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
 
         provider = XAIProvider(auth_path=auth_file)
-        headers = await provider.authenticate()
+        reset = upstream_request_id_var.set("req-fixed-001")
+        try:
+            headers = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset)
 
         # Oracle: token is the exact bearer we wrote; version is the env override
         # (config resolver returns it verbatim); identifier is the fixed client string;
-        # conv-id is this instance's sticky prompt cache key. The exact-dict match also
-        # proves no extra header leaks in.
+        # conv-id is this instance's sticky prompt cache key; req-id is the per-request
+        # value carried on the contextvar. The exact-dict match also proves no extra
+        # header leaks in.
         token = data[_ENTRY_KEY]["key"]
         assert headers == {
             "Authorization": f"Bearer {token}",
             "x-grok-client-version": "1.2.3",
             "x-grok-client-identifier": _XAI_CLIENT_IDENTIFIER,
             "x-grok-conv-id": provider._prompt_cache_key,
+            "x-grok-req-id": "req-fixed-001",
         }
 
     @pytest.mark.asyncio
@@ -2666,10 +2674,11 @@ class TestAuthenticate:
         headers = await XAIProvider(auth_path=auth_file).authenticate()
 
         # Security oracle: the opaque bearer must appear ONLY in Authorization —
-        # never smuggled into the version or identifier header.
+        # never smuggled into the version, identifier, or request-id header.
         token = data[_ENTRY_KEY]["key"]
         assert token not in headers["x-grok-client-version"]
         assert token not in headers["x-grok-client-identifier"]
+        assert token not in headers["x-grok-req-id"]
 
 
 # --- prompt cache identity (sticky routing key) ---
@@ -2716,6 +2725,89 @@ class TestPromptCacheIdentity:
         # as the SAME value — cli-chat-proxy accepts either (grok-build is key.or(conv_id)).
         assert headers["x-grok-conv-id"] == body["prompt_cache_key"]
         assert body["prompt_cache_key"]
+
+
+# --- per-request upstream request id (x-grok-req-id) ---
+
+
+class TestUpstreamRequestIdHeader:
+    """``x-grok-req-id`` carries a per-request id the grok CLI sends on every responses
+    call (verified against the CLI binary). Unlike the sticky ``x-grok-conv-id`` (one
+    identity per process), this is fresh per request and set once by the proxy on the
+    ``upstream_request_id_var`` contextvar — so it stays STABLE across the transport retry
+    and the reactive 401 retry (both re-call ``authenticate`` within the one request
+    context), which is what lets an upstream dedup a retried request instead of double-
+    processing it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_header_carries_the_contextvar_value(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        reset = upstream_request_id_var.set("req-from-proxy-42")
+        try:
+            headers = await XAIProvider(auth_path=auth_file).authenticate()
+        finally:
+            upstream_request_id_var.reset(reset)
+        # Oracle: the header value IS the contextvar the proxy set for this request —
+        # not derived, not random, when a request id is present.
+        assert headers["x-grok-req-id"] == "req-from-proxy-42"
+
+    @pytest.mark.asyncio
+    async def test_stable_across_two_authenticate_calls_in_one_request(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        provider = XAIProvider(auth_path=auth_file)
+        reset = upstream_request_id_var.set("req-stable-across-retry")
+        try:
+            first = await provider.authenticate()
+            # The reactive-401 path re-calls authenticate within the SAME request context;
+            # the id must not change or the upstream can't dedup the retry.
+            second = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset)
+        assert first["x-grok-req-id"] == second["x-grok-req-id"] == "req-stable-across-retry"
+
+    @pytest.mark.asyncio
+    async def test_fresh_per_request(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        provider = XAIProvider(auth_path=auth_file)
+        reset_a = upstream_request_id_var.set("req-A")
+        try:
+            headers_a = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset_a)
+        reset_b = upstream_request_id_var.set("req-B")
+        try:
+            headers_b = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset_b)
+        # Oracle: a distinct id per request (the proxy stamps a fresh uuid each request),
+        # so two requests are never conflated by the upstream.
+        assert headers_a["x-grok-req-id"] == "req-A"
+        assert headers_b["x-grok-req-id"] == "req-B"
+        assert headers_a["x-grok-req-id"] != headers_b["x-grok-req-id"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_a_fresh_uuid_when_contextvar_unset(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        provider = XAIProvider(auth_path=auth_file)
+        # Force the empty/unset state deterministically (order-independent under
+        # pytest-randomly): the header must NEVER go out empty, so authenticate mints
+        # a uuid when the proxy left no id.
+        reset = upstream_request_id_var.set("")
+        try:
+            headers = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset)
+        req_id = headers["x-grok-req-id"]
+        assert req_id  # never empty
+        # A parseable uuid proves the fallback minted a real id, not a placeholder.
+        uuid.UUID(req_id)
 
 
 # --- provider contract: capabilities, endpoint, registration ---

@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import claude_bridge.config as config
+from claude_bridge.log import upstream_request_id_var
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.providers.xai.auth import _XAI_CLIENT_IDENTIFIER, get_xai_bearer_token
 from claude_bridge.providers.xai.stream import (
@@ -132,6 +133,13 @@ class XAIProvider:
         ``key.or(conv_id)``, so key and header carry the same value). It is an opaque per-instance
         UUID — never a secret.
 
+        The ``x-grok-req-id`` carries the per-request id the proxy stamped on
+        ``upstream_request_id_var``, matching the header the grok CLI sends on every responses
+        call. It is read (not minted) here so it stays STABLE when ``authenticate`` is re-called
+        within one request — the transport retry and the reactive-401 retry — letting the
+        upstream dedup a retried request. A uuid is minted only as a fallback so the header is
+        never emitted empty. Opaque trace id, never a secret.
+
         Args:
             force_refresh: Force a bearer refresh regardless of proactive expiry — the
                 reactive path after an upstream 401. Forwarded to ``get_xai_bearer_token``.
@@ -146,6 +154,7 @@ class XAIProvider:
             "x-grok-client-version": config.xai_client_version(),
             "x-grok-client-identifier": _XAI_CLIENT_IDENTIFIER,
             "x-grok-conv-id": self._prompt_cache_key,
+            "x-grok-req-id": upstream_request_id_var.get() or str(uuid.uuid4()),
         }
 
     def _stash_reasoning(self, associations: dict[str, dict]) -> None:
