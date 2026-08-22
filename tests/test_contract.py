@@ -26,7 +26,7 @@ from claude_bridge.providers.openai import (
     anthropic_to_openai,
     openai_to_anthropic,
 )
-from claude_bridge.proxy import estimate_input_tokens
+from claude_bridge.request_view import estimate_input_tokens
 
 # A provider that declares the full media surface — used to assert the forward path.
 _FULL_MEDIA_CAPABILITIES = ProviderCapabilities(

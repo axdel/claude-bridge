@@ -89,6 +89,8 @@ source_modules = [
     "claude_bridge.provider",
     "claude_bridge.stats",
     "claude_bridge.log",
+    "claude_bridge.http_client",
+    "claude_bridge.request_view",
 ]
 forbidden_modules = [
     "claude_bridge.proxy",

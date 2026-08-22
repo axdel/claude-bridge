@@ -14,11 +14,24 @@ import secrets
 import time as _time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
 
 import claude_bridge.config as config
-from claude_bridge.log import get_logger, is_trace_enabled, request_id_var, trace_event
+from claude_bridge.http_client import (
+    FORWARD_HEADERS,
+    build_provider_request,
+    forward_request,
+    get_timeout,
+    retry_request,
+)
+from claude_bridge.log import get_logger, request_id_var
 from claude_bridge.provider import PROVIDERS, Provider, ProviderCapabilities
+from claude_bridge.request_view import (
+    emit_translation_warnings,
+    estimate_tokens,
+    trace_inbound_request,
+    trace_provider_response,
+    trace_stream_event,
+)
 from claude_bridge.router import Router
 from claude_bridge.stats import BridgeStats
 from claude_bridge.stream import format_anthropic_sse
@@ -39,68 +52,10 @@ _MAX_REQUEST_BODY = config.max_request_body(on_invalid=_warn_invalid_max_request
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 
 
-def _get_timeout(default: int) -> int:
-    """Return upstream timeout in seconds from UPSTREAM_TIMEOUT env var, or *default*."""
-
-    def _warn_invalid(raw: str) -> None:
-        logger.warning("Invalid UPSTREAM_TIMEOUT=%r, using default %ds", raw, default)
-
-    return config.upstream_timeout(default, on_invalid=_warn_invalid)
-
-
-_TRANSIENT_ERRORS = (urllib.error.URLError, TimeoutError, OSError)
-
-
-def _retry_request(
-    fn,
-    *,
-    retries: int = 1,
-    backoff: float = 0.5,
-) -> tuple[int, bytes]:
-    """Call *fn* and retry on transient errors. Returns ``(status, body)``.
-
-    *fn* must return ``(status, body)`` on success or raise an exception.
-    HTTPError is not retried (server responded, just with an error status).
-    """
-    last_exc: Exception | None = None
-    for attempt in range(1 + retries):
-        try:
-            return fn()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-        except _TRANSIENT_ERRORS as exc:
-            last_exc = exc
-            if attempt < retries:
-                logger.warning(
-                    "Transient error (attempt %d/%d): %s", attempt + 1, retries + 1, exc
-                )
-                _time.sleep(backoff * (2**attempt))
-    logger.error("All %d attempts failed: %s", retries + 1, last_exc)
-    return 502, json.dumps({"error": "upstream unavailable"}).encode()
-
-
-# Headers to forward from the client to the upstream API.
-_FORWARD_HEADERS = ("x-api-key", "content-type", "anthropic-version")
-
 # Upstream HTTP status codes that trigger failover.
 _FAILOVER_STATUSES = {429, 500, 502, 503}
 
 # SSE events too noisy for DEBUG — normal stream lifecycle, not interesting.
-_RATELIMIT_HEADER_PREFIXES = ("x-ratelimit-", "anthropic-ratelimit-")
-_RATELIMIT_EXACT_HEADERS = ("retry-after",)
-
-
-def _extract_ratelimit_headers(headers) -> list[tuple[str, str]]:
-    """Extract rate limit headers from an HTTP response headers object."""
-    result = []
-    for key, value in headers.items():
-        lower_key = key.lower()
-        is_ratelimit = any(lower_key.startswith(p) for p in _RATELIMIT_HEADER_PREFIXES)
-        if is_ratelimit or lower_key in _RATELIMIT_EXACT_HEADERS:
-            result.append((lower_key, value))
-    return result
-
-
 _QUIET_SSE_EVENTS = frozenset(
     {
         "content_block_delta",
@@ -201,169 +156,6 @@ async def _parse_request(
     return method, path, headers, body
 
 
-# Approximate bytes-per-token ratio for mixed code/natural language traffic.
-_BYTES_PER_TOKEN = 3.5
-
-# Flat per-modality token budgets for media blocks. A model's cost for an image
-# or document is dominated by fixed per-item processing — OpenAI bills vision by
-# 512px-tile count and files by per-page render+extract — NOT by the base64 byte
-# length. So media contributes a flat budget, never its encoded payload size: a
-# 200 KB pasted image counted as text is ~57k phantom tokens, which wrecks Claude
-# Code's auto-compact signal. Values are representative (a high-detail OpenAI
-# vision image is ~765-1445 tokens; a multi-page document is larger) and bias
-# toward over-counting so auto-compact trips early, not late. Limitation: the
-# document budget does not scale with page count — refine with the
-# token_count_multiplier follow-up.
-_IMAGE_TOKEN_ESTIMATE = 1200
-_DOCUMENT_TOKEN_ESTIMATE = 3000
-_MEDIA_TOKEN_ESTIMATES = {"image": _IMAGE_TOKEN_ESTIMATE, "document": _DOCUMENT_TOKEN_ESTIMATE}
-
-# A single media block whose decoded payload exceeds this is logged. No hard cap —
-# _MAX_REQUEST_BODY already bounds the whole request body.
-_OVERSIZED_MEDIA_BYTES = 5 * 1024 * 1024  # 5 MiB decoded
-
-
-def _approx_decoded_bytes(data: str) -> int:
-    """Approximate the decoded size of a base64 string without decoding it.
-
-    base64 encodes 3 bytes per 4 characters, so the decoded size is ~len*3/4.
-    Used for trace size summaries and the oversized-media warning only — the
-    payload itself is never decoded, logged, or copied into a trace.
-    """
-    return len(data) * 3 // 4
-
-
-def _media_descriptor(block: dict) -> dict:
-    """Structural ``{kind, media_type, approx_bytes}`` for one media block.
-
-    Reads only the block type, the source media_type, and the base64 length —
-    never the payload — so the result is safe to persist to a trace.
-    """
-    source = block.get("source")
-    source = source if isinstance(source, dict) else {}
-    data = source.get("data")
-    return {
-        "kind": str(block.get("type", "")),
-        "media_type": str(source.get("media_type", "")),
-        "approx_bytes": _approx_decoded_bytes(data) if isinstance(data, str) else 0,
-    }
-
-
-def _iter_media_blocks(content: object) -> Iterator[dict]:
-    """Yield image/document blocks in a content value, descending into tool_result.
-
-    Media may sit at the top level of a message or nested inside tool_result
-    content (T-005); both reach the provider, so both are surfaced here.
-    """
-    if not isinstance(content, list):
-        return
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        block_type = block.get("type")
-        if block_type in _MEDIA_TOKEN_ESTIMATES:
-            yield block
-        elif block_type == "tool_result":
-            yield from _iter_media_blocks(block.get("content"))
-
-
-def _oversized_media(descriptors: list[dict]) -> list[dict]:
-    """Descriptors whose decoded payload exceeds ``_OVERSIZED_MEDIA_BYTES``."""
-    return [d for d in descriptors if d["approx_bytes"] > _OVERSIZED_MEDIA_BYTES]
-
-
-def _content_token_units(content: object) -> tuple[int, int, list[dict]]:
-    """Return ``(text_bytes, media_tokens, media_descriptors)`` for a content value.
-
-    Image/document blocks contribute a flat per-modality token budget AND a
-    structural descriptor (surfaced from this single walk so the caller need not
-    re-traverse for the oversized-media scan); tool_result content is walked so
-    nested media is budgeted and described identically; every other block is
-    counted by JSON byte size, matching the pre-media estimate.
-    """
-    if not isinstance(content, list):
-        return len(json.dumps(content).encode()), 0, []
-    text_bytes = 0
-    media_tokens = 0
-    descriptors: list[dict] = []
-    for block in content:
-        block_type = block.get("type") if isinstance(block, dict) else None
-        if block_type in _MEDIA_TOKEN_ESTIMATES:
-            media_tokens += _MEDIA_TOKEN_ESTIMATES[block_type]
-            descriptors.append(_media_descriptor(block))
-        elif block_type == "tool_result":
-            wrapper = {k: v for k, v in block.items() if k != "content"}
-            nested_bytes, nested_media, nested_descriptors = _content_token_units(
-                block.get("content")
-            )
-            text_bytes += len(json.dumps(wrapper).encode()) + nested_bytes
-            media_tokens += nested_media
-            descriptors.extend(nested_descriptors)
-        else:
-            text_bytes += len(json.dumps(block).encode())
-    return text_bytes, media_tokens, descriptors
-
-
-def _message_token_units(message: object) -> tuple[int, int, list[dict]]:
-    """Return ``(text_bytes, media_tokens, media_descriptors)`` for one message.
-
-    String/non-list content is counted whole, byte-identical to the pre-media
-    estimate; list content has its media blocks budgeted flatly (see
-    ``_content_token_units``) while the role wrapper is still counted by bytes.
-    """
-    if not isinstance(message, dict) or not isinstance(message.get("content"), list):
-        return len(json.dumps(message).encode()), 0, []
-    wrapper = {k: v for k, v in message.items() if k != "content"}
-    text_bytes, media_tokens, descriptors = _content_token_units(message["content"])
-    return len(json.dumps(wrapper).encode()) + text_bytes, media_tokens, descriptors
-
-
-def estimate_input_tokens(request: dict) -> int:
-    """Estimate input token count by walking the Anthropic request structure.
-
-    Counts UTF-8 JSON bytes of text content (system, message text/tool blocks,
-    tool definitions) at ~3.5 bytes/token. Image and document blocks — top-level
-    or nested in tool_result — instead contribute a FLAT per-modality budget
-    (``_IMAGE_TOKEN_ESTIMATE`` / ``_DOCUMENT_TOKEN_ESTIMATE``), because a model's
-    media cost is dominated by fixed per-item processing, not the base64 byte
-    length. Logs a warning for any single media block whose decoded payload
-    exceeds ``_OVERSIZED_MEDIA_BYTES`` (no hard cap — ``_MAX_REQUEST_BODY`` bounds
-    the request). Returns 0 for empty/malformed requests. Provider-agnostic —
-    operates on the Anthropic request format.
-    """
-    text_bytes = 0
-    media_tokens = 0
-    media_descriptors: list[dict] = []
-    system = request.get("system")
-    if system is not None:
-        text_bytes += len(json.dumps(system).encode())
-    for message in request.get("messages", []):
-        message_bytes, message_media, message_descriptors = _message_token_units(message)
-        text_bytes += message_bytes
-        media_tokens += message_media
-        media_descriptors.extend(message_descriptors)
-    tools = request.get("tools")
-    if tools:
-        text_bytes += len(json.dumps(tools).encode())
-    for descriptor in _oversized_media(media_descriptors):
-        logger.warning(
-            "Oversized %s media (~%d bytes) forwarded without a hard cap",
-            descriptor["kind"],
-            descriptor["approx_bytes"],
-        )
-    if text_bytes == 0 and media_tokens == 0:
-        return 0
-    return int(text_bytes / _BYTES_PER_TOKEN + 0.5) + media_tokens
-
-
-def _estimate_tokens(body: bytes) -> int:
-    """Estimate input tokens from raw request body bytes."""
-    try:
-        return estimate_input_tokens(json.loads(body))
-    except (json.JSONDecodeError, ValueError):
-        return 0
-
-
 def _record_sync_response(
     stats: BridgeStats | None,
     request_start: float,
@@ -405,197 +197,6 @@ def _is_streaming(body: bytes) -> bool:
         return json.loads(body).get("stream") is True
     except (json.JSONDecodeError, ValueError):
         return False
-
-
-# ---------------------------------------------------------------------------
-# Redacted compatibility trace — structural summaries + self-guarding hooks.
-#
-# The summarizers below are the redaction allowlist: each constructs a dict of
-# explicitly named structural fields (counts, type names, tool names, lengths,
-# token totals, stop reasons). They NEVER copy prompt text, tool arguments,
-# tool results, reasoning payloads, request headers, or credentials into the
-# trace. Redaction is enforced by construction here, not by discipline at the
-# call sites. The hooks self-guard on ``is_trace_enabled()`` so the host
-# functions carry zero added complexity and zero overhead when tracing is off.
-# ---------------------------------------------------------------------------
-
-
-def _block_type_counts(blocks: object) -> dict[str, int]:
-    """Count content blocks by their ``type`` field — structure only, no content."""
-    counts: dict[str, int] = {}
-    if not isinstance(blocks, list):
-        return counts
-    for block in blocks:
-        if isinstance(block, dict):
-            block_type = str(block.get("type", "unknown"))
-            counts[block_type] = counts.get(block_type, 0) + 1
-    return counts
-
-
-def _summarize_anthropic_request(request: dict) -> dict:
-    """Structural-only summary of an inbound Anthropic request.
-
-    Emits model, stream flag, message/tool counts, tool names, top-level block
-    type counts, the tool_choice *type*, the system prompt *length*, and a media
-    list of ``{kind, media_type, approx_bytes}`` for every image/document block
-    (top-level or tool_result-nested) — never any prompt text, tool argument,
-    tool result, or base64 media payload.
-    """
-    messages = request.get("messages")
-    message_list = messages if isinstance(messages, list) else []
-    block_types: dict[str, int] = {}
-    media_descriptors: list[dict] = []
-    for message in message_list:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if isinstance(content, str):
-            block_types["text"] = block_types.get("text", 0) + 1
-        else:
-            for block_type, count in _block_type_counts(content).items():
-                block_types[block_type] = block_types.get(block_type, 0) + count
-        media_descriptors.extend(_media_descriptor(block) for block in _iter_media_blocks(content))
-    tools = request.get("tools") or []
-    tool_names = sorted(str(tool.get("name", "")) for tool in tools if isinstance(tool, dict))
-    tool_choice = request.get("tool_choice")
-    system = request.get("system")
-    return {
-        "model": str(request.get("model", "")),
-        "stream": bool(request.get("stream")),
-        "message_count": len(message_list),
-        "system_chars": len(json.dumps(system)) if system is not None else 0,
-        "block_types": block_types,
-        "tool_count": len(tools),
-        "tool_names": tool_names,
-        "tool_choice": tool_choice.get("type") if isinstance(tool_choice, dict) else tool_choice,
-        "media": media_descriptors,
-    }
-
-
-def _summarize_provider_request(translated: dict, warnings: list[str]) -> dict:
-    """Structural-only summary of a translated provider request.
-
-    Emits model, stream flag, input item count, tool count/names, the resolved
-    tool_choice, reasoning effort, and the translation warnings — both the count
-    and the sanitized warning strings, which name what was stripped — never any
-    translated input content. The warning strings are neutralized at construction
-    (see ``_safe_token``), so they are safe to persist to the trace.
-    """
-    tools = translated.get("tools") or []
-    tool_names = sorted(str(tool.get("name", "")) for tool in tools if isinstance(tool, dict))
-    tool_choice = translated.get("tool_choice")
-    if isinstance(tool_choice, dict):
-        tool_choice = f"{tool_choice.get('type')}:{tool_choice.get('name')}"
-    reasoning = translated.get("reasoning")
-    summary = {
-        "model": str(translated.get("model", "")),
-        "stream": bool(translated.get("stream")),
-        "input_items": len(translated.get("input") or []),
-        "tool_count": len(tools),
-        "tool_names": tool_names,
-        "tool_choice": tool_choice,
-        "reasoning_effort": reasoning.get("effort") if isinstance(reasoning, dict) else None,
-        "warning_count": len(warnings),
-        "warnings": list(warnings),
-    }
-    if "parallel_tool_calls" in translated:
-        summary["parallel_tool_calls"] = bool(translated.get("parallel_tool_calls"))
-    return summary
-
-
-def _summarize_anthropic_response(response: dict) -> dict:
-    """Structural-only summary of an outbound Anthropic response.
-
-    Emits model, stop_reason, block type counts, and token usage — never the
-    response text or tool_use arguments.
-    """
-    usage = response.get("usage")
-    usage = usage if isinstance(usage, dict) else {}
-    return {
-        "model": str(response.get("model", "")),
-        "stop_reason": response.get("stop_reason"),
-        "block_types": _block_type_counts(response.get("content")),
-        "input_tokens": usage.get("input_tokens", 0),
-        "output_tokens": usage.get("output_tokens", 0),
-    }
-
-
-def _summarize_stream_event(event: dict) -> dict:
-    """Structural-only summary of one translated Anthropic SSE event.
-
-    Emits the event name, block index, block/delta *type*, stop_reason, and
-    output token total — never the streamed text or partial tool-argument JSON.
-    """
-    data = event.get("data")
-    data = data if isinstance(data, dict) else {}
-    summary: dict = {"sse": event.get("event", "")}
-    if "index" in data:
-        summary["index"] = data.get("index")
-    content_block = data.get("content_block")
-    if isinstance(content_block, dict):
-        summary["block_type"] = content_block.get("type")
-    delta = data.get("delta")
-    if isinstance(delta, dict):
-        if "type" in delta:
-            summary["delta_type"] = delta.get("type")
-        if "stop_reason" in delta:
-            summary["stop_reason"] = delta.get("stop_reason")
-    usage = data.get("usage")
-    if isinstance(usage, dict) and "output_tokens" in usage:
-        summary["output_tokens"] = usage.get("output_tokens")
-    return summary
-
-
-def _trace_inbound_request(body: bytes) -> None:
-    """Trace the structural shape of an inbound Anthropic request, if enabled."""
-    if not is_trace_enabled():
-        return
-    try:
-        trace_event("inbound_request", _summarize_anthropic_request(json.loads(body)))
-    except Exception:
-        logger.debug("inbound trace failed", exc_info=True)
-
-
-def _trace_provider_request(translated: dict, warnings: list[str]) -> None:
-    """Trace the structural shape of a translated provider request, if enabled."""
-    if not is_trace_enabled():
-        return
-    try:
-        trace_event("provider_request", _summarize_provider_request(translated, warnings))
-    except Exception:
-        logger.debug("provider request trace failed", exc_info=True)
-
-
-def _emit_translation_warnings(warnings: list[str], translated: dict) -> None:
-    """Surface translation warnings to every observer — the human log and the
-    structural trace — from a single place.
-
-    Both the streaming and non-streaming request paths route their warnings here so
-    the logged warnings and the traced warnings can never drift out of lockstep.
-    """
-    for warning in warnings:
-        logger.warning("Translation: %s", warning)
-    _trace_provider_request(translated, warnings)
-
-
-def _trace_provider_response(response: dict) -> None:
-    """Trace the structural shape of a translated provider response, if enabled."""
-    if not is_trace_enabled():
-        return
-    try:
-        trace_event("provider_response", _summarize_anthropic_response(response))
-    except Exception:
-        logger.debug("provider response trace failed", exc_info=True)
-
-
-def _trace_stream_event(event: dict) -> None:
-    """Trace the structural shape of one translated SSE event, if enabled."""
-    if not is_trace_enabled():
-        return
-    try:
-        trace_event("stream_event", _summarize_stream_event(event))
-    except Exception:
-        logger.debug("stream event trace failed", exc_info=True)
 
 
 async def _process_request(
@@ -649,7 +250,7 @@ async def _process_request(
 
     # Handle count_tokens — estimate from request body
     if method == "POST" and base_path == "/v1/messages/count_tokens":
-        token_count = _estimate_tokens(body)
+        token_count = estimate_tokens(body)
         logger.debug("count_tokens -> %d", token_count)
         _write_response(writer, 200, json.dumps({"input_tokens": token_count}).encode())
         return
@@ -701,7 +302,7 @@ async def _route_request(
     request_start: float,
 ) -> None:
     """Route a /v1/messages request to the appropriate backend."""
-    _trace_inbound_request(body)
+    trace_inbound_request(body)
     if provider is not None:
         mode = "stream" if streaming else "sync"
         logger.info("-> DIRECT %s (%s) model=%s", provider.name, mode, request_model)
@@ -770,7 +371,7 @@ async def _auto_route(
 
     # Try Anthropic upstream
     status_code, response_body, rl_headers = await asyncio.to_thread(
-        _forward_request, upstream_url, body, headers
+        forward_request, upstream_url, body, headers
     )
 
     if status_code not in _FAILOVER_STATUSES:
@@ -912,23 +513,6 @@ def _provider_error_log_summary(raw_body: bytes) -> str:
     return f"provider error body without message ({len(raw_body)}B)"
 
 
-def _build_provider_request(
-    endpoint: str, translated: dict, auth_headers: dict
-) -> urllib.request.Request:
-    """Build the POST request for a provider call: JSON body, content type, auth headers.
-
-    Shared by the buffered (``_forward_via_provider``) and streaming
-    (``_stream_via_provider``) paths, which diverge only in how they open the
-    returned request — read-and-close versus keep-open for incremental reads.
-    """
-    data = json.dumps(translated).encode()
-    req = urllib.request.Request(endpoint, data=data, method="POST")  # noqa: S310
-    req.add_header("Content-Type", "application/json")
-    for key, value in auth_headers.items():
-        req.add_header(key, value)
-    return req
-
-
 async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, bytes]:
     """Authenticate, translate, forward to provider, translate back.
 
@@ -954,15 +538,15 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
             type(translated).__name__,
         )
         return 502, _anthropic_error_body(502, "Provider translation failed")
-    _emit_translation_warnings(warnings, translated)
+    emit_translation_warnings(warnings, translated)
 
     # Open a streaming connection and collect the full response
     def _do_provider_request():
-        req = _build_provider_request(provider.endpoint, translated, auth_headers)
-        with urllib.request.urlopen(req, timeout=_get_timeout(120)) as resp:  # noqa: S310  # nosec B310
+        req = build_provider_request(provider.endpoint, translated, auth_headers)
+        with urllib.request.urlopen(req, timeout=get_timeout(120)) as resp:  # noqa: S310  # nosec B310
             return resp.status, resp.read()
 
-    status_code, raw_response = await asyncio.to_thread(_retry_request, _do_provider_request)
+    status_code, raw_response = await asyncio.to_thread(retry_request, _do_provider_request)
     logger.info("Provider response: %d (%dB)", status_code, len(raw_response))
     if status_code != 200:
         logger.error(
@@ -979,7 +563,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         except Exception:
             logger.exception("Provider JSON response translation failed")
             return 502, _anthropic_error_body(502, "could not parse provider response")
-        _trace_provider_response(anthropic_response)
+        trace_provider_response(anthropic_response)
         return 200, json.dumps(anthropic_response).encode()
 
     # SSE-sync providers such as Codex/OpenAI return streamed deltas even for
@@ -1003,7 +587,7 @@ async def _forward_via_provider(provider: Provider, body: bytes) -> tuple[int, b
         )
         return 502, _anthropic_error_body(502, "could not parse provider response")
 
-    _trace_provider_response(anthropic_response)
+    trace_provider_response(anthropic_response)
     return 200, json.dumps(anthropic_response).encode()
 
 
@@ -1106,34 +690,6 @@ def _aggregate_stream_to_message(events: list[dict]) -> dict | None:
     return accumulator.build()
 
 
-def _forward_request(
-    upstream_url: str, body: bytes, client_headers: dict[str, str]
-) -> tuple[int, bytes, list[tuple[str, str]]]:
-    """Synchronous HTTP POST to the upstream — called from asyncio.to_thread."""
-    url = f"{upstream_url}/v1/messages"
-    req = urllib.request.Request(url, data=body, method="POST")  # noqa: S310
-
-    for key in _FORWARD_HEADERS:
-        if key in client_headers:
-            req.add_header(key, client_headers[key])
-
-    last_exc: Exception | None = None
-    for attempt in range(2):
-        try:
-            with urllib.request.urlopen(req, timeout=_get_timeout(60)) as resp:  # noqa: S310  # nosec B310
-                return resp.status, resp.read(), _extract_ratelimit_headers(resp.headers)
-        except urllib.error.HTTPError as exc:
-            rl_headers = _extract_ratelimit_headers(exc.headers) if exc.headers else []
-            return exc.code, exc.read(), rl_headers
-        except _TRANSIENT_ERRORS as exc:
-            last_exc = exc
-            if attempt == 0:
-                logger.warning("Upstream transient error, retrying: %s", exc)
-                _time.sleep(0.5)
-    logger.error("Upstream unavailable after retry: %s", last_exc)
-    return 502, json.dumps({"error": "upstream unavailable"}).encode(), []
-
-
 class _ClientDisconnected(Exception):
     """Raised when a write/drain fails because the client closed the connection."""
 
@@ -1167,10 +723,10 @@ async def _stream_passthrough(
     def _open_stream():
         url = f"{upstream_url}/v1/messages"
         req = urllib.request.Request(url, data=body, method="POST")  # noqa: S310
-        for key in _FORWARD_HEADERS:
+        for key in FORWARD_HEADERS:
             if key in client_headers:
                 req.add_header(key, client_headers[key])
-        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310  # nosec B310
+        return urllib.request.urlopen(req, timeout=get_timeout(120))  # noqa: S310  # nosec B310
 
     try:
         resp = await asyncio.to_thread(_open_stream)
@@ -1233,15 +789,15 @@ async def _stream_via_provider(
             ).encode(),
         )
         return 502
-    _emit_translation_warnings(warnings, translated)
+    emit_translation_warnings(warnings, translated)
 
     # Enable streaming on the translated request when the provider declares body selection.
     if _provider_capabilities(provider).stream_request_mode == "body_parameter":
         translated["stream"] = True
 
     def _open_stream():
-        req = _build_provider_request(provider.endpoint, translated, auth_headers)
-        return urllib.request.urlopen(req, timeout=_get_timeout(120))  # noqa: S310  # nosec B310
+        req = build_provider_request(provider.endpoint, translated, auth_headers)
+        return urllib.request.urlopen(req, timeout=get_timeout(120))  # noqa: S310  # nosec B310
 
     logger.debug(
         "Sending to provider: model=%s items=%d",
@@ -1278,7 +834,7 @@ async def _stream_via_provider(
 
     try:
         async for anthropic_event in provider.translate_stream(_raw_chunks()):
-            _trace_stream_event(anthropic_event)
+            trace_stream_event(anthropic_event)
             sse_bytes = format_anthropic_sse(anthropic_event["event"], anthropic_event["data"])
             event_name = anthropic_event["event"]
             if event_name not in _QUIET_SSE_EVENTS:

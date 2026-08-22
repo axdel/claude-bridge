@@ -1067,10 +1067,10 @@ class TestRequestTranslation:
 
     def test_thinking_block_dropped_in_drop_mode(self, monkeypatch):
         """reasoning_mode=drop empties the thinking block — the text never survives."""
-        import claude_bridge.providers.xai as xai
+        import claude_bridge.providers.xai.translate as xai_translate
 
-        monkeypatch.setattr(xai, "_XAI_REASONING_MODE", "drop")
-        result, warnings = xai.anthropic_to_xai(
+        monkeypatch.setattr(xai_translate, "_XAI_REASONING_MODE", "drop")
+        result, warnings = xai_translate.anthropic_to_xai(
             {
                 "messages": [
                     {
@@ -1134,10 +1134,10 @@ class TestRequestTranslation:
 
     def test_thinking_config_drop_mode_warns_stripped(self, monkeypatch):
         """In drop mode a top-level thinking config is reported as stripped."""
-        import claude_bridge.providers.xai as xai
+        import claude_bridge.providers.xai.translate as xai_translate
 
-        monkeypatch.setattr(xai, "_XAI_REASONING_MODE", "drop")
-        _, warnings = xai.anthropic_to_xai(
+        monkeypatch.setattr(xai_translate, "_XAI_REASONING_MODE", "drop")
+        _, warnings = xai_translate.anthropic_to_xai(
             {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 5}}
         )
         assert any("drop" in w.lower() for w in warnings)

@@ -16,11 +16,11 @@ from threading import Thread
 import pytest
 
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities, StreamRequestMode
-from claude_bridge.proxy import (
+from claude_bridge.proxy import start_proxy
+from claude_bridge.request_view import (
     _approx_decoded_bytes,
     _oversized_media,
     estimate_input_tokens,
-    start_proxy,
 )
 
 
@@ -650,44 +650,44 @@ def test_get_fallback_provider_warns_for_unknown_provider(monkeypatch):
 
 
 def test_get_timeout_returns_default_when_unset(monkeypatch):
-    """Without UPSTREAM_TIMEOUT env var, _get_timeout returns the provided default."""
+    """Without UPSTREAM_TIMEOUT env var, get_timeout returns the provided default."""
     import claude_bridge.config as config
-    from claude_bridge.proxy import _get_timeout
+    from claude_bridge.http_client import get_timeout
 
     monkeypatch.delenv(config.UPSTREAM_TIMEOUT_ENV, raising=False)
-    assert _get_timeout(60) == 60
-    assert _get_timeout(120) == 120
+    assert get_timeout(60) == 60
+    assert get_timeout(120) == 120
 
 
 def test_get_timeout_reads_env_var(monkeypatch):
     """UPSTREAM_TIMEOUT overrides the default for all callsites."""
     import claude_bridge.config as config
-    from claude_bridge.proxy import _get_timeout
+    from claude_bridge.http_client import get_timeout
 
     monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "30")
-    assert _get_timeout(60) == 30
-    assert _get_timeout(120) == 30
+    assert get_timeout(60) == 30
+    assert get_timeout(120) == 30
 
 
 def test_get_timeout_ignores_invalid_env_var(monkeypatch):
     """Non-numeric UPSTREAM_TIMEOUT falls back to default."""
     import claude_bridge.config as config
-    from claude_bridge.proxy import _get_timeout
+    from claude_bridge.http_client import get_timeout
 
     monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "not-a-number")
-    assert _get_timeout(120) == 120
+    assert get_timeout(120) == 120
 
 
 def test_get_timeout_ignores_zero_and_negative(monkeypatch):
     """Zero or negative UPSTREAM_TIMEOUT falls back to default."""
     import claude_bridge.config as config
-    from claude_bridge.proxy import _get_timeout
+    from claude_bridge.http_client import get_timeout
 
     monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
-    assert _get_timeout(120) == 120
+    assert get_timeout(120) == 120
 
     monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "-5")
-    assert _get_timeout(60) == 60
+    assert get_timeout(60) == 60
 
 
 def test_max_request_body_warns_for_invalid_import_value(monkeypatch):
@@ -711,14 +711,14 @@ def test_max_request_body_warns_for_invalid_import_value(monkeypatch):
 def test_get_timeout_warns_for_nonpositive_values(monkeypatch):
     """Invalid positive syntax and nonpositive timeouts are both diagnosable."""
     import claude_bridge.config as config
+    from claude_bridge.http_client import get_timeout
     from claude_bridge.log import configure_logging
-    from claude_bridge.proxy import _get_timeout
 
     stream = io.StringIO()
     configure_logging(level="WARNING", stream=stream)
     monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
 
-    assert _get_timeout(120) == 120
+    assert get_timeout(120) == 120
 
     assert "Invalid UPSTREAM_TIMEOUT='0', using default 120s" in stream.getvalue()
 
@@ -1105,7 +1105,7 @@ class TestMediaAwareTokenEstimation:
             def emit(self, record: logging.LogRecord) -> None:
                 records.append(record)
 
-        bridge_logger = logging.getLogger("claude_bridge.proxy")
+        bridge_logger = logging.getLogger("claude_bridge.request_view")
         handler = _Capture(level=logging.WARNING)
         previous_level = bridge_logger.level
         bridge_logger.addHandler(handler)
@@ -1522,10 +1522,10 @@ async def test_stream_passthrough_upstream_unavailable_returns_502():
 
 
 def test_retry_request_retries_on_transient_error():
-    """_retry_request retries once on URLError, then succeeds."""
+    """retry_request retries once on URLError, then succeeds."""
     import urllib.error
 
-    from claude_bridge.proxy import _retry_request
+    from claude_bridge.http_client import retry_request
 
     call_count = 0
 
@@ -1536,30 +1536,30 @@ def test_retry_request_retries_on_transient_error():
             raise urllib.error.URLError("Connection reset")
         return 200, b"ok"
 
-    status, body = _retry_request(flaky_fn, retries=1, backoff=0.0)
+    status, body = retry_request(flaky_fn, retries=1, backoff=0.0)
     assert status == 200
     assert body == b"ok"
     assert call_count == 2
 
 
 def test_retry_request_gives_up_after_max_retries():
-    """_retry_request returns error after exhausting retries."""
+    """retry_request returns error after exhausting retries."""
     import urllib.error
 
-    from claude_bridge.proxy import _retry_request
+    from claude_bridge.http_client import retry_request
 
     def always_fails():
         raise urllib.error.URLError("Connection refused")
 
-    status, _body = _retry_request(always_fails, retries=1, backoff=0.0)
+    status, _body = retry_request(always_fails, retries=1, backoff=0.0)
     assert status == 502
 
 
 def test_retry_request_no_retry_on_http_error():
-    """_retry_request does not retry on HTTPError (non-transient)."""
+    """retry_request does not retry on HTTPError (non-transient)."""
     import urllib.error
 
-    from claude_bridge.proxy import _retry_request
+    from claude_bridge.http_client import retry_request
 
     call_count = 0
 
@@ -1574,7 +1574,7 @@ def test_retry_request_no_retry_on_http_error():
             None,  # type: ignore[arg-type]
         )
 
-    status, _body = _retry_request(http_error, retries=1, backoff=0.0)
+    status, _body = retry_request(http_error, retries=1, backoff=0.0)
     assert status == 400
     assert call_count == 1
 

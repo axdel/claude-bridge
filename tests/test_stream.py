@@ -913,10 +913,10 @@ class TestStreamBufferBounding:
 
     @pytest.mark.asyncio
     async def test_aborts_when_unterminated_buffer_exceeds_cap(self, monkeypatch):
-        from claude_bridge.providers import openai as openai_mod
+        from claude_bridge.providers.openai import provider as provider_mod
 
-        monkeypatch.setattr(openai_mod, "_MAX_SSE_BUFFER", 64)
-        provider = openai_mod.OpenAIProvider()
+        monkeypatch.setattr(provider_mod, "_MAX_SSE_BUFFER", 64)
+        provider = provider_mod.OpenAIProvider()
         # Five 32-byte chunks with no "\n\n" → 160 bytes accumulated, never a complete
         # event. Oracle: the cap contract aborts a malformed stream rather than
         # buffering it without limit.
@@ -928,10 +928,10 @@ class TestStreamBufferBounding:
 
     @pytest.mark.asyncio
     async def test_does_not_abort_at_exact_cap(self, monkeypatch):
-        from claude_bridge.providers import openai as openai_mod
+        from claude_bridge.providers.openai import provider as provider_mod
 
-        monkeypatch.setattr(openai_mod, "_MAX_SSE_BUFFER", 64)
-        provider = openai_mod.OpenAIProvider()
+        monkeypatch.setattr(provider_mod, "_MAX_SSE_BUFFER", 64)
+        provider = provider_mod.OpenAIProvider()
         # Exactly cap bytes, still unterminated: the bound is exclusive, so this must
         # NOT abort — kills the > vs >= off-by-one on the cap check. Garbage bytes
         # parse to zero events at the tail; the assertion is the absence of a raise.

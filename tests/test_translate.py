@@ -10,7 +10,7 @@ from claude_bridge.providers.openai import (
     anthropic_to_openai,
     openai_to_anthropic,
 )
-from claude_bridge.proxy import estimate_input_tokens
+from claude_bridge.request_view import estimate_input_tokens
 
 # A provider/auth mode that declares the full image+document input surface.
 # Built locally (not imported) so these behavior tests stay independent of any
@@ -236,9 +236,9 @@ class TestAnthropicToOpenaiStripping:
 
     def test_thinking_stripped_when_drop_mode(self, monkeypatch):
         """Thinking config stripped when REASONING_MODE=drop."""
-        import claude_bridge.providers.openai as oai_mod
+        import claude_bridge.providers.openai.translate as oai_translate
 
-        monkeypatch.setattr(oai_mod, "_REASONING_MODE", "drop")
+        monkeypatch.setattr(oai_translate, "_REASONING_MODE", "drop")
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -358,9 +358,9 @@ class TestThinkingBlockPassthrough:
 
     def test_thinking_block_dropped_in_drop_mode(self, monkeypatch):
         """In drop mode, thinking blocks become empty text."""
-        import claude_bridge.providers.openai as oai_mod
+        import claude_bridge.providers.openai.translate as oai_translate
 
-        monkeypatch.setattr(oai_mod, "_REASONING_MODE", "drop")
+        monkeypatch.setattr(oai_translate, "_REASONING_MODE", "drop")
         request = {
             "model": "claude-opus-4-6",
             "messages": [
