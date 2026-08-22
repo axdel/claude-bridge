@@ -2518,3 +2518,410 @@ async def test_forward_via_provider_overflow_returns_anthropic_error(http_client
     assert "400000" in response["error"]["message"]
     # The raw OpenAI envelope must NOT leak through.
     assert "error" not in json.loads(body).get("error", {})
+
+
+# ---------------------------------------------------------------------------
+# Reactive 401 refresh + retry: a bearer rejected upstream (rotated/expired since
+# the proactive check) triggers exactly ONE forced credential refresh and retry,
+# before any downstream byte — sync (_forward_via_provider) and stream paths alike.
+# ---------------------------------------------------------------------------
+
+
+_REAUTH_JSON_PAYLOAD = json.dumps(
+    {
+        "id": "reauth-1",
+        "model": "reauth-model",
+        "text": "fresh-bearer response",
+        "finish_reason": "end_turn",
+        "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+    }
+).encode()
+
+
+class _Json200IfFreshHandler(BaseHTTPRequestHandler):
+    """JSON 200 iff the request carries the refreshed bearer, else 401.
+
+    Models a credential the upstream rejects until a reactive refresh replaces it, so a
+    200 here can only mean the retry forwarded the fresh bearer.
+    """
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.headers.get("Authorization") == "Bearer fresh-token":
+            body, code = _REAUTH_JSON_PAYLOAD, 200
+        else:
+            body, code = b'{"error": {"message": "unauthorized"}}', 401
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _Json401Handler(BaseHTTPRequestHandler):
+    """Always 401 — even the refreshed bearer is rejected, so the retry cannot recover."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = b'{"error": {"message": "still unauthorized"}}'
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _Sse200IfFreshHandler(BaseHTTPRequestHandler):
+    """SSE 200 iff the request carries the refreshed bearer, else a JSON 401."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.headers.get("Authorization") == "Bearer fresh-token":
+            body = b"data: {}\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+        else:
+            body = b'{"error": {"message": "unauthorized"}}'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _Sse401Handler(BaseHTTPRequestHandler):
+    """Always 401 on the streaming open — the retry cannot recover."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = b'{"error": {"message": "still unauthorized"}}'
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _ReauthProviderBase:
+    """Shared credential behaviour: a stale bearer first, the fresh one only on a forced refresh.
+
+    Records how many times ``authenticate`` ran and how many of those were forced, so a test
+    can assert the retry fired exactly once and only in reaction to a 401.
+    """
+
+    def __init__(self, endpoint: str, *, fail_force_refresh: bool = False) -> None:
+        self.endpoint = endpoint
+        self.fail_force_refresh = fail_force_refresh
+        self.auth_calls = 0
+        self.force_refresh_calls = 0
+
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
+        self.auth_calls += 1
+        if force_refresh:
+            self.force_refresh_calls += 1
+            if self.fail_force_refresh:
+                raise RuntimeError("reactive refresh failed")
+            return {"Authorization": "Bearer fresh-token"}
+        return {"Authorization": "Bearer stale-token"}
+
+
+class _ReauthJsonProvider(_ReauthProviderBase):
+    """JSON-sync provider whose credential is rejected until a reactive refresh."""
+
+    name = "reauth-json"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="json",
+    )
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        return {"prompt": anthropic_req["messages"][0]["content"]}, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return {
+            "id": f"msg_{provider_resp['id']}",
+            "type": "message",
+            "role": "assistant",
+            "model": provider_resp["model"],
+            "stop_reason": provider_resp["finish_reason"],
+            "content": [{"type": "text", "text": provider_resp["text"]}],
+            "usage": {
+                "input_tokens": provider_resp["usage"]["prompt_tokens"],
+                "output_tokens": provider_resp["usage"]["completion_tokens"],
+            },
+        }
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        if False:
+            yield {}
+
+
+class _ReauthStreamProvider(_ReauthProviderBase):
+    """SSE provider mirroring _ReauthJsonProvider's credential behaviour for the stream path."""
+
+    name = "reauth-stream"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+    )
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        return {"model": anthropic_req["model"], "input": []}, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return provider_resp
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        async for _chunk in raw_chunks:
+            pass
+        for event in _text_stream_events():
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_forward_reactive_401_refreshes_and_retries(http_client):
+    """A provider 401 triggers one forced refresh and a retry; the fresh bearer succeeds."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _Json200IfFreshHandler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    provider = _ReauthJsonProvider(f"http://127.0.0.1:{port}/v1/messages")
+    try:
+        status, body = await _forward_via_provider(
+            provider, _anthropic_request_bytes(), http_client
+        )
+    finally:
+        server.shutdown()
+
+    # Oracle: the mock returns 200 ONLY for the refreshed bearer, so a 200 here proves the
+    # 401 drove a forced refresh AND the retry forwarded the fresh credential.
+    assert status == 200
+    assert json.loads(body)["content"][0]["text"] == "fresh-bearer response"
+    assert provider.auth_calls == 2
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_reactive_401_retries_exactly_once(http_client):
+    """When even the refreshed bearer is rejected, the 401 is surfaced after ONE retry."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _Json401Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    provider = _ReauthJsonProvider(f"http://127.0.0.1:{port}/v1/messages")
+    try:
+        status, _body = await _forward_via_provider(
+            provider, _anthropic_request_bytes(), http_client
+        )
+    finally:
+        server.shutdown()
+
+    # Oracle: exactly one forced refresh (no unbounded loop), and the 401 is surfaced.
+    assert status == 401
+    assert provider.auth_calls == 2
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_reactive_401_reauth_failure_returns_502(http_client):
+    """If the reactive refresh itself fails, the request returns 502, not the raw 401."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _Json401Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    provider = _ReauthJsonProvider(f"http://127.0.0.1:{port}/v1/messages", fail_force_refresh=True)
+    try:
+        status, body = await _forward_via_provider(
+            provider, _anthropic_request_bytes(), http_client
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 502
+    assert json.loads(body)["type"] == "error"
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_no_401_does_not_force_refresh(_json_provider_mock, http_client):
+    """A first-try 200 never triggers a reactive refresh (retry fires only on a 401)."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    provider = _ReauthJsonProvider(_json_provider_mock)
+    status, _body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
+
+    assert status == 200
+    assert provider.auth_calls == 1
+    assert provider.force_refresh_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_reactive_401_refreshes_and_retries():
+    """A streaming 401 on open triggers one forced refresh and a retry before any SSE byte."""
+    from claude_bridge.proxy import _make_handler
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    provider_port = _find_free_port()
+    provider_server = HTTPServer(("127.0.0.1", provider_port), _Sse200IfFreshHandler)
+    Thread(target=provider_server.serve_forever, daemon=True).start()
+    provider = _ReauthStreamProvider(f"http://127.0.0.1:{provider_port}/v1/responses")
+    client = create_client()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats(), client=client)
+    proxy_port = _find_free_port()
+    proxy_server = await asyncio.start_server(handler, "127.0.0.1", proxy_port)
+    try:
+        status, raw = await asyncio.to_thread(
+            _http_post_stream_raw,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+        await client.aclose()
+        provider_server.shutdown()
+
+    # Oracle: a 200 SSE stream is reachable only with the refreshed bearer, so the client
+    # receiving message_start proves the reactive refresh + retry happened before any byte.
+    assert status == 200
+    assert b"event: message_start" in raw
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_reactive_401_retries_once_then_surfaces_401():
+    """A refreshed bearer that is also rejected surfaces the 401 after ONE retry — never a
+    committed SSE 200."""
+    from claude_bridge.proxy import _make_handler
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    provider_port = _find_free_port()
+    provider_server = HTTPServer(("127.0.0.1", provider_port), _Sse401Handler)
+    Thread(target=provider_server.serve_forever, daemon=True).start()
+    provider = _ReauthStreamProvider(f"http://127.0.0.1:{provider_port}/v1/responses")
+    client = create_client()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats(), client=client)
+    proxy_port = _find_free_port()
+    proxy_server = await asyncio.start_server(handler, "127.0.0.1", proxy_port)
+    try:
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+        await client.aclose()
+        provider_server.shutdown()
+
+    assert status == 401
+    assert data["type"] == "error"
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_reactive_401_reauth_failure_returns_502():
+    """If the reactive refresh fails mid-stream-open, the client gets 502 before any SSE byte."""
+    from claude_bridge.proxy import _make_handler
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    provider_port = _find_free_port()
+    provider_server = HTTPServer(("127.0.0.1", provider_port), _Sse401Handler)
+    Thread(target=provider_server.serve_forever, daemon=True).start()
+    provider = _ReauthStreamProvider(
+        f"http://127.0.0.1:{provider_port}/v1/responses", fail_force_refresh=True
+    )
+    client = create_client()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats(), client=client)
+    proxy_port = _find_free_port()
+    proxy_server = await asyncio.start_server(handler, "127.0.0.1", proxy_port)
+    try:
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+        await client.aclose()
+        provider_server.shutdown()
+
+    assert status == 502
+    assert data["type"] == "error"
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_open_stream_with_reauth_transport_error_after_refresh_returns_502(monkeypatch):
+    """A refreshed re-open that hits a transport error returns 502 before any SSE byte.
+
+    A transport failure on the SECOND open is not reproducible with a real socket (the
+    server cannot fail exactly one of two attempts), so the failure is injected at the
+    ``open_stream`` transport seam — the thin adapter over ``client.send``.
+    """
+    import claude_bridge.proxy_streaming as ps
+    from claude_bridge.proxy_streaming import _open_stream_with_reauth
+    from claude_bridge.wire import StreamOutcome
+
+    calls = {"n": 0}
+
+    async def _fake_open_stream(client, url, *, content, headers, retries=1):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(401, headers={"content-type": "application/json"}, content=b"{}")
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(ps, "open_stream", _fake_open_stream)
+
+    provider = _ReauthStreamProvider("http://unused")
+    writer = _RecordingWriter()
+    outcome = await _open_stream_with_reauth(
+        provider,
+        {"model": "m", "input": []},
+        {"Authorization": "Bearer stale-token"},
+        cast(asyncio.StreamWriter, writer),
+        cast(httpx.AsyncClient, None),
+    )
+
+    # Oracle: 401 on open drove exactly one forced refresh + one re-open; the re-open's
+    # transport error becomes a 502 written before any SSE byte, never a raised exception.
+    assert isinstance(outcome, StreamOutcome)
+    assert outcome.status == 502
+    assert provider.force_refresh_calls == 1
+    assert calls["n"] == 2
+    assert bytes(writer.buffer).startswith(b"HTTP/1.1 502 Bad Gateway")

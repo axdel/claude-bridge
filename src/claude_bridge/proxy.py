@@ -490,6 +490,24 @@ async def _forward_via_provider(
         client, provider.endpoint, translated, auth_headers
     )
     logger.info("Provider response: %d (%dB)", status_code, len(raw_response))
+
+    # A 401 means the bearer was rejected upstream — rotated or expired between our proactive
+    # expiry check and this call. Force one credential refresh and retry the POST exactly once,
+    # before any downstream output; the fresh bearer may succeed where the stale one failed. The
+    # x-grok-req-id contextvar is unchanged across the retry, so the upstream can dedup it against
+    # the first attempt. A failing refresh becomes a 502 (the 401 is not the client's to see).
+    if status_code == 401:
+        logger.warning("Provider returned 401; forcing a credential refresh and retrying once")
+        try:
+            auth_headers = await provider.authenticate(force_refresh=True)
+        except Exception:
+            logger.exception("Reactive credential refresh failed")
+            return 502, anthropic_error_body(502, "Provider preflight failed")
+        status_code, raw_response = await post_provider(
+            client, provider.endpoint, translated, auth_headers
+        )
+        logger.info("Provider response after refresh: %d (%dB)", status_code, len(raw_response))
+
     if status_code != 200:
         logger.error("Provider HTTP %d: %s", status_code, provider_error_log_summary(raw_response))
         return status_code, anthropic_error_body(status_code, provider_error_message(raw_response))

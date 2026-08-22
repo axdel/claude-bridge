@@ -368,6 +368,53 @@ async def _pump_provider_stream(
     return StreamOutcome(200, tokens_in, tokens_out, error=not saw_terminal)
 
 
+async def _open_stream_with_reauth(
+    provider: Provider,
+    translated: dict,
+    auth_headers: dict[str, str],
+    writer: asyncio.StreamWriter,
+    client: httpx.AsyncClient,
+) -> httpx.Response | StreamOutcome:
+    """Open the provider stream, retrying once with a refreshed credential on a 401.
+
+    A 401 before any SSE byte means the bearer was rejected upstream — rotated or expired since
+    our proactive expiry check. Drain the rejected response, force ONE credential refresh, and
+    re-open the stream exactly once, all before any downstream output, so the client never sees
+    the transient 401. The x-grok-req-id contextvar is unchanged across the retry, letting the
+    upstream dedup it against the first attempt. Returns the open response for the caller to
+    validate and pump, or a ``StreamOutcome`` when the connection or the refresh itself failed
+    (a 502 already written to the client).
+    """
+    content = json.dumps(translated).encode()
+    try:
+        response = await open_stream(
+            client, provider.endpoint, content=content, headers=auth_headers
+        )
+    except httpx.TransportError as exc:
+        logger.error("Provider connection error: %s", exc)
+        write_response(writer, 502, anthropic_error_body(502, "provider unavailable"))
+        return StreamOutcome(502)
+
+    if response.status_code != 401:
+        return response
+
+    # 401 before any SSE byte: close the rejected response, force one refresh, re-open once.
+    await response.aclose()
+    logger.warning("Provider returned 401 on stream open; forcing a refresh and retrying once")
+    try:
+        auth_headers = await provider.authenticate(force_refresh=True)
+    except Exception:
+        logger.exception("Reactive credential refresh failed")
+        write_response(writer, 502, anthropic_error_body(502, "Provider preflight failed"))
+        return StreamOutcome(502)
+    try:
+        return await open_stream(client, provider.endpoint, content=content, headers=auth_headers)
+    except httpx.TransportError as exc:
+        logger.error("Provider connection error after refresh: %s", exc)
+        write_response(writer, 502, anthropic_error_body(502, "provider unavailable"))
+        return StreamOutcome(502)
+
+
 async def stream_via_provider(
     provider: Provider,
     body: bytes,
@@ -376,8 +423,9 @@ async def stream_via_provider(
 ) -> StreamOutcome:
     """Translate a request, stream from the provider, translate SSE back to Anthropic.
 
-    Orchestrates preflight (parse/auth/translate), opening the stream, validating the
-    response before any downstream byte, and pumping the translated events.
+    Orchestrates preflight (parse/auth/translate), opening the stream (with one reactive
+    401 refresh + retry), validating the response before any downstream byte, and pumping
+    the translated events.
     """
     prepared = await _prepare_provider_stream(provider, body, writer)
     if isinstance(prepared, StreamOutcome):
@@ -389,17 +437,10 @@ async def stream_via_provider(
         translated.get("model"),
         len(translated.get("input", [])),
     )
-    try:
-        response = await open_stream(
-            client,
-            provider.endpoint,
-            content=json.dumps(translated).encode(),
-            headers=auth_headers,
-        )
-    except httpx.TransportError as exc:
-        logger.error("Provider connection error: %s", exc)
-        write_response(writer, 502, anthropic_error_body(502, "provider unavailable"))
-        return StreamOutcome(502)
+    opened = await _open_stream_with_reauth(provider, translated, auth_headers, writer, client)
+    if isinstance(opened, StreamOutcome):
+        return opened
+    response = opened
 
     guard = await validate_stream_response(response, writer)
     if guard is not None:
