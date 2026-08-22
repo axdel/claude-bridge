@@ -2,27 +2,45 @@
 
 from __future__ import annotations
 
+import pytest
 
-def test_upstream_timeout_defaults_and_env_override(monkeypatch):
-    """UPSTREAM_TIMEOUT is read at call time and falls back for invalid values."""
+
+@pytest.mark.parametrize(
+    ("accessor_name", "env_name", "default"),
+    [
+        ("connect_timeout", "CONNECT_TIMEOUT_ENV", 10.0),
+        ("stream_idle_timeout", "STREAM_IDLE_TIMEOUT_ENV", 300.0),
+        ("pool_idle", "POOL_IDLE_ENV", 90.0),
+    ],
+)
+def test_positive_float_timeout_accessor_default_override_and_invalid_fallback(
+    monkeypatch, accessor_name, env_name, default
+):
+    """Each HTTP/2 timeout accessor returns its spec default, honors a positive override,
+    and falls back (invoking on_invalid) for unparseable or non-positive values."""
     import claude_bridge.config as config
 
-    monkeypatch.delenv(config.UPSTREAM_TIMEOUT_ENV, raising=False)
-    assert config.upstream_timeout(60) == 60
-    assert config.upstream_timeout(120) == 120
+    accessor = getattr(config, accessor_name)
+    env_var = getattr(config, env_name)
 
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "30")
-    assert config.upstream_timeout(60) == 30
-    assert config.upstream_timeout(120) == 30
+    monkeypatch.delenv(env_var, raising=False)
+    assert accessor() == default
+
+    monkeypatch.setenv(env_var, "42.5")
+    assert accessor() == 42.5
 
     invalid_values: list[str] = []
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "not-a-number")
-    assert config.upstream_timeout(120, on_invalid=invalid_values.append) == 120
+    monkeypatch.setenv(env_var, "not-a-number")
+    assert accessor(on_invalid=invalid_values.append) == default
     assert invalid_values == ["not-a-number"]
 
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
-    assert config.upstream_timeout(120, on_invalid=invalid_values.append) == 120
+    monkeypatch.setenv(env_var, "0")
+    assert accessor(on_invalid=invalid_values.append) == default
     assert invalid_values == ["not-a-number", "0"]
+
+    monkeypatch.setenv(env_var, "-5")
+    assert accessor(on_invalid=invalid_values.append) == default
+    assert invalid_values == ["not-a-number", "0", "-5"]
 
 
 def test_max_request_body_default_and_override(monkeypatch):

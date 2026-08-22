@@ -101,3 +101,23 @@ class Provider(Protocol):
 
 # Provider registry — concrete implementations added in later tasks.
 PROVIDERS: dict[str, type[Provider]] = {}
+
+
+def provider_capabilities(provider: Provider) -> ProviderCapabilities:
+    """Return validated provider capabilities or raise a provider-named error.
+
+    Guards the proxy against a dynamically authored provider (e.g. a test double)
+    that omits or mis-declares ``capabilities`` before the transport layer reads it.
+    """
+    provider_name = getattr(provider, "name", type(provider).__name__)
+    capabilities = getattr(provider, "capabilities", None)
+    if not isinstance(capabilities, ProviderCapabilities):
+        msg = f"Provider '{provider_name}' declares invalid capabilities"
+        raise ValueError(msg)
+    return capabilities
+
+
+def validate_provider(provider: Provider) -> Provider:
+    """Validate proxy-visible provider contract fields before caching or serving."""
+    provider_capabilities(provider)
+    return provider

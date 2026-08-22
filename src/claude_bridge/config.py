@@ -14,13 +14,15 @@ from pathlib import Path
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 REASONING_MODE_ENV = "REASONING_MODE"
 LOG_LEVEL_ENV = "LOG_LEVEL"
-UPSTREAM_TIMEOUT_ENV = "UPSTREAM_TIMEOUT"
 MAX_REQUEST_BODY_ENV = "MAX_REQUEST_BODY"
 LLM_BRIDGE_FALLBACK_ENV = "LLM_BRIDGE_FALLBACK"
 ANTHROPIC_REAL_URL_ENV = "ANTHROPIC_REAL_URL"
 CLAUDE_BRIDGE_TRACE_PATH_ENV = "CLAUDE_BRIDGE_TRACE_PATH"
 XAI_MODEL_ENV = "XAI_MODEL"
 XAI_CLIENT_VERSION_ENV = "XAI_CLIENT_VERSION"
+CONNECT_TIMEOUT_ENV = "CONNECT_TIMEOUT"
+STREAM_IDLE_TIMEOUT_ENV = "STREAM_IDLE_TIMEOUT"
+POOL_IDLE_ENV = "POOL_IDLE"
 
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_ANTHROPIC_REAL_URL = "https://api.anthropic.com"
@@ -32,6 +34,15 @@ DEFAULT_REASONING_MODE = "passthrough"
 # a known model version; if the id is later deprecated (as `grok-4.20` was), reverting to
 # `grok-build` is a one-line change. Supersedes D-XAI-008. Override per run with XAI_MODEL.
 DEFAULT_XAI_MODEL = "grok-4.6"
+
+# HTTP/2 transport split timeouts (seconds). A single urllib socket timeout fired on
+# every recv and killed long-thinking grok-4.6 streams at ~120s; these separate
+# connection setup from per-chunk stream idle, so a healthy stream runs as long as
+# chunks keep arriving within DEFAULT_STREAM_IDLE_TIMEOUT. DEFAULT_POOL_IDLE overrides
+# httpx's 5s keepalive_expiry (grok-build holds an idle connection ~90s).
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_STREAM_IDLE_TIMEOUT = 300.0
+DEFAULT_POOL_IDLE = 90.0
 
 # cli-chat-proxy.grok.com answers HTTP 426 below this x-grok-client-version; the
 # resolver never sends a header older than this floor. Bundle dir layout:
@@ -63,17 +74,24 @@ def log_level(explicit_level: str | None = None) -> str:
     return explicit_level or os.environ.get(LOG_LEVEL_ENV, DEFAULT_LOG_LEVEL)
 
 
-def upstream_timeout(
-    default: int,
+def _positive_env_number[NumT: (int, float)](
+    name: str,
+    default: NumT,
     *,
+    cast: Callable[[str], NumT],
     on_invalid: Callable[[str], None] | None = None,
-) -> int:
-    """Return the positive UPSTREAM_TIMEOUT override or the caller's default."""
-    raw = os.environ.get(UPSTREAM_TIMEOUT_ENV)
+) -> NumT:
+    """Return a positive numeric env override parsed by *cast*, else *default*.
+
+    Shared validation for every positive-number setting: a missing var yields the
+    default silently; a present-but-invalid value (unparseable, or not > 0) invokes
+    *on_invalid* and falls back to the default.
+    """
+    raw = os.environ.get(name)
     if raw is None:
         return default
     try:
-        value = int(raw)
+        value = cast(raw)
     except (ValueError, TypeError):
         if on_invalid is not None:
             on_invalid(raw)
@@ -90,20 +108,40 @@ def max_request_body(
     on_invalid: Callable[[str], None] | None = None,
 ) -> int:
     """Return the positive request body limit in bytes, or the default when invalid."""
-    raw = os.environ.get(MAX_REQUEST_BODY_ENV)
-    if raw is None:
-        return DEFAULT_MAX_REQUEST_BODY
-    try:
-        value = int(raw)
-    except (ValueError, TypeError):
-        if on_invalid is not None:
-            on_invalid(raw)
-        return DEFAULT_MAX_REQUEST_BODY
-    if value <= 0:
-        if on_invalid is not None:
-            on_invalid(raw)
-        return DEFAULT_MAX_REQUEST_BODY
-    return value
+    return _positive_env_number(
+        MAX_REQUEST_BODY_ENV, DEFAULT_MAX_REQUEST_BODY, cast=int, on_invalid=on_invalid
+    )
+
+
+def connect_timeout(*, on_invalid: Callable[[str], None] | None = None) -> float:
+    """Return the positive CONNECT_TIMEOUT override (seconds) or the default."""
+    return _positive_env_number(
+        CONNECT_TIMEOUT_ENV, DEFAULT_CONNECT_TIMEOUT, cast=float, on_invalid=on_invalid
+    )
+
+
+def stream_idle_timeout(*, on_invalid: Callable[[str], None] | None = None) -> float:
+    """Return the positive STREAM_IDLE_TIMEOUT override (seconds) or the default.
+
+    httpx's per-read (per-chunk) timeout on a streaming response — the gap a stream
+    may sit idle *between* chunks, NOT a cap on total stream duration.
+    """
+    return _positive_env_number(
+        STREAM_IDLE_TIMEOUT_ENV, DEFAULT_STREAM_IDLE_TIMEOUT, cast=float, on_invalid=on_invalid
+    )
+
+
+def pool_idle(*, on_invalid: Callable[[str], None] | None = None) -> float:
+    """Return the positive POOL_IDLE override (seconds) or the default.
+
+    Maps to httpx ``Limits(keepalive_expiry=...)``: how long an idle keep-alive
+    connection is reused before being dropped. httpx defaults to 5s; upstreams like
+    grok-build hold ~90s, so the default is raised to match — a 5s expiry would
+    reconnect constantly and forfeit the HTTP/2 multiplex benefit.
+    """
+    return _positive_env_number(
+        POOL_IDLE_ENV, DEFAULT_POOL_IDLE, cast=float, on_invalid=on_invalid
+    )
 
 
 def fallback_chain() -> list[str]:

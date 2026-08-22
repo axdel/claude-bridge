@@ -44,14 +44,22 @@ class BridgeStats:
         latency_ms: float,
         tokens_in: int,
         tokens_out: int,
+        *,
+        error: bool = False,
     ) -> None:
-        """Record a completed upstream/provider response."""
+        """Record a completed upstream/provider response.
+
+        ``error`` flags a semantic failure the outer status cannot express — a streamed
+        response the client received as HTTP 200 that then truncated or carried a
+        provider error event. A 5xx status counts as an error too; the two never
+        double-count (one increment per response).
+        """
         with self._lock:
             self._upstream_attempts += 1
             self._latency_total_ms += latency_ms
             self._tokens_in += tokens_in
             self._tokens_out += tokens_out
-            if status_code >= 500:
+            if status_code >= 500 or error:
                 self._errors_total += 1
 
     def record_failover(self) -> None:
