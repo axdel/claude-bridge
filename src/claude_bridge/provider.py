@@ -75,8 +75,14 @@ class Provider(Protocol):
     endpoint: str
     capabilities: ProviderCapabilities
 
-    async def authenticate(self) -> dict[str, str]:
-        """Return headers required to authenticate with this provider."""
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
+        """Return headers required to authenticate with this provider.
+
+        Args:
+            force_refresh: Force a credential refresh regardless of proactive expiry —
+                the reactive path the proxy takes after an upstream 401, before any
+                downstream byte. Default False resolves the credential normally.
+        """
         ...
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:

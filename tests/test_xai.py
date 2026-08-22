@@ -327,6 +327,26 @@ class TestGetXaiBearerToken:
         assert result == new_token
 
     @pytest.mark.asyncio
+    async def test_force_refresh_refreshes_even_a_proactively_valid_token(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Reactive entry point: a token that passes the proactive expiry check was still
+        # rejected upstream (401). force_refresh=True bypasses the fast path and drives a
+        # real refresh (threading the rejected token through as stale_token so the
+        # double-check does not hand it back), returning a genuinely new bearer. Fails
+        # against code that ignores force_refresh (returns the still-valid on-disk token).
+        new_token = _make_jwt({"exp": time.time() + 7200})
+        data = _grok_auth()  # default entry: far-future exp -> proactively valid
+        auth_file = _write_grok_auth(tmp_path, data)
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 7200}),
+        )
+        result = await get_xai_bearer_token(auth_file, force_refresh=True)
+        assert result == new_token
+        assert result != data[_ENTRY_KEY]["key"]
+
+    @pytest.mark.asyncio
     async def test_expired_no_refresh_token_raises(self, tmp_path: Path):
         data = _grok_auth(
             {
@@ -806,6 +826,63 @@ class TestCrossProcessRefreshLock:
             fcntl.flock(probe_fd, fcntl.LOCK_UN)
         finally:
             os.close(probe_fd)
+
+    @pytest.mark.asyncio
+    async def test_reactive_refresh_posts_when_ondisk_is_the_rejected_token(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Reactive 401 path: the on-disk token passes the proactive expiry check yet
+        # upstream just rejected it. Passing it as ``stale_token`` must force the POST —
+        # the double-check may NOT short-circuit on "looks valid" and hand the rejected
+        # credential straight back. Oracle: the mocked refresh returns a new token, so a
+        # correct force yields it; a double-check that ignores stale_token returns the
+        # rejected one and fails. Kills a dropped ``!= stale_token`` clause and its flip.
+        rejected = _make_jwt({"exp": time.time() + 3600})
+        new_token = _make_jwt({"exp": time.time() + 7200})
+        auth_file = _write_grok_auth(
+            tmp_path, _grok_auth({"key": rejected, "expires_at": _iso(time.time() + 3600)})
+        )
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 7200}),
+        )
+        returned = await refresh_xai_token(
+            _ENTRY_KEY,
+            "refresh-original",
+            _CLIENT_ID,
+            auth_path=auth_file,
+            stale_token=rejected,
+        )
+        assert returned == new_token
+
+    @pytest.mark.asyncio
+    async def test_reactive_refresh_skips_when_a_peer_already_rotated(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # A peer claude-grok refreshed while we waited for the lock: the on-disk token
+        # DIFFERS from the one we rejected and is valid. The double-check must return the
+        # peer's fresh token and skip the POST — our own refresh_token may be the
+        # single-use one the peer already consumed. Oracle: urlopen must never fire, and
+        # the returned token is the peer's. Kills a mutant that unconditionally POSTs in
+        # reactive mode (which would call _boom).
+        rejected = _make_jwt({"exp": time.time() + 3600})
+        peer_token = _make_jwt({"exp": time.time() + 7200})
+        auth_file = _write_grok_auth(
+            tmp_path, _grok_auth({"key": peer_token, "expires_at": _iso(time.time() + 3600)})
+        )
+
+        def _boom(*a, **kw):
+            raise AssertionError("refresh POST fired though a peer already rotated the token")
+
+        monkeypatch.setattr("urllib.request.urlopen", _boom)
+        returned = await refresh_xai_token(
+            _ENTRY_KEY,
+            "refresh-original",
+            _CLIENT_ID,
+            auth_path=auth_file,
+            stale_token=rejected,
+        )
+        assert returned == peer_token
 
 
 # --- import decode_jwt_exp used to keep the oracle honest (no unused import) ---

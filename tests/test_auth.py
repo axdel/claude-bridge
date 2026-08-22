@@ -149,6 +149,39 @@ class TestGetBearerToken:
         assert result == token
 
     @pytest.mark.asyncio
+    async def test_force_refresh_refreshes_even_a_valid_token(self, monkeypatch, tmp_path: Path):
+        """Reactive 401 parity with xAI: a proactively-valid Codex token that upstream
+        rejected must be force-refreshed, not returned as-is. Oracle: the mocked refresh
+        returns a new access_token; force yields it, a no-op returns the old one."""
+        valid_token = _make_jwt({"exp": time.time() + 3600})
+        new_token = _make_jwt({"exp": time.time() + 7200})
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": valid_token,
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+
+        class _FakeResp:
+            def __init__(self) -> None:
+                self._data = json.dumps({"access_token": new_token}).encode()
+
+            def read(self) -> bytes:
+                return self._data
+
+            def __enter__(self) -> _FakeResp:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: _FakeResp())
+        result = await get_bearer_token(auth_file, force_refresh=True)
+        assert result == new_token
+
+    @pytest.mark.asyncio
     async def test_malformed_stored_token_raises_value_error(self, tmp_path: Path):
         """Malformed access_token in auth.json raises ValueError from is_token_expired."""
         auth_data = {

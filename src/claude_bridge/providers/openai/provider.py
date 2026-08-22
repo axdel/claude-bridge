@@ -90,8 +90,14 @@ class OpenAIProvider:
         self._reasoning_by_call_id: dict[str, dict] = {}
         self._reasoning_lock = threading.Lock()
 
-    async def authenticate(self) -> dict[str, str]:
-        """Return Authorization header with a valid bearer token."""
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
+        """Return Authorization header with a valid bearer token.
+
+        Args:
+            force_refresh: Force a token refresh regardless of proactive expiry — the
+                reactive path after an upstream 401. A no-op in api_key mode (a static
+                key has nothing to refresh); forwarded to ``get_bearer_token`` otherwise.
+        """
         if self.auth_mode == "api_key":
             if not self._api_key:
                 msg = (
@@ -100,7 +106,7 @@ class OpenAIProvider:
                 )
                 raise ValueError(msg)
             return {"Authorization": f"Bearer {self._api_key}"}
-        token = await get_bearer_token(self._auth_path)
+        token = await get_bearer_token(self._auth_path, force_refresh=force_refresh)
         return {"Authorization": f"Bearer {token}"}
 
     def _stash_reasoning(self, associations: dict[str, dict]) -> None:

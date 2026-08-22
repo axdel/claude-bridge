@@ -48,18 +48,23 @@ def read_codex_auth(path: Path | None = None) -> dict:
 _refresh_lock = asyncio.Lock()
 
 
-async def get_bearer_token(auth_path: Path | None = None) -> str:
+async def get_bearer_token(auth_path: Path | None = None, *, force_refresh: bool = False) -> str:
     """Return a valid access token, refreshing if expired.
 
     Uses an asyncio.Lock to prevent concurrent refresh stampede — multiple
     callers with expired tokens share a single refresh operation.
+
+    Args:
+        force_refresh: Force a refresh regardless of the proactive expiry check —
+            the reactive path after an upstream 401 rejects a token that still looks
+            unexpired. Default False keeps proactive behavior (refresh only on expiry).
     """
     async with _refresh_lock:
         data = read_codex_auth(auth_path)
         tokens = data.get("tokens", data)  # support both nested and flat structures
         token = tokens["access_token"]
 
-        if not is_token_expired(token):
+        if not force_refresh and not is_token_expired(token):
             return token
 
         new_token = await refresh_access_token(tokens["refresh_token"], auth_path=auth_path)

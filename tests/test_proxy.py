@@ -391,7 +391,7 @@ class _FakeOpenAIProvider:
     def __init__(self, endpoint: str) -> None:
         self.endpoint = endpoint
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {"Authorization": "Bearer fake-token"}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -732,7 +732,7 @@ class _BrokenProvider:
         sync_response_mode="sse",
     )
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -1166,7 +1166,7 @@ class _StreamModeProvider:
             sync_response_mode="sse",
         )
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -1387,7 +1387,7 @@ class _StreamFailureProvider:
         sync_response_mode="sse",
     )
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -2103,7 +2103,7 @@ class _FailingAuthProvider:
         sync_response_mode="json",
     )
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         raise ValueError("missing provider token")
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -2150,7 +2150,7 @@ class _JsonSyncProvider:
         self.translated_responses: list[dict] = []
         self.stream_calls = 0
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {"Authorization": "Bearer json-token"}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:

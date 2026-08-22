@@ -180,7 +180,9 @@ def _cross_process_refresh_lock(auth_dir: Path):
         os.close(fd)
 
 
-async def get_xai_bearer_token(auth_path: Path | None = None) -> str:
+async def get_xai_bearer_token(
+    auth_path: Path | None = None, *, force_refresh: bool = False
+) -> str:
     """Return a valid xAI bearer, refreshing via OIDC if expired.
 
     Serializes concurrent refreshes at two levels: an ``asyncio.Lock`` within one
@@ -189,19 +191,25 @@ async def get_xai_bearer_token(auth_path: Path | None = None) -> str:
     single refresh instead of stampeding the endpoint and burning the single-use
     refresh_token.
 
-    Note: refresh is *proactive* (expiry checked before each request). There is
-    no reactive refresh-on-401 — a token expiring mid-flight surfaces as an
-    upstream auth error, recovered on the next request cycle.
+    Refresh is proactive by default (expiry checked before each request). Pass
+    ``force_refresh=True`` for the reactive path — after an upstream 401 — which
+    bypasses the proactive check and drives a refresh even for a token that still
+    looks unexpired, threading the rejected token through as ``stale_token`` so a
+    peer's freshly-rotated token is honored but the rejected one is never returned.
+
+    Args:
+        force_refresh: Force a refresh regardless of the proactive expiry check
+            (reactive 401 recovery). Default ``False`` keeps proactive behavior.
 
     Raises:
         FileNotFoundError / ValueError: Propagated from ``read_xai_auth`` /
-            ``refresh_xai_token``; also raised if the token is expired and no
-            refresh token is present.
+            ``refresh_xai_token``; also raised if the token is expired (or a refresh
+            is forced) and no refresh token is present.
     """
     async with _xai_refresh_lock:
         entry_key, entry = read_xai_auth(auth_path)
         token = entry.get("key")
-        if isinstance(token, str) and not _xai_token_expired(entry):
+        if not force_refresh and isinstance(token, str) and not _xai_token_expired(entry):
             return _validated_bearer(token)
 
         refresh_token = entry.get("refresh_token")
@@ -213,11 +221,16 @@ async def get_xai_bearer_token(auth_path: Path | None = None) -> str:
             raise ValueError(msg)
 
         client_id = entry.get("oidc_client_id") or entry_key.split("::", 1)[-1]
+        # A forced refresh passes the (still-valid-looking but upstream-rejected) token
+        # as stale_token so refresh_xai_token's double-check does not hand it back.
+        stale_token = token if (force_refresh and isinstance(token, str)) else None
         # Issuer is PINNED to _XAI_ISSUER (never entry.get("oidc_issuer")): the refresh
         # POST carries the refresh_token, so a poisoned auth.json must not choose its
         # destination host.
         return _validated_bearer(
-            await refresh_xai_token(entry_key, refresh_token, client_id, auth_path=auth_path)
+            await refresh_xai_token(
+                entry_key, refresh_token, client_id, auth_path=auth_path, stale_token=stale_token
+            )
         )
 
 
@@ -228,6 +241,7 @@ async def refresh_xai_token(
     *,
     issuer: str = _XAI_ISSUER,
     auth_path: Path | None = None,
+    stale_token: str | None = None,
 ) -> str:
     """Exchange a refresh token for a new bearer and persist it atomically.
 
@@ -242,6 +256,14 @@ async def refresh_xai_token(
     token: if a peer ``claude-grok`` process already rotated it while this caller
     waited for the lock, the now-valid token is returned and no POST is made — the
     caller's own refresh_token may be the single-use one that peer already spent.
+
+    Args:
+        stale_token: The just-rejected bearer, when this is a reactive refresh after
+            an upstream 401. It disarms the double-check for that exact value: a token
+            still passing the proactive expiry check but freshly rejected upstream must
+            NOT be handed back, so the POST proceeds unless a *different* valid token is
+            already on disk (a peer rotated it). ``None`` (the proactive default) leaves
+            the original skip-if-valid behavior intact.
 
     Returns:
         The new bearer JWT.
@@ -268,7 +290,15 @@ async def refresh_xai_token(
         if not isinstance(existing, dict):
             existing = {}
         existing_key = existing.get("key")
-        if isinstance(existing_key, str) and not _xai_token_expired(existing):
+        # In reactive (force) mode the caller passes the just-rejected token as
+        # stale_token: skip only if a *different* valid token is on disk (a peer
+        # rotated it), never if the on-disk token is still the rejected one. In
+        # proactive mode stale_token is None, so this reduces to skip-if-valid.
+        if (
+            isinstance(existing_key, str)
+            and not _xai_token_expired(existing)
+            and existing_key != stale_token
+        ):
             return existing_key
 
         body = urllib.parse.urlencode(

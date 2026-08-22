@@ -119,7 +119,7 @@ class XAIProvider:
         self._reasoning_by_call_id: dict[str, dict] = {}
         self._reasoning_lock = threading.Lock()
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         """Return the subscription bearer plus the grok client headers.
 
         Divergence from Codex (bearer-only): cli-chat-proxy rejects a request whose
@@ -132,11 +132,15 @@ class XAIProvider:
         ``key.or(conv_id)``, so key and header carry the same value). It is an opaque per-instance
         UUID — never a secret.
 
+        Args:
+            force_refresh: Force a bearer refresh regardless of proactive expiry — the
+                reactive path after an upstream 401. Forwarded to ``get_xai_bearer_token``.
+
         Raises:
             FileNotFoundError / ValueError: Propagated from ``get_xai_bearer_token`` when the
                 grok auth file is absent, malformed, or expired with no refresh token.
         """
-        token = await get_xai_bearer_token(self._auth_path)
+        token = await get_xai_bearer_token(self._auth_path, force_refresh=force_refresh)
         return {
             "Authorization": f"Bearer {token}",
             "x-grok-client-version": config.xai_client_version(),
