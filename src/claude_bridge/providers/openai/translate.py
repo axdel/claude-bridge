@@ -424,20 +424,6 @@ def _translate_message(
     return items, warnings
 
 
-def _has_cache_control(request: dict) -> bool:
-    """Return True if any part of the request contains cache_control hints."""
-    system = request.get("system")
-    if isinstance(system, list) and any("cache_control" in b for b in system):
-        return True
-    if any("cache_control" in t for t in request.get("tools", [])):
-        return True
-    for msg in request.get("messages", []):
-        content = msg.get("content", [])
-        if isinstance(content, list) and any("cache_control" in b for b in content):
-            return True
-    return False
-
-
 def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
     """Map an Anthropic ``tool_choice`` to OpenAI Responses request fields.
 
@@ -556,11 +542,6 @@ def anthropic_to_openai(
         warnings.extend(msg_warnings)
 
     result["input"] = input_items
-
-    if _has_cache_control(request):
-        warnings.append(
-            "Stripped cache_control hints (no provider equivalent — caching is automatic)"
-        )
 
     return result, warnings
 

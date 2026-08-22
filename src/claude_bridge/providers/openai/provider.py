@@ -8,6 +8,7 @@ the Provider protocol, and owns the in-memory encrypted-reasoning cache
 from __future__ import annotations
 
 import threading
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -69,6 +70,10 @@ class OpenAIProvider:
         self.auth_mode = auth_mode
         self._api_key = api_key
         self._auth_path = auth_path
+        # Sticky prompt cache identity: a process-stable UUID (the proxy holds one provider per
+        # process), invariant across this instance's requests yet distinct across launchers. Random
+        # UUID — never hash(instructions), never logged, embeds no secret (INV-SEC-01, INV-SEC-06).
+        self._prompt_cache_key = str(uuid.uuid4())
         # Endpoint and input-content capabilities both vary by backend. The instance
         # attribute shadows the conservative class default so the proxy and
         # translate_request (which hold an instance) forward the modalities this
@@ -138,9 +143,15 @@ class OpenAIProvider:
         translated["input"] = new_input
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
-        """Translate Anthropic Messages request to OpenAI Responses request, echoing any
-        captured encrypted reasoning back before its function_calls."""
+        """Translate Anthropic Messages request to OpenAI Responses request, stamping this
+        instance's sticky prompt cache key and echoing any captured encrypted reasoning back
+        before its function_calls.
+
+        The cache key and reasoning echo are stamped here rather than in the pure
+        ``anthropic_to_openai`` translator because both are per-instance state (D-REASON-001).
+        """
         result, warnings = anthropic_to_openai(anthropic_req, self.capabilities)
+        result["prompt_cache_key"] = self._prompt_cache_key
         self._inject_reasoning(result)
         return result, warnings
 

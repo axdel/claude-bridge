@@ -277,9 +277,11 @@ class TestAnthropicToOpenaiStripping:
             ],
         }
         result, warnings = anthropic_to_openai(request)
-        assert any("cache_control" in w.lower() for w in warnings)
         content = result["input"][0]["content"][0]
+        # The marker is dropped from the outbound request; caching now rides an explicit
+        # prompt_cache_key, so no advisory is emitted for it.
         assert "cache_control" not in content
+        assert not any("cache_control" in w.lower() for w in warnings)
 
     def test_cache_control_stripped_from_system_blocks(self):
         request = {
@@ -294,8 +296,10 @@ class TestAnthropicToOpenaiStripping:
             ],
             "messages": [{"role": "user", "content": "Hi"}],
         }
-        _, warnings = anthropic_to_openai(request)
-        assert any("cache_control" in w.lower() for w in warnings)
+        result, warnings = anthropic_to_openai(request)
+        # System-block marker is dropped from the outbound request; no advisory is emitted.
+        assert "cache_control" not in json.dumps(result)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
     def test_cache_control_stripped_from_tool_definitions(self):
         request = {
@@ -312,17 +316,20 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, warnings = anthropic_to_openai(request)
-        assert any("cache_control" in w.lower() for w in warnings)
         tool = result["tools"][0]
         assert "cache_control" not in tool
+        assert not any("cache_control" in w.lower() for w in warnings)
 
-    def test_no_cache_control_no_warning(self):
+    def test_clean_request_leaves_no_cache_control_in_output(self):
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Hello"}],
         }
-        _, warnings = anthropic_to_openai(request)
+        result, warnings = anthropic_to_openai(request)
+        # A request with no cache_control yields output with none and no advisory — the
+        # invariant that survives the "caching is automatic" warning's removal.
+        assert "cache_control" not in json.dumps(result)
         assert not any("cache_control" in w.lower() for w in warnings)
 
 

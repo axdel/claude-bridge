@@ -1142,17 +1142,21 @@ class TestRequestTranslation:
         )
         assert any("drop" in w.lower() for w in warnings)
 
-    def test_cache_control_on_system_warned(self):
-        _, warnings = anthropic_to_xai(
+    def test_cache_control_on_system_stripped_without_warning(self):
+        result, warnings = anthropic_to_xai(
             {
                 "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
                 "messages": [],
             }
         )
-        assert any("cache_control" in w for w in warnings)
+        # The Anthropic per-block marker has no Responses equivalent, so it is dropped
+        # from the outbound request. Sticky caching now rides an explicit prompt_cache_key,
+        # so the old "caching is automatic" advisory is no longer emitted (noise on every turn).
+        assert "cache_control" not in json.dumps(result)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
-    def test_cache_control_on_tool_warned(self):
-        _, warnings = anthropic_to_xai(
+    def test_cache_control_on_tool_stripped_without_warning(self):
+        result, warnings = anthropic_to_xai(
             {
                 "messages": [],
                 "tools": [
@@ -1164,10 +1168,11 @@ class TestRequestTranslation:
                 ],
             }
         )
-        assert any("cache_control" in w for w in warnings)
+        assert "cache_control" not in json.dumps(result)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
-    def test_cache_control_hints_warned(self):
-        _, warnings = anthropic_to_xai(
+    def test_cache_control_on_content_stripped_without_warning(self):
+        result, warnings = anthropic_to_xai(
             {
                 "messages": [
                     {
@@ -1183,7 +1188,8 @@ class TestRequestTranslation:
                 ]
             }
         )
-        assert any("cache_control" in w for w in warnings)
+        assert "cache_control" not in json.dumps(result)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
     # -- provider delegation --------------------------------------------------
 
@@ -2371,15 +2377,19 @@ class TestAuthenticate:
         auth_file = _write_grok_auth(tmp_path, data)
         monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
 
-        headers = await XAIProvider(auth_path=auth_file).authenticate()
+        provider = XAIProvider(auth_path=auth_file)
+        headers = await provider.authenticate()
 
         # Oracle: token is the exact bearer we wrote; version is the env override
-        # (config resolver returns it verbatim); identifier is the fixed client string.
+        # (config resolver returns it verbatim); identifier is the fixed client string;
+        # conv-id is this instance's sticky prompt cache key. The exact-dict match also
+        # proves no extra header leaks in.
         token = data[_ENTRY_KEY]["key"]
         assert headers == {
             "Authorization": f"Bearer {token}",
             "x-grok-client-version": "1.2.3",
             "x-grok-client-identifier": _XAI_CLIENT_IDENTIFIER,
+            "x-grok-conv-id": provider._prompt_cache_key,
         }
 
     @pytest.mark.asyncio
@@ -2425,6 +2435,52 @@ class TestAuthenticate:
         token = data[_ENTRY_KEY]["key"]
         assert token not in headers["x-grok-client-version"]
         assert token not in headers["x-grok-client-identifier"]
+
+
+# --- prompt cache identity (sticky routing key) ---
+
+
+class TestPromptCacheIdentity:
+    """The prompt cache key is a per-instance sticky-routing identity: stable across
+    every request on one provider (so grok-4.6 reuses the cached prefix), distinct across
+    instances (so three concurrent launchers never collide), and never derived from request
+    content. It rides both the body ``prompt_cache_key`` and the ``x-grok-conv-id`` header
+    as the same value, because grok-build resolves cache identity as ``key.or(conv_id)``.
+    """
+
+    @staticmethod
+    def _request(text: str) -> dict:
+        return {"messages": [{"role": "user", "content": text}]}
+
+    def test_prompt_cache_key_present_and_stable_across_requests_on_one_instance(self):
+        provider = XAIProvider()
+        first, _ = provider.translate_request(self._request("alpha"))
+        second, _ = provider.translate_request(self._request("beta"))
+        # Oracle: sticky routing requires ONE identity across the process, so the key is
+        # invariant across requests on a single instance despite differing content.
+        assert first["prompt_cache_key"]
+        assert first["prompt_cache_key"] == second["prompt_cache_key"]
+
+    def test_prompt_cache_key_differs_across_instances_for_identical_input(self):
+        # Identical input to both instances: same content, different key proves the key is
+        # instance identity, NOT hash(instructions) — the security constraint (INV-SEC-01/06).
+        a, _ = XAIProvider().translate_request(self._request("same"))
+        b, _ = XAIProvider().translate_request(self._request("same"))
+        assert a["prompt_cache_key"] != b["prompt_cache_key"]
+
+    @pytest.mark.asyncio
+    async def test_conv_id_header_equals_body_prompt_cache_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        provider = XAIProvider(auth_path=auth_file)
+
+        headers = await provider.authenticate()
+        body, _ = provider.translate_request(self._request("hi"))
+
+        # Oracle (plan sub-item 3): the one sticky key rides BOTH the header and the body,
+        # as the SAME value — cli-chat-proxy accepts either (grok-build is key.or(conv_id)).
+        assert headers["x-grok-conv-id"] == body["prompt_cache_key"]
+        assert body["prompt_cache_key"]
 
 
 # --- provider contract: capabilities, endpoint, registration ---

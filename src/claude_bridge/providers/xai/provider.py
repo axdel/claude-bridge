@@ -8,6 +8,7 @@ encrypted-reasoning cache (D-XAI-004). Registers itself in ``PROVIDERS`` on impo
 from __future__ import annotations
 
 import threading
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -108,6 +109,10 @@ class XAIProvider:
         # Optional override of ~/.grok/auth.json for testing; the no-arg default resolves the
         # real subscription file, so the fallback path's ``provider_cls()`` construction works.
         self._auth_path = auth_path
+        # Sticky prompt cache identity: a process-stable UUID (the proxy holds one provider per
+        # process), invariant across this instance's requests yet distinct across launchers. Random
+        # UUID — never hash(instructions), never logged, embeds no secret (INV-SEC-01, INV-SEC-06).
+        self._prompt_cache_key = str(uuid.uuid4())
         # Encrypted reasoning items captured from each tool turn, keyed by the EXACT upstream
         # call_id, so they can be re-injected before their function_calls on the next request.
         # In-memory only — opaque, never persisted, never logged, never returned to Claude Code.
@@ -122,6 +127,11 @@ class XAIProvider:
         so both accompany the bearer. The opaque bearer is never logged and rides only in the
         ``Authorization`` header.
 
+        The ``x-grok-conv-id`` carries this instance's sticky prompt cache key so cli-chat-proxy
+        routes the conversation to its cached prefix (grok-build resolves cache identity as
+        ``key.or(conv_id)``, so key and header carry the same value). It is an opaque per-instance
+        UUID — never a secret.
+
         Raises:
             FileNotFoundError / ValueError: Propagated from ``get_xai_bearer_token`` when the
                 grok auth file is absent, malformed, or expired with no refresh token.
@@ -131,6 +141,7 @@ class XAIProvider:
             "Authorization": f"Bearer {token}",
             "x-grok-client-version": config.xai_client_version(),
             "x-grok-client-identifier": _XAI_CLIENT_IDENTIFIER,
+            "x-grok-conv-id": self._prompt_cache_key,
         }
 
     def _stash_reasoning(self, associations: dict[str, dict]) -> None:
@@ -176,9 +187,15 @@ class XAIProvider:
         translated["input"] = new_input
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
-        """Translate an Anthropic Messages request to an xAI Responses request, echoing any
-        captured encrypted reasoning back before its function_calls."""
+        """Translate an Anthropic Messages request to an xAI Responses request, stamping this
+        instance's sticky prompt cache key and echoing any captured encrypted reasoning back
+        before its function_calls.
+
+        The cache key and reasoning echo are stamped here rather than in the pure
+        ``anthropic_to_xai`` translator because both are per-instance state (D-REASON-001).
+        """
         result, warnings = anthropic_to_xai(anthropic_req, self.capabilities)
+        result["prompt_cache_key"] = self._prompt_cache_key
         self._inject_reasoning(result)
         return result, warnings
 

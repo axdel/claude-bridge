@@ -154,6 +154,44 @@ def test_openai_codex_oauth_instance_declares_image_document_without_tool_arrays
     )
 
 
+def test_openai_translate_request_stamps_prompt_cache_key_in_api_key_mode():
+    """The sticky prompt cache key is stamped on the outbound request in api_key mode —
+    the OpenAI api_key path gets the same identity as codex_oauth (clean apply)."""
+    from claude_bridge.providers.openai import OpenAIProvider
+
+    provider = OpenAIProvider(auth_mode="api_key", api_key="test-key-placeholder")
+    body, _ = provider.translate_request({"messages": [{"role": "user", "content": "hi"}]})
+
+    assert body["prompt_cache_key"]
+
+
+def test_openai_translate_request_stamps_prompt_cache_key_in_codex_oauth_mode():
+    """The Codex backend receives the sticky key too, restoring prefix-cache locality."""
+    from claude_bridge.providers.openai import OpenAIProvider
+
+    provider = OpenAIProvider(auth_mode="codex_oauth")
+    body, _ = provider.translate_request({"messages": [{"role": "user", "content": "hi"}]})
+
+    assert body["prompt_cache_key"]
+
+
+def test_openai_prompt_cache_key_stable_per_instance_and_distinct_across_instances():
+    """One identity per instance: stable across requests (prefix-cache reuse), distinct across
+    instances (concurrent launchers never collide). Identical input to two instances yields two
+    different keys — proof the key is instance identity, not hash(instructions)."""
+    from claude_bridge.providers.openai import OpenAIProvider
+
+    provider = OpenAIProvider(auth_mode="api_key", api_key="test-key-placeholder")
+    first, _ = provider.translate_request({"messages": [{"role": "user", "content": "same"}]})
+    second, _ = provider.translate_request({"messages": [{"role": "user", "content": "other"}]})
+    other_instance, _ = OpenAIProvider(
+        auth_mode="api_key", api_key="test-key-placeholder"
+    ).translate_request({"messages": [{"role": "user", "content": "same"}]})
+
+    assert first["prompt_cache_key"] == second["prompt_cache_key"]
+    assert first["prompt_cache_key"] != other_instance["prompt_cache_key"]
+
+
 def test_xai_declares_full_media_capabilities_at_class_level():
     """xAI forwards image+document input and array-form tool output, at the class level.
 
