@@ -395,7 +395,7 @@ async def _try_failover(
         logger.warning("Failover ineligible: %s", reason)
         return None
 
-    if not router.should_use_fallback():
+    if not await router.should_use_fallback():
         return None
 
     result = await _forward_via_provider(fallback, body, client)
@@ -414,7 +414,7 @@ async def _auto_route(
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Auto mode: try Anthropic, failover on error."""
     # If circuit breaker is OPEN, try fallback first
-    if router.should_use_fallback():
+    if await router.should_use_fallback():
         result = await _try_failover(router, body, client, stats)
         if result is not None:
             return result[0], result[1], []
