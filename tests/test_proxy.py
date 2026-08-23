@@ -219,7 +219,8 @@ async def test_upstream_unreachable_returns_502():
             {"model": "test", "messages": []},
         )
         assert status == 502
-        assert "upstream unavailable" in data["error"]
+        assert data["type"] == "error"
+        assert data["error"]["message"] == "upstream unavailable"
     finally:
         server.close()
         await server.wait_closed()

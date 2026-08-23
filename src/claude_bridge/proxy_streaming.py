@@ -204,8 +204,9 @@ async def stream_passthrough(
     headers = select_forward_headers(client_headers)
     try:
         response = await open_stream(client, url, content=body, headers=headers)
-    except httpx.TransportError:
-        write_response(writer, 502, json.dumps({"error": "upstream unavailable"}).encode())
+    except httpx.TransportError as exc:
+        logger.error("Passthrough stream connect failed: %s", exc)
+        write_response(writer, 502, anthropic_error_body(502, "upstream unavailable"))
         return StreamOutcome(502)
 
     guard = await validate_passthrough_response(response, writer)

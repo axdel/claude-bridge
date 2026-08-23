@@ -197,7 +197,10 @@ async def test_forward_request_returns_502_after_retry_exhausted() -> None:
         await client.aclose()
 
     assert status == 502
-    assert json.loads(body) == {"error": "upstream unavailable"}
+    assert json.loads(body) == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "upstream unavailable"},
+    }
     assert ratelimit == []
     assert calls["n"] == 2
 
@@ -266,7 +269,10 @@ async def test_post_provider_returns_502_after_retry_exhausted() -> None:
         await client.aclose()
 
     assert status == 502
-    assert json.loads(body) == {"error": "upstream unavailable"}
+    assert json.loads(body) == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "upstream unavailable"},
+    }
     assert calls["n"] == 2
 
 

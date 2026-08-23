@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 
 import httpx
 
 import claude_bridge.config as config
 from claude_bridge.log import get_logger
+from claude_bridge.wire import anthropic_error_body
 
 logger = get_logger("http_client")
 
@@ -37,6 +39,47 @@ _RATELIMIT_EXACT_HEADERS = ("retry-after",)
 _TRANSIENT_ERRORS = (httpx.TransportError,)
 
 _RETRY_BACKOFF_SECONDS = 0.5
+
+
+def _jittered_backoff(attempt: int = 1) -> float:
+    """Return the retry delay (seconds) for *attempt* (1-based) with decorrelating jitter.
+
+    Base backoff scaled by the attempt number, times a random factor in [0.5, 1.5). Several
+    bridge processes that trip the same transient upstream failure at once then retry at
+    spread-out instants instead of waking together and colliding again — the multi-process
+    deployment the cross-process refresh lock also serves. Not a hot-path optimization: it
+    decorrelates the small number of concurrent retriers a local proxy can have, and never
+    returns zero (the 0.5 floor keeps the backoff meaningful).
+    """
+    return _RETRY_BACKOFF_SECONDS * attempt * (0.5 + random.random())  # noqa: S311  # nosec B311
+
+
+async def _buffered_post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    content: bytes,
+    headers: dict[str, str],
+    kind: str,
+) -> httpx.Response | None:
+    """POST *content* buffered, retrying once on a transient transport error.
+
+    Returns the response for any HTTP status — the server answered, so an error status is
+    the caller's to interpret and is never retried. Returns None when the transport fails
+    on both the attempt and its one retry; the retry is safe because no downstream byte was
+    ever written. *kind* labels the log lines (``"Upstream"`` / ``"Provider"``). Shared by
+    the two buffered POST paths so retry, jittered backoff, and failure logging live once.
+    """
+    for attempt in range(2):
+        try:
+            return await client.post(url, content=content, headers=headers)
+        except _TRANSIENT_ERRORS as exc:
+            if attempt == 0:
+                logger.warning("%s transient error, retrying: %s", kind, exc)
+                await asyncio.sleep(_jittered_backoff())
+                continue
+            logger.error("%s unavailable after retry: %s", kind, exc)
+    return None
 
 
 def _build_timeout() -> httpx.Timeout:
@@ -98,22 +141,16 @@ async def forward_request(
     """
     url = f"{upstream_url}/v1/messages"
     headers = select_forward_headers(client_headers)
-    for attempt in range(2):
-        try:
-            response = await client.post(url, content=body, headers=headers)
-        except _TRANSIENT_ERRORS as exc:
-            if attempt == 0:
-                logger.warning("Upstream transient error, retrying: %s", exc)
-                await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
-                continue
-            logger.error("Upstream unavailable after retry: %s", exc)
-            break
-        return (
-            response.status_code,
-            response.content,
-            _extract_ratelimit_headers(response.headers),
-        )
-    return 502, json.dumps({"error": "upstream unavailable"}).encode(), []
+    response = await _buffered_post_with_retry(
+        client, url, content=body, headers=headers, kind="Upstream"
+    )
+    if response is None:
+        return 502, anthropic_error_body(502, "upstream unavailable"), []
+    return (
+        response.status_code,
+        response.content,
+        _extract_ratelimit_headers(response.headers),
+    )
 
 
 async def post_provider(
@@ -129,18 +166,12 @@ async def post_provider(
     """
     headers = {"Content-Type": "application/json", **auth_headers}
     body = json.dumps(translated).encode()
-    for attempt in range(2):
-        try:
-            response = await client.post(endpoint, content=body, headers=headers)
-        except _TRANSIENT_ERRORS as exc:
-            if attempt == 0:
-                logger.warning("Provider transient error, retrying: %s", exc)
-                await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
-                continue
-            logger.error("Provider unavailable after retry: %s", exc)
-            break
-        return response.status_code, response.content
-    return 502, json.dumps({"error": "upstream unavailable"}).encode()
+    response = await _buffered_post_with_retry(
+        client, endpoint, content=body, headers=headers, kind="Provider"
+    )
+    if response is None:
+        return 502, anthropic_error_body(502, "upstream unavailable")
+    return response.status_code, response.content
 
 
 async def open_stream(
@@ -168,9 +199,11 @@ async def open_stream(
         try:
             request = client.build_request("POST", url, content=content, headers=send_headers)
             return await client.send(request, stream=True)
-        except _TRANSIENT_ERRORS:
+        except _TRANSIENT_ERRORS as exc:
             if attempt >= retries:
                 raise
             attempt += 1
-            logger.warning("Stream connect transient error, retry %d/%d", attempt, retries)
-            await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+            logger.warning(
+                "Stream connect transient error, retry %d/%d: %s", attempt, retries, exc
+            )
+            await asyncio.sleep(_jittered_backoff(attempt))
