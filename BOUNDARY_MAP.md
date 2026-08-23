@@ -1,67 +1,27 @@
 # Boundary Map
 
-> The allowed import directions for `claude_bridge`. Dependencies flow one way:
-> entry → orchestration → provider abstraction → leaf utilities. Concrete providers
-> are self-contained and mutually independent. Enforced mechanically by import-linter
-> (`[tool.importlinter]` in `pyproject.toml`); the boundary-map primitive gate runs
-> `lint-imports` and is the merge blocker — this file is the human-readable statement
-> of the same contract.
+## Import Rules
 
-## Dependency DAG
-
-```
-__main__            (CLI entry — the composition root; wires a provider into the proxy)
-   │
-   ├── proxy        (HTTP server: binds 127.0.0.1, dispatches via the Provider protocol)
-   ├── router       (circuit-breaker failover state: Anthropic ↔ fallback provider)
-   │      │
-   │      ▼
-   │   provider     (abstraction: the Provider protocol + PROVIDERS registry + ProviderCapabilities)
-   │      ▲
-   │      │  (concrete providers register into PROVIDERS; the proxy never names them)
-   │   providers/openai   providers/xai      (self-contained, mutually independent)
-   │      │                   │
-   ▼      ▼                   ▼
-leaf utilities:  config · content · auth · stream · stats · log
-   (pure helpers — never import orchestration or a concrete provider)
-```
-
-Arrows point from consumer to dependency; there is no reverse edge. A leaf utility
-that imported `proxy` or a concrete provider would invert the DAG.
-
-## Import Contracts
-
-These three contracts are the exact `[tool.importlinter]` contracts in `pyproject.toml`;
-`lint-imports` enforces them and the boundary-map gate reports its verdict.
-
-| # | Contract | Type | Rule |
-|-|-|-|-|
-| 1 | Providers are mutually independent | independence | `providers.openai` and `providers.xai` never import each other — each provider is a self-contained translation path (D-XAI-002) |
-| 2 | Proxy dispatches via the abstraction | forbidden | `proxy` must not import `providers.openai` or `providers.xai` — it dispatches only through the `Provider` protocol resolved from the `PROVIDERS` registry |
-| 3 | Leaf utilities never import orchestration | forbidden | `config`, `content`, `auth`, `stream`, `provider`, `stats`, `log` must not import `proxy`, `router`, `__main__`, or either concrete provider |
-
-## Layer Purity
-
-| Layer | Modules | Owns | Must NOT import |
-|-|-|-|-|
-| Entry | `__main__` | Arg parsing, provider selection, proxy startup | — (top of the DAG) |
-| Orchestration | `proxy`, `router` | HTTP serving, request dispatch, failover state | concrete providers (`providers.openai`, `providers.xai`) |
-| Abstraction | `provider` | `Provider` protocol, `PROVIDERS` registry, `ProviderCapabilities` | orchestration, concrete providers |
-| Concrete providers | `providers.openai`, `providers.xai` | One provider's full Anthropic↔upstream translation | the other provider |
-| Leaf utilities | `config`, `content`, `auth`, `stream`, `stats`, `log` | Pure, reusable helpers | orchestration, concrete providers |
+| Module | Target | Rule | Notes | Status | Superseded By |
+|-|-|-|-|-|-|
+| concrete_provider | sibling_provider | must-not-import | Neither concrete provider imports the other — each is a self-contained Anthropic↔upstream translation, auth, and streaming path. import-linter independence contract "Providers are mutually independent (no cross-provider imports)"; D-XAI-002, INV-ARCH-01 | active |  |
+| leaf_utility | orchestration | must-not-import | Leaf utilities (config, content, auth, stream, provider, stats, log, http_client, request_view) never import proxy, router, __main__, or either concrete provider. import-linter forbidden contract "Leaf utilities never import orchestration"; the source_modules set now includes the http_client transport and request_view leaves | active |  |
+| proxy | concrete_provider | must-not-import | The proxy dispatches only through the Provider protocol resolved from the PROVIDERS registry, never importing providers.openai or providers.xai. import-linter forbidden contract "Proxy dispatches via the provider abstraction, never concrete providers"; INV-ARCH-02 | active |  |
 
 ## Error Ownership
 
-| Layer | Raises | Translates |
-|-|-|-|
-| Leaf utilities (`auth`, `content`) | Value/credential errors on malformed input (bad bearer, unreadable `auth.json`) | raw I/O errors into typed local errors |
-| Concrete providers | Upstream/translation errors | HTTP/transport errors into Anthropic-shaped error responses |
-| Orchestration (`proxy`, `router`) | HTTP status responses; opens the circuit on repeated failure | provider errors into client responses |
+| Layer | Raises | Catches and Translates | Status | Superseded By |
+|-|-|-|-|-|
+| concrete_provider | Upstream/translation errors | HTTP/transport errors into Anthropic-shaped error responses | active |  |
+| leaf_utility | Value/credential errors on malformed input (bad bearer, unreadable auth.json) | raw I/O errors into typed local errors | active |  |
+| orchestration | HTTP status responses; opens the circuit on repeated failure | provider errors into client responses | active |  |
 
-## Enforcement
+## Layer Purity
 
-Mechanical: `lint-imports` (import-linter, `cli_name = lint-imports`) run by the
-boundary-map primitive gate. The `claude_bridge` package is editable-installed
-(`[build-system]` → `uv sync`) so grimp can resolve `root_package = "claude_bridge"`
-on `sys.path`. A new module joins the DAG by being placed in one of the layers above;
-a new provider registers into `PROVIDERS` and stays independent of every sibling.
+| Layer | Owns | Must NOT Contain | Status | Superseded By |
+|-|-|-|-|-|
+| abstraction | the Provider protocol, PROVIDERS registry, ProviderCapabilities (provider) | orchestration or concrete-provider imports | active |  |
+| concrete_provider | one provider's full Anthropic↔upstream translation, auth, and streaming (providers/openai, providers/xai) | the sibling provider; and the transport — providers receive the client via post_provider/open_stream, never importing http_client (D-STRUCT-002) | active |  |
+| entry | Arg parsing, provider selection, proxy startup (__main__) | business or translation logic — it only wires a selected provider into the proxy | active |  |
+| leaf_utility | Pure, reusable helpers — config, content, auth, stream, stats, log, plus the http_client data-plane transport and request_view | orchestration or concrete-provider imports | active |  |
+| orchestration | HTTP serving, request dispatch, failover state (proxy, proxy_streaming, router) | concrete-provider imports or translation logic; dispatches only via the Provider protocol | active |  |
