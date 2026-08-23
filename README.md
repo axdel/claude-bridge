@@ -261,7 +261,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | `XAI_CLIENT_VERSION` | highest installed grok CLI bundle (floor `0.1.202`) | Override for the `x-grok-client-version` header the cli-chat-proxy gates on; when unset, resolved from the newest `~/.grok/downloads/grok-<ver>-*` bundle |
 | `XAI_REASONING_EFFORT` | `low` | xAI `reasoning.effort` for grok-4.6+ (`low` / `medium` / `high`); sent only to models that accept it, omitted for pre-4.6; an invalid value falls back to the default |
 | `REASONING_MODE` | `passthrough` | Thinking-block handling for OpenAI and xAI: `passthrough` preserves tagged thinking text, `drop` strips it |
-| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `LOG_LEVEL` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. The `claude-grok` / `claude-codex` launchers default to `WARNING` — upstream timeouts, transport errors, and failovers reach the terminal without `--debug`; raw `python -m claude_bridge` defaults to `INFO`. |
 | `CONNECT_TIMEOUT` | `10.0` | Data-plane TCP connect timeout in seconds (httpx transport) — a dead connect fails fast; invalid, zero, or negative values fall back to the default |
 | `STREAM_IDLE_TIMEOUT` | `300.0` | Data-plane read/write idle timeout in seconds — the gap between streamed chunks, so long grok-4.6 thinking survives as long as chunks keep arriving; invalid, zero, or negative values fall back to the default |
 | `POOL_IDLE` | `90.0` | Data-plane connection-pool idle timeout in seconds for the shared keep-alive `AsyncClient`; invalid, zero, or negative values fall back to the default |

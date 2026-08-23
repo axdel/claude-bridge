@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 
+from claude_bridge.content import parse_media_source
 from claude_bridge.log import get_logger, is_trace_enabled, trace_event
 
 logger = get_logger("request_view")
@@ -53,16 +54,19 @@ def _approx_decoded_bytes(data: str) -> int:
 def _media_descriptor(block: dict) -> dict:
     """Structural ``{kind, media_type, approx_bytes}`` for one media block.
 
-    Reads only the block type, the source media_type, and the base64 length —
-    never the payload — so the result is safe to persist to a trace.
+    Derives the block shape from ``content.parse_media_source`` — the single owner
+    of Anthropic media-block parsing (INV-MEDIA-01) — rather than re-reading
+    ``source["media_type"]`` / ``source["data"]`` here, so this trace view cannot
+    drift from the shape the providers forward. Only the normalized media type and
+    the base64 length reach the result — never the payload — so it is safe to
+    persist to a trace. ``approx_bytes`` is non-zero only for an inline base64
+    source (``data`` populated); a url/file source carries no bytes to size.
     """
-    source = block.get("source")
-    source = source if isinstance(source, dict) else {}
-    data = source.get("data")
+    media = parse_media_source(block)
     return {
-        "kind": str(block.get("type", "")),
-        "media_type": str(source.get("media_type", "")),
-        "approx_bytes": _approx_decoded_bytes(data) if isinstance(data, str) else 0,
+        "kind": media.kind,
+        "media_type": media.media_type,
+        "approx_bytes": _approx_decoded_bytes(media.data) if media.data is not None else 0,
     }
 
 

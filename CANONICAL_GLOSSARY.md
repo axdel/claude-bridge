@@ -4,6 +4,7 @@
 
 | Canonical Name | Domain | Concept | Rejected Aliases | Notes | Status | Superseded By |
 |-|-|-|-|-|-|-|
+| ClientDisconnected | streaming | The exception raised when writing or draining a streamed response fails because the client closed the connection first | client_disconnect, connection_dropped, peer_disconnected | `wire.ClientDisconnected`; `proxy_streaming` catches it and maps it to `StreamOutcome(status=499)` — a client-initiated disconnect, distinct from an upstream provider error (BOUNDARY_MAP Error Ownership). Raised only by the client write/drain path, never by an upstream failure. | active |  |
 | PROVIDERS | provider | The registry mapping a provider name to its `Provider` class | provider_map, registry_dict, handlers | `PROVIDERS: dict[str, type[Provider]]` in `provider.py`; the single dispatch table | active |  |
 | Provider | provider | The translation adapter that converts Anthropic Messages ↔ an upstream API | adapter, backend, engine, connector | The `Provider` protocol in `provider.py`; each concrete one lives in `providers/` | active |  |
 | ProviderCapabilities | provider | The per-provider feature/flag descriptor | features, provider_config, options | Frozen descriptor in `provider.py` (image/document input, tool round-trip) | active |  |

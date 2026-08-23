@@ -59,15 +59,15 @@ def test_property_accepts_iff_nonempty_printable_ascii(validate, token):
 
 
 @pytest.mark.parametrize("validate", _VALIDATORS)
-@given(secret=st.text(alphabet=_TOKEN_ALPHABET, min_size=16), bad=_UNSAFE_CHAR)
-def test_property_rejected_credential_never_echoed(validate, secret, bad):
+@given(token=st.text(alphabet=_TOKEN_ALPHABET, min_size=16), bad=_UNSAFE_CHAR)
+def test_property_rejected_credential_never_echoed(validate, token, bad):
     """A malformed credential is rejected AND never appears in the error (CWE-532).
 
     Oracle: the security requirement itself — the raised message must not contain the
-    secret. The 16+ char base64url secret is a plausible real credential; appending any
+    token. The 16+ char base64url token is a plausible real credential; appending any
     header-unsafe char guarantees rejection, so the leak check is always exercised.
     """
-    poisoned = secret + bad
+    poisoned = token + bad
     with pytest.raises(ValueError) as excinfo:
         validate(poisoned)
-    assert secret not in str(excinfo.value)
+    assert token not in str(excinfo.value)

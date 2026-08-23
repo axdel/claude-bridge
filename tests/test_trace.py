@@ -282,6 +282,45 @@ class TestMediaTraceSummary:
         assert abs(media[0]["approx_bytes"] - 404) <= 2  # recovers the 404-byte payload
         assert img_b64 not in json.dumps(summary)
 
+    def test_url_media_source_reports_zero_bytes_not_a_stray_data_field(self):
+        """A url-source block sizes to 0 bytes — the descriptor derives from
+        content.parse_media_source (INV-MEDIA-01's single owner of the block shape),
+        so a base64-looking ``data`` field on a non-base64 source is never mistaken
+        for a payload.
+
+        Oracle: parse_media_source's documented contract — a ``url`` source populates
+        ``.url`` and leaves ``.data`` None — so approx_bytes must be 0 regardless of a
+        malformed stray ``data`` key. Re-reading ``source['data']`` inline (the removed
+        re-encoding) would instead size the 4000-char stray field to ~3000 bytes.
+        """
+        from claude_bridge.request_view import _summarize_anthropic_request
+
+        stray = "A" * 4000
+        request = {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": "https://example.test/x.png",
+                                "media_type": "image/png",
+                                "data": stray,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        summary = _summarize_anthropic_request(request)
+        assert summary["media"] == [
+            {"kind": "image", "media_type": "image/png", "approx_bytes": 0}
+        ]
+        assert stray not in json.dumps(summary)
+
     def test_tool_result_nested_media_is_summarized(self):
         from claude_bridge.request_view import _summarize_anthropic_request
 
