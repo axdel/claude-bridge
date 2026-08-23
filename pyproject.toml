@@ -49,7 +49,8 @@ line-length = 99
 select = ["E", "F", "W", "I", "S", "UP", "B", "C4", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "S105", "S108", "S310"]
+# S603: launcher/isolation tests drive subprocess with sys.executable + fixed args (trusted input).
+"tests/**/*.py" = ["S101", "S105", "S108", "S310", "S603"]
 
 [tool.basedpyright]
 pythonVersion = "3.12"

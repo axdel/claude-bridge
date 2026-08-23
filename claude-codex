@@ -44,23 +44,28 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Start bridge in background
-export PYTHONPATH="${BRIDGE_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
 export LOG_LEVEL
-# `-P` (safe path, Python 3.11+) drops the automatic prepend of the current
-# directory to sys.path, so running claude-codex from an untrusted project dir
-# cannot let a local `claude_bridge/__main__.py` shadow the real bridge and read
-# the provider auth.json (search-path injection, CWE-427). Our own trusted src dir
-# is still first on the explicit PYTHONPATH exported above.
+# `-I` (isolated mode, Python 3.11+) starts the bridge with NO untrusted path on
+# sys.path: it drops the current-directory prepend (like `-P`) AND ignores
+# PYTHONPATH/PYTHONHOME AND the per-user site dir. `claude_bridge` resolves from the
+# venv's editable install (the trusted ${BRIDGE_DIR}/src) and `httpx` from the venv
+# site-packages, so running claude-codex from an untrusted project dir cannot let a
+# local `sitecustomize.py`, `claude_bridge/`, or a shadowing `httpx.py` run ahead of
+# the real bridge and read the provider auth.json (search-path injection, CWE-427).
+# `-P` alone did NOT close this — it leaves an inherited PYTHONPATH (e.g. `.`) on the
+# path, and httpx, not in src, would resolve from it. The venv is selected by the
+# interpreter path, not env, so `-I` keeps it; LOG_LEVEL and the ANTHROPIC_* vars
+# below are not PYTHON* vars, so `-I` honors them too.
 # Bridge logs go to stderr at LOG_LEVEL (WARNING+ by default), so upstream timeouts
 # and stalled-stream deaths are visible on the terminal without `--debug`; `--debug`
 # raises the level to DEBUG. No `2>/dev/null` here — discarding the whole stream is
 # what hid the 120s upstream deaths; INFO/DEBUG chatter is filtered by the log level.
-"$BRIDGE_PY" -P -m claude_bridge --port "$PORT" --provider openai &
+"$BRIDGE_PY" -I -m claude_bridge --port "$PORT" --provider openai &
 BRIDGE_PID=$!
 
 # Wait for bridge to accept connections (max 3s)
 for _ in $(seq 1 30); do
-    if "$BRIDGE_PY" -P -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
+    if "$BRIDGE_PY" -I -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
         break
     fi
     sleep 0.1
@@ -82,7 +87,7 @@ cat <<'BANNER'
  \___|_|\__,_|\__,_|\__,_|\___|     \___\___/ \__,_|\___/_/\_\
 
 BANNER
-BRIDGE_VERSION=$("$BRIDGE_PY" -P -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
+BRIDGE_VERSION=$("$BRIDGE_PY" -I -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
 echo " port:${PORT}  pid:${BRIDGE_PID}  model:gpt-5.6-sol  version:${BRIDGE_VERSION}"
 echo " by axdel  github.com/axdel/claude-bridge"
 echo ""
