@@ -1548,7 +1548,7 @@ class _StreamFailureProvider:
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         async for _chunk in raw_chunks:
             raise ValueError("stream translation failed")
-            yield {}
+        yield {}  # only reached on an empty stream; present so this stays an async generator
 
 
 class _ProviderOkStreamHandler(BaseHTTPRequestHandler):
@@ -2364,7 +2364,7 @@ class _FailingAuthProvider:
         return provider_resp
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
-        if False:
+        for _ in ():  # empty async generator: this provider double is not driven for streaming
             yield {}
 
 
@@ -2422,7 +2422,7 @@ class _JsonSyncProvider:
         }
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
-        if False:
+        for _ in ():  # empty async generator: this provider double is not driven for streaming
             yield {}
 
 
@@ -2947,7 +2947,7 @@ class _ReauthJsonProvider(_ReauthProviderBase):
         }
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
-        if False:
+        for _ in ():  # empty async generator: this provider double is not driven for streaming
             yield {}
 
 

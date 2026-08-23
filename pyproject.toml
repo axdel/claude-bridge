@@ -61,6 +61,15 @@ typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
 
+# Dead-code detection (vulture). ignore_names lists interface-required identifiers that
+# are structurally unused but cannot be removed, so vulture reports them as 100%-confidence
+# false positives: fp/newurl (the urllib redirect_request override that refuses
+# token-endpoint redirects, CWE-918), kw (**kw catch-alls in test doubles), and format
+# (the BaseHTTPRequestHandler.log_message override in the test HTTP servers). ignore_names
+# is the only pyproject key that survives the runner's CLI; see DECISIONS.md D-QUALITY-001.
+[tool.vulture]
+ignore_names = ["fp", "newurl", "kw", "format"]
+
 # Architecture-boundary contracts (import-linter). Encodes the one-way import DAG
 # the proxy relies on: providers are self-contained and mutually independent, the
 # proxy dispatches only through the provider abstraction, and leaf utilities never
