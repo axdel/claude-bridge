@@ -2494,6 +2494,26 @@ def test_provider_error_message_non_json_falls_back_to_body():
     assert provider_error_message(b"502 Bad Gateway") == "502 Bad Gateway"
 
 
+def test_provider_error_message_bounds_the_relayed_message():
+    """A long provider message is truncated before it is relayed to the client.
+
+    The message field is provider-authored free text relayed to the requesting client
+    (the 'visible errors' feature, D-SEC-001). A compromised first-party provider could
+    echo request content — an encrypted reasoning blob (INV-SEC-06) or the prompt-cache
+    key (INV-SEC-01) — in that field; bounding it caps an echoed opaque value to a prefix
+    instead of relaying it whole. Oracle: the cap matches the [:limit] slice the non-JSON
+    fallbacks in the same function already use.
+    """
+    from claude_bridge.wire import _PROVIDER_MESSAGE_LIMIT, provider_error_message
+
+    long_message = "b" * (_PROVIDER_MESSAGE_LIMIT + 500)
+    raw = json.dumps({"error": {"message": long_message}}).encode()
+
+    result = provider_error_message(raw)
+
+    assert result == "b" * _PROVIDER_MESSAGE_LIMIT
+
+
 def test_provider_error_log_summary_non_json_omits_raw_body_secret():
     """Malformed provider bodies log only metadata, never raw body text."""
     from claude_bridge.wire import provider_error_log_summary

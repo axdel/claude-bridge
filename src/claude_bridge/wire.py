@@ -15,6 +15,11 @@ from dataclasses import dataclass
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 
+# Upper bound on provider-authored error text relayed to the client (D-SEC-001).
+# A real diagnostic is short; the cap keeps an echoed opaque value (reasoning blob,
+# cache key) from being relayed whole. Matches the existing non-JSON fallback slices.
+_PROVIDER_MESSAGE_LIMIT = 500
+
 # HTTP status → Anthropic error type (docs.anthropic.com/en/api/errors). Anything
 # unmapped falls back to ``api_error`` so a novel upstream status never crashes.
 _ANTHROPIC_ERROR_TYPES = {
@@ -105,20 +110,26 @@ def provider_error_message(raw_body: bytes) -> str:
     """Extract a human-readable message from an upstream provider error body.
 
     Understands the OpenAI ``{"error": {"message": ...}}`` shape and degrades to the
-    decoded body (truncated) when the payload is not the expected JSON.
+    decoded body when the payload is not the expected JSON. The result is relayed to the
+    requesting client (the 'visible errors' feature, D-SEC-001), so it is bounded to
+    ``_PROVIDER_MESSAGE_LIMIT``: a compromised first-party provider could echo request
+    content — an encrypted reasoning blob (INV-SEC-06) or the prompt-cache key
+    (INV-SEC-01) — and the cap keeps such an echoed value from being relayed whole.
     """
     try:
         parsed = json.loads(raw_body)
     except (json.JSONDecodeError, ValueError):
-        return raw_body.decode("utf-8", errors="replace")[:500]
+        return raw_body.decode("utf-8", errors="replace")[:_PROVIDER_MESSAGE_LIMIT]
     error = parsed.get("error") if isinstance(parsed, dict) else None
     if isinstance(error, dict):
-        return error.get("message") or error.get("type") or json.dumps(error)[:500]
-    if isinstance(error, str):
-        return error
-    if isinstance(parsed, dict) and parsed.get("message"):
-        return parsed["message"]
-    return raw_body.decode("utf-8", errors="replace")[:500]
+        message = error.get("message") or error.get("type") or json.dumps(error)
+    elif isinstance(error, str):
+        message = error
+    elif isinstance(parsed, dict) and parsed.get("message"):
+        message = parsed["message"]
+    else:
+        message = raw_body.decode("utf-8", errors="replace")
+    return str(message)[:_PROVIDER_MESSAGE_LIMIT]
 
 
 def safe_log_excerpt(value: object, *, limit: int = 200) -> str:
