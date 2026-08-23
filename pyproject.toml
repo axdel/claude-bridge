@@ -39,6 +39,8 @@ dev = [
     "bandit>=1.9.4",
     "pip-audit>=2.10.0",
     "import-linter>=2.13",
+    "hypothesis>=6.165.10",
+    "deptry>=0.25.1",
 ]
 
 [tool.ruff]
