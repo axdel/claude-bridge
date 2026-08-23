@@ -55,7 +55,7 @@ of leaking provider-incompatible content.
 
 ## Features
 
-- **Zero dependencies** — stdlib-only Python, no `pip install`
+- **One dependency** — `httpx[http2]` for the HTTP/2 data plane (installed once via `uv sync`); everything else is stdlib
 - **Direct API key auth** — set `OPENAI_API_KEY` for the official OpenAI Responses API
 - **Subscription OAuth** — no API key? Uses Codex OAuth (OpenAI, `~/.codex/auth.json`) or Grok CLI OAuth (xAI, `~/.grok/auth.json`) automatically — xAI is subscription-only, no API key
 - **Reasoning continuity** — encrypted reasoning blobs are cached in memory and echoed across tool turns (OpenAI and xAI)
@@ -73,7 +73,7 @@ of leaking provider-incompatible content.
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
 - **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
 - **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
-- **570 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **621 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -86,13 +86,14 @@ of leaking provider-incompatible content.
 ### Software (macOS)
 
 ```bash
-brew install python claude-code codex
+brew install python claude-code codex uv
 
 # xAI's grok CLI self-installs its own binary under ~/.grok/bin (not via brew).
 # Install it per xAI's grok CLI instructions, then it is on your PATH as `grok`.
 
 # Verify
 python3 --version    # 3.12+
+uv --version         # provisions the bridge's httpx dependency (uv sync)
 claude --version
 codex --version
 grok --version
@@ -105,7 +106,7 @@ cat ~/.grok/auth.json              # should show an xAI OAuth entry (keyed by is
 ```
 
 > **macOS only** for now (brew dependencies). Linux support is untested.
-> **No `pip install` needed** — the bridge is stdlib-only Python.
+> **One dependency** — run `uv sync` once to install `httpx[http2]` (the HTTP/2 data plane); the rest is stdlib Python.
 > Codex CLI is for the OpenAI OAuth path, grok CLI is for the xAI OAuth path.
 > If you set `OPENAI_API_KEY`, direct OpenAI mode uses the official API instead. xAI has no
 > API-key mode — it always reuses the grok CLI subscription credentials.
@@ -115,6 +116,10 @@ cat ~/.grok/auth.json              # should show an xAI OAuth entry (keyed by is
 ```bash
 git clone https://github.com/axdel/claude-bridge.git
 cd claude-bridge
+
+# Provision the one runtime dependency (httpx[http2]) into ./.venv — the launchers
+# run the bridge with this venv's Python, so this step is required, not optional.
+uv sync
 
 # Make the launchers available system-wide
 mkdir -p ~/.local/bin
@@ -494,7 +499,7 @@ suite.
 | | Claude Bridge | [1rgs/claude-code-proxy](https://github.com/1rgs/claude-code-proxy) | [fuergaosi233/claude-code-proxy](https://github.com/fuergaosi233/claude-code-proxy) |
 |---|---|---|---|
 | Target API | **Responses API** | Chat Completions | Chat Completions |
-| Dependencies | **stdlib-only** | FastAPI + LiteLLM | FastAPI + openai SDK |
+| Dependencies | **httpx only** | FastAPI + LiteLLM | FastAPI + openai SDK |
 | Tool fidelity | **Proper function_call_output** | Lossy (text flatten) | Proper |
 | Auto-failover | Yes (circuit breaker) | No | No |
 | Metrics | `/stats` endpoint | No | No |

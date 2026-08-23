@@ -1,6 +1,7 @@
 """Claude Bridge — use your Claude Code setup with any LLM provider.
 
-A stdlib-only async proxy that sits between Claude Code and LLM providers.
+An async proxy that sits between Claude Code and LLM providers. Its one runtime
+dependency is ``httpx[http2]`` (the HTTP/2 data plane); the rest is Python stdlib.
 Intercepts Anthropic Messages API traffic and can either pass it through to
 the real Anthropic endpoint or translate it to another provider's format
 (e.g., OpenAI Responses API).
@@ -13,7 +14,7 @@ Architecture::
                         |
                     provider.py (protocol)
                         |
-          providers/openai.py / providers/xai.py
+          providers/openai/   providers/xai/   (sub-packages)
 
 Adding a new provider:
     1. Create ``providers/<name>.py`` implementing the ``Provider`` protocol

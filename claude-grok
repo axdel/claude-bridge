@@ -13,6 +13,16 @@ PORT=$((9000 + RANDOM % 999))
 BRIDGE_PID=""
 LOG_LEVEL="${LOG_LEVEL:-WARNING}"
 
+# The bridge's one runtime dependency (httpx[http2], the HTTP/2 data plane) lives in
+# the project venv that `uv sync` provisions at ${BRIDGE_DIR}/.venv — the system
+# python3 does not have it. Run every claude_bridge invocation through that
+# interpreter, and fail loud with the fix if the venv is missing (D-RUNTIME-003).
+BRIDGE_PY="${BRIDGE_DIR}/.venv/bin/python"
+if [[ ! -x "$BRIDGE_PY" ]]; then
+    echo "claude-grok: ${BRIDGE_DIR}/.venv not found — run 'uv sync' in ${BRIDGE_DIR} first." >&2
+    exit 1
+fi
+
 # Parse our flags (before --)
 CLAUDE_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -46,12 +56,12 @@ export LOG_LEVEL
 # raises the level to DEBUG. No `2>/dev/null` here — discarding the whole stream is
 # what hid the 120s upstream deaths; INFO/DEBUG chatter is filtered by the log level
 # instead, so the terminal stays quiet in normal use but never silent on failure.
-python3 -P -m claude_bridge --port "$PORT" --provider xai &
+"$BRIDGE_PY" -P -m claude_bridge --port "$PORT" --provider xai &
 BRIDGE_PID=$!
 
 # Wait for bridge to accept connections (max 3s)
 for _ in $(seq 1 30); do
-    if python3 -P -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
+    if "$BRIDGE_PY" -P -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
         break
     fi
     sleep 0.1
@@ -73,10 +83,10 @@ cat <<'BANNER'
  \___|_|\__,_|\__,_|\__,_|\___|      \__, |_|  \___/|_|\_\
                                      |___/
 BANNER
-BRIDGE_VERSION=$(python3 -P -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
+BRIDGE_VERSION=$("$BRIDGE_PY" -P -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
 # Derive the model from the config owner (config.xai_model) rather than hardcoding it,
 # so the banner tracks DEFAULT_XAI_MODEL and any XAI_MODEL override instead of drifting.
-BRIDGE_MODEL=$(python3 -P -c "from claude_bridge import config; print(config.xai_model())" 2>/dev/null || echo "?")
+BRIDGE_MODEL=$("$BRIDGE_PY" -P -c "from claude_bridge import config; print(config.xai_model())" 2>/dev/null || echo "?")
 echo " port:${PORT}  pid:${BRIDGE_PID}  model:${BRIDGE_MODEL}  version:${BRIDGE_VERSION}"
 echo " by axdel  github.com/axdel/claude-bridge"
 echo ""
