@@ -805,6 +805,65 @@ async def test_oversized_body_returns_413(upstream_url: str, monkeypatch):
         await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_too_many_request_headers_returns_413(upstream_url: str, monkeypatch):
+    """More header lines than _MAX_REQUEST_HEADERS is rejected with 413, not buffered.
+
+    Bounds the inbound header-count vector (CWE-400): without the cap the loop accepts
+    unlimited header lines. 413 is the request-too-large status from the HTTP spec; the
+    expected value is derived from the spec, not from running the parser.
+    """
+    import claude_bridge.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "_MAX_REQUEST_HEADERS", 5)
+
+    port = _find_free_port()
+    server, client = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        padding = b"".join(b"X-Pad-%d: v\r\n" % i for i in range(20))
+        writer.write(b"POST /v1/messages HTTP/1.1\r\n" + padding + b"Content-Length: 0\r\n\r\n")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(-1), timeout=2)
+        writer.close()
+        assert b"413" in response
+        assert b"request_too_large" in response
+    finally:
+        server.close()
+        await server.wait_closed()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oversized_request_headers_return_413(upstream_url: str, monkeypatch):
+    """Aggregate header bytes over _MAX_REQUEST_HEADER_BYTES is rejected with 413.
+
+    Bounds the duplicate-key/large-value header flood the count cap alone misses: a dict
+    overwrites duplicate keys so len(headers) stays small, but the accumulated bytes are
+    what exhaust memory. 413 is the spec status for a too-large request.
+    """
+    import claude_bridge.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "_MAX_REQUEST_HEADER_BYTES", 200)
+
+    port = _find_free_port()
+    server, client = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        # Same key repeated (dict keeps one entry) but the bytes accumulate past the cap.
+        flood = b"".join(b"X-Same: %s\r\n" % (b"v" * 40) for _ in range(20))
+        writer.write(b"POST /v1/messages HTTP/1.1\r\n" + flood + b"Content-Length: 0\r\n\r\n")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(-1), timeout=2)
+        writer.close()
+        assert b"413" in response
+        assert b"request_too_large" in response
+    finally:
+        server.close()
+        await server.wait_closed()
+        await client.aclose()
+
+
 # ---------------------------------------------------------------------------
 # translate_request() validation tests
 # ---------------------------------------------------------------------------

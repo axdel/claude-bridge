@@ -61,6 +61,14 @@ def _warn_invalid_max_request_body(raw: str) -> None:
 
 _MAX_REQUEST_BODY = config.max_request_body(on_invalid=_warn_invalid_max_request_body)
 
+# Ceilings on the inbound request-header block (CWE-400 memory-exhaustion defense). The
+# count cap bounds a duplicate-key flood by line; the aggregate-byte cap is the memory
+# bound (a dict overwrites duplicate keys, so line count alone cannot bound the bytes).
+# Fixed defensive constants, not operator-tunable knobs — real requests carry ~20-30
+# headers well under a few KiB; these are generous headroom, not a tuning surface.
+_MAX_REQUEST_HEADERS = 200
+_MAX_REQUEST_HEADER_BYTES = 64 * 1024
+
 
 # Upstream HTTP status codes that trigger failover.
 _FAILOVER_STATUSES = {429, 500, 502, 503}
@@ -135,7 +143,15 @@ def _make_handler(
 
 
 class _RequestTooLarge(Exception):
-    """Raised when Content-Length exceeds MAX_REQUEST_BODY."""
+    """Raised when the request body or header block exceeds its size ceiling.
+
+    Carries a per-case *message* so the 413 the caller returns names which ceiling
+    was crossed (body bytes, header count, or header bytes) rather than a generic one.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 async def _parse_request(
@@ -153,10 +169,22 @@ async def _parse_request(
     method, path = parts[0], parts[1]
 
     headers: dict[str, str] = {}
+    header_lines = 0
+    header_bytes = 0
     while True:
         line = await reader.readline()
         if line in (b"\r\n", b"\n", b""):
             break
+        header_lines += 1
+        header_bytes += len(line)
+        if header_lines > _MAX_REQUEST_HEADERS:
+            raise _RequestTooLarge(
+                f"Request header count exceeds maximum ({_MAX_REQUEST_HEADERS})"
+            )
+        if header_bytes > _MAX_REQUEST_HEADER_BYTES:
+            raise _RequestTooLarge(
+                f"Request headers exceed maximum size ({_MAX_REQUEST_HEADER_BYTES} bytes)"
+            )
         decoded = line.decode("utf-8", errors="replace").strip()
         if ":" in decoded:
             key, value = decoded.split(":", 1)
@@ -167,7 +195,7 @@ async def _parse_request(
     except (ValueError, TypeError):
         return None  # Malformed Content-Length — caller sends 400
     if content_length > _MAX_REQUEST_BODY:
-        raise _RequestTooLarge
+        raise _RequestTooLarge(f"Request body exceeds maximum size ({_MAX_REQUEST_BODY} bytes)")
     body = await reader.readexactly(content_length) if content_length else b""
     return method, path, headers, body
 
@@ -243,13 +271,13 @@ async def _process_request(
 
     try:
         parsed = await _parse_request(reader)
-    except _RequestTooLarge:
+    except _RequestTooLarge as exc:
         error_body = json.dumps(
             {
                 "type": "error",
                 "error": {
                     "type": "request_too_large",
-                    "message": f"Request body exceeds maximum size ({_MAX_REQUEST_BODY} bytes)",
+                    "message": exc.message,
                 },
             }
         ).encode()
