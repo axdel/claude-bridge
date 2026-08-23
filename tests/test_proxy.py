@@ -2235,8 +2235,6 @@ class _JsonSyncProvider:
     def __init__(self, endpoint: str, *, fail_translate: bool = False) -> None:
         self.endpoint = endpoint
         self.fail_translate = fail_translate
-        self.translated_responses: list[dict] = []
-        self.stream_calls = 0
 
     async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {"Authorization": "Bearer json-token"}
@@ -2245,7 +2243,6 @@ class _JsonSyncProvider:
         return {"provider_prompt": anthropic_req["messages"][0]["content"]}, []
 
     def translate_response(self, provider_resp: dict) -> dict:
-        self.translated_responses.append(provider_resp)
         if self.fail_translate:
             raise ValueError("translator exploded")
         return {
@@ -2262,7 +2259,6 @@ class _JsonSyncProvider:
         }
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
-        self.stream_calls += 1
         if False:
             yield {}
 
@@ -2338,16 +2334,6 @@ async def test_forward_via_provider_json_sync_calls_translate_response(
         "content": [{"type": "text", "text": "hello from json mode"}],
         "usage": {"input_tokens": 11, "output_tokens": 7},
     }
-    assert provider.translated_responses == [
-        {
-            "id": "provider-123",
-            "model": "json-model",
-            "text": "hello from json mode",
-            "finish_reason": "end_turn",
-            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
-        }
-    ]
-    assert provider.stream_calls == 0
 
 
 @pytest.mark.asyncio
@@ -2368,8 +2354,6 @@ async def test_forward_via_provider_json_sync_malformed_json_returns_502(
         "type": "error",
         "error": {"type": "api_error", "message": "could not parse provider response"},
     }
-    assert provider.translated_responses == []
-    assert provider.stream_calls == 0
 
 
 @pytest.mark.asyncio
@@ -2377,7 +2361,13 @@ async def test_forward_via_provider_json_sync_translate_failure_returns_502(
     _json_provider_mock,
     http_client,
 ):
-    """Provider translate_response failures become Anthropic-shaped 502 envelopes."""
+    """A translate_response failure returns a translation-specific 502 message.
+
+    The provider body parsed fine, so the message must differ from the malformed-JSON
+    case ("could not parse provider response"). That distinguishable message is the
+    behavioral oracle proving the translate path — not the parse path — produced the
+    502, without inspecting internal call shape.
+    """
     from claude_bridge.proxy import _forward_via_provider
 
     provider = _JsonSyncProvider(_json_provider_mock, fail_translate=True)
@@ -2388,18 +2378,8 @@ async def test_forward_via_provider_json_sync_translate_failure_returns_502(
     response = json.loads(body)
     assert response == {
         "type": "error",
-        "error": {"type": "api_error", "message": "could not parse provider response"},
+        "error": {"type": "api_error", "message": "provider response translation failed"},
     }
-    assert provider.translated_responses == [
-        {
-            "id": "provider-123",
-            "model": "json-model",
-            "text": "hello from json mode",
-            "finish_reason": "end_turn",
-            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
-        }
-    ]
-    assert provider.stream_calls == 0
 
 
 @pytest.mark.asyncio
@@ -2430,6 +2410,38 @@ async def test_forward_via_provider_sse_sync_does_not_call_translate_response(
         }
     ]
     assert response["stop_reason"] == "tool_use"
+
+
+@pytest.mark.asyncio
+async def test_forward_via_provider_sse_sync_translate_stream_failure_returns_502(
+    _codex_sse_mock, http_client
+):
+    """An SSE-sync translate_stream failure yields the translation-specific 502.
+
+    Same distinguishable-message contract as the JSON path: a translator that raises is
+    reported as a translation failure, not a parse failure ("could not parse..."). The
+    message is the behavioral oracle — both response-translation paths share it.
+    """
+    from claude_bridge.proxy import _forward_via_provider
+
+    class _SseTranslateFailProvider(_FakeOpenAIProvider):
+        async def translate_stream(self, raw_chunks):
+            async for _chunk in raw_chunks:
+                raise ValueError("stream translator exploded")
+            yield {}  # unreachable — present so this is an async generator
+
+    url, payload = _codex_sse_mock
+    payload["bytes"] = b"data: {}\n\n"
+    provider = _SseTranslateFailProvider(endpoint=f"{url}/v1/responses")
+
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
+
+    assert status == 502
+    response = json.loads(body)
+    assert response == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "provider response translation failed"},
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -532,10 +532,14 @@ async def _forward_via_provider(
     if provider_capabilities(provider).sync_response_mode == "json":
         try:
             provider_response = json.loads(raw_response)
+        except (json.JSONDecodeError, ValueError):
+            logger.exception("Provider JSON response did not parse")
+            return 502, anthropic_error_body(502, "could not parse provider response")
+        try:
             anthropic_response = provider.translate_response(provider_response)
         except Exception:
-            logger.exception("Provider JSON response translation failed")
-            return 502, anthropic_error_body(502, "could not parse provider response")
+            logger.exception("Provider response translation failed")
+            return 502, anthropic_error_body(502, "provider response translation failed")
         trace_provider_response(anthropic_response)
         return 200, json.dumps(anthropic_response).encode()
 
@@ -550,7 +554,7 @@ async def _forward_via_provider(
         events = [event async for event in provider.translate_stream(_single_chunk())]
     except Exception:
         logger.exception("Provider stream translation failed")
-        return 502, anthropic_error_body(502, "could not parse provider response")
+        return 502, anthropic_error_body(502, "provider response translation failed")
 
     anthropic_response = aggregate_stream_to_message(events)
     if anthropic_response is None:
