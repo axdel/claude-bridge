@@ -38,7 +38,7 @@ _UNSAFE_CHAR = st.sampled_from([chr(cp) for cp in _UNSAFE_CODEPOINTS])
 
 @pytest.mark.parametrize("validate", _VALIDATORS)
 @given(token=st.text())
-def test_accepts_iff_nonempty_printable_ascii(validate, token):
+def test_property_accepts_iff_nonempty_printable_ascii(validate, token):
     """Accept-and-return-unchanged iff the token is non-empty printable ASCII; else reject.
 
     Oracle: the RFC 7235 token68 header-safety predicate written independently as an
@@ -60,7 +60,7 @@ def test_accepts_iff_nonempty_printable_ascii(validate, token):
 
 @pytest.mark.parametrize("validate", _VALIDATORS)
 @given(secret=st.text(alphabet=_TOKEN_ALPHABET, min_size=16), bad=_UNSAFE_CHAR)
-def test_rejected_credential_is_never_echoed(validate, secret, bad):
+def test_property_rejected_credential_never_echoed(validate, secret, bad):
     """A malformed credential is rejected AND never appears in the error (CWE-532).
 
     Oracle: the security requirement itself — the raised message must not contain the

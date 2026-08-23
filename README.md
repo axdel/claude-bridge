@@ -73,7 +73,7 @@ of leaking provider-incompatible content.
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
 - **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
 - **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
-- **621 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **671 tests** — coverage measured, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -377,7 +377,23 @@ uv run pytest tests/ -v     # installs test deps on first run, shows coverage
 ```
 
 No external services — every test uses mock HTTP servers or pure-function
-fixtures. Coverage is enforced at 80%.
+fixtures. Coverage is measured and reported on every run (report-only; the ratchet is
+reviewer-enforced against trunk, not a hard addopts floor — see DECISIONS.md D-QUALITY-002).
+
+### Branch-review quality gate
+
+The full pre-merge quality roster (lint, types, security, complexity, dead code,
+dependencies, architecture, dependency metrics, property tests, coverage, clones)
+runs through a wrapper script:
+
+```bash
+scripts/quality-review.sh    # full branch-review roster
+```
+
+The wrapper sets `PYTHONPATH=src` before invoking the gate: the dependency-metrics
+tool (grimp) runs under the globally-installed claude-protocol interpreter, which
+does not carry this project's editable install, so the src-layout package must be on
+its import path (see DECISIONS.md D-QUALITY-003).
 
 ### Mutation testing
 

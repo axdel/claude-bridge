@@ -22,11 +22,16 @@ packages = ["src/claude_bridge"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Coverage is report-only (no --cov-fail-under): the branch-review roster runs the
+# hypothesis property-test check as `pytest -k property` — a subset that structurally
+# cannot reach a global fail-under — and claude-protocol's coverage model is report-only
+# (the ratchet is reviewer-enforced against trunk, not a hard addopts floor). A floor here
+# fails every subset invocation. See DECISIONS.md D-QUALITY-002.
 # --gremlin-no-coverage-filter: pytest-gremlins' coverage-guided test selection
 # under-reports the kill rate here (its per-test map collapses toward one-test-per-line,
 # marking mutants the full suite demonstrably kills as survivors). Full-suite-per-mutant
 # is the correct measurement; harmless (a registered no-op) when --gremlins is inactive.
-addopts = "--cov=claude_bridge --cov-report=term-missing --cov-fail-under=80 --gremlin-no-coverage-filter"
+addopts = "--cov=claude_bridge --cov-report=term-missing --gremlin-no-coverage-filter"
 
 [dependency-groups]
 dev = [
@@ -69,6 +74,14 @@ venv = ".venv"
 # is the only pyproject key that survives the runner's CLI; see DECISIONS.md D-QUALITY-001.
 [tool.vulture]
 ignore_names = ["fp", "newurl", "kw", "format"]
+
+# Dead-dependency detection (deptry). claude_bridge is this project's own package
+# (src-layout), not a third-party dependency. Without this, deptry flags every
+# `import claude_bridge...` as DEP003 "transitive dependency" — the editable install makes
+# it resolvable from site-packages, so deptry's auto-detection misclassifies it.
+# known_first_party is config-only, so it takes effect under the runner's `deptry .` CLI.
+[tool.deptry]
+known_first_party = ["claude_bridge"]
 
 # Architecture-boundary contracts (import-linter). Encodes the one-way import DAG
 # the proxy relies on: providers are self-contained and mutually independent, the
