@@ -142,6 +142,12 @@ def _cross_process_refresh_lock(auth_dir: Path):
         os.close(fd)
 
 
+def _current_tokens(auth_path: Path | None) -> dict:
+    """Return the token mapping from auth.json, supporting nested and flat shapes."""
+    data = read_codex_auth(auth_path)
+    return data.get("tokens", data)
+
+
 async def get_bearer_token(auth_path: Path | None = None, *, force_refresh: bool = False) -> str:
     """Return a valid access token, refreshing if expired.
 
@@ -152,6 +158,12 @@ async def get_bearer_token(auth_path: Path | None = None, *, force_refresh: bool
     refresh_token. The returned token is header-safety validated (never a
     control-char-bearing credential).
 
+    A proactively-valid token takes a lock-free fast path; only the refresh path
+    (single-use refresh_token + network POST) acquires the lock, re-reading and
+    re-checking on-disk state under it (double-checked locking) so a peer's fresh
+    token is reused rather than triggering a redundant refresh — a fresh-token
+    caller never blocks behind another process's in-flight refresh.
+
     Args:
         force_refresh: Force a refresh regardless of the proactive expiry check —
             the reactive path after an upstream 401 rejects a token that still looks
@@ -159,9 +171,15 @@ async def get_bearer_token(auth_path: Path | None = None, *, force_refresh: bool
             rotated token is honored but the rejected one is never returned. Default
             False keeps proactive behavior (refresh only on expiry).
     """
+    # Fast path: a fresh proactive token needs no refresh, so it takes no lock.
+    if not force_refresh:
+        token = _current_tokens(auth_path)["access_token"]
+        if not is_token_expired(token):
+            return _validated_bearer(token)
+
+    # Refresh path: serialize, then double-check on-disk state under the lock.
     async with _refresh_lock:
-        data = read_codex_auth(auth_path)
-        tokens = data.get("tokens", data)  # support both nested and flat structures
+        tokens = _current_tokens(auth_path)
         token = tokens["access_token"]
 
         if not force_refresh and not is_token_expired(token):

@@ -24,6 +24,7 @@ from claude_bridge.providers.openai.auth import (
     _TOKEN_URL,
     _NoRedirectHandler,
     _on_disk_access_token,
+    _refresh_lock,
     _validated_bearer,
 )
 
@@ -172,6 +173,23 @@ class TestGetBearerToken:
         auth_file.write_text(json.dumps(auth_data))
         result = await get_bearer_token(auth_file)
         assert result == token
+
+    @pytest.mark.asyncio
+    async def test_valid_token_returns_without_waiting_on_the_refresh_lock(self, tmp_path: Path):
+        """A fresh token returns via the lock-free fast path even while a peer holds the
+        refresh lock mid-refresh — so a fresh-token caller never blocks behind another
+        process's in-flight refresh. Oracle: with the lock held, the call must still
+        complete within the timeout and yield the stored token. Kills lock-spanning code
+        (which would block on acquire and trip asyncio.wait_for's TimeoutError)."""
+        valid = _make_jwt({"exp": time.time() + 3600})
+        auth_data = {"auth_mode": "chatgpt", "access_token": valid, "refresh_token": "ref_xyz"}
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+
+        async with _refresh_lock:  # a peer is mid-refresh, holding the lock
+            result = await asyncio.wait_for(get_bearer_token(auth_file), timeout=1.0)
+        assert result == valid
 
     @pytest.mark.asyncio
     async def test_force_refresh_refreshes_even_a_valid_token(self, monkeypatch, tmp_path: Path):

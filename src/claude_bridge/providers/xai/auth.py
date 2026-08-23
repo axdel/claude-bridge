@@ -210,7 +210,10 @@ async def get_xai_bearer_token(
     event loop, and a cross-process ``flock`` (see ``refresh_xai_token``) across
     separate ``claude-grok`` processes — so callers with an expired token share a
     single refresh instead of stampeding the endpoint and burning the single-use
-    refresh_token.
+    refresh_token. A proactively-valid token takes a lock-free fast path; only the
+    refresh path acquires the lock and re-checks on-disk state under it
+    (double-checked locking), so a fresh-token caller never blocks behind another
+    process's in-flight refresh.
 
     Refresh is proactive by default (expiry checked before each request). Pass
     ``force_refresh=True`` for the reactive path — after an upstream 401 — which
@@ -227,6 +230,14 @@ async def get_xai_bearer_token(
             ``refresh_xai_token``; also raised if the token is expired (or a refresh
             is forced) and no refresh token is present.
     """
+    # Fast path: a fresh proactive token needs no refresh, so it takes no lock.
+    if not force_refresh:
+        _, entry = read_xai_auth(auth_path)
+        token = entry.get("key")
+        if isinstance(token, str) and not _xai_token_expired(entry):
+            return _validated_bearer(token)
+
+    # Refresh path: serialize, then double-check on-disk state under the lock.
     async with _xai_refresh_lock:
         entry_key, entry = read_xai_auth(auth_path)
         token = entry.get("key")

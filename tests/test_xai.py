@@ -50,7 +50,11 @@ from claude_bridge.providers.xai import (
     translate_xai_sse_event,
     xai_to_anthropic,
 )
-from claude_bridge.providers.xai.auth import _TOKEN_OPENER, _NoRedirectHandler
+from claude_bridge.providers.xai.auth import (
+    _TOKEN_OPENER,
+    _NoRedirectHandler,
+    _xai_refresh_lock,
+)
 
 _CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 _ENTRY_KEY = f"https://auth.x.ai::{_CLIENT_ID}"
@@ -313,6 +317,19 @@ class TestGetXaiBearerToken:
         data = _grok_auth()
         auth_file = _write_grok_auth(tmp_path, data)
         result = await get_xai_bearer_token(auth_file)
+        assert result == data[_ENTRY_KEY]["key"]
+
+    @pytest.mark.asyncio
+    async def test_valid_token_returns_without_waiting_on_the_refresh_lock(self, tmp_path: Path):
+        """A fresh token returns via the lock-free fast path even while a peer holds the
+        refresh lock mid-refresh — so a fresh-token caller never blocks behind another
+        process's in-flight refresh. Oracle: with the lock held, the call must still
+        complete within the timeout and yield the stored token. Kills lock-spanning code
+        (which would block on acquire and trip asyncio.wait_for's TimeoutError)."""
+        data = _grok_auth()
+        auth_file = _write_grok_auth(tmp_path, data)
+        async with _xai_refresh_lock:  # a peer is mid-refresh, holding the lock
+            result = await asyncio.wait_for(get_xai_bearer_token(auth_file), timeout=1.0)
         assert result == data[_ENTRY_KEY]["key"]
 
     @pytest.mark.asyncio
