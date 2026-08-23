@@ -9,8 +9,10 @@ dependencies = ["httpx[http2]>=0.27"]
 # venv (hatchling is a build-time tool, not a runtime dependency). The runtime
 # carries one dependency — httpx[http2] — for HTTP/2 + split-timeout streaming
 # transport (D-RUNTIME-002 supersedes the former stdlib-only D-RUNTIME-001).
-# Launchers run `python -m claude_bridge` with explicit PYTHONPATH=src; the venv
-# supplies httpx and its h2 extra.
+# Launchers run the bridge through the project venv interpreter as
+# `.venv/bin/python -I -m claude_bridge`: isolated mode (-I) drops CWD, PYTHONPATH, and
+# per-user site (CWE-427), so the package is importable only via its editable install into
+# the venv (D-BUILD-001), which also supplies httpx and its h2 extra. See D-RUNTIME-003.
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
