@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import stat
 import time
 from pathlib import Path
 
@@ -17,6 +19,14 @@ from claude_bridge.providers.openai import (
     read_codex_auth,
     refresh_access_token,
 )
+from claude_bridge.providers.openai.auth import (
+    _TOKEN_OPENER,
+    _TOKEN_URL,
+    _NoRedirectHandler,
+    _on_disk_access_token,
+    _refresh_lock,
+    _validated_bearer,
+)
 
 
 def _make_jwt(payload: dict) -> str:
@@ -25,6 +35,22 @@ def _make_jwt(payload: dict) -> str:
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=")
     signature = base64.urlsafe_b64encode(b"fakesig").rstrip(b"=")
     return f"{header.decode()}.{body.decode()}.{signature.decode()}"
+
+
+class _FakeTokenResp:
+    """Minimal _TOKEN_OPENER.open context-manager stand-in returning a fixed JSON body."""
+
+    def __init__(self, body: dict):
+        self._data = json.dumps(body).encode()
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self) -> _FakeTokenResp:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
 
 
 # --- decode_jwt_exp ---
@@ -149,6 +175,58 @@ class TestGetBearerToken:
         assert result == token
 
     @pytest.mark.asyncio
+    async def test_valid_token_returns_without_waiting_on_the_refresh_lock(self, tmp_path: Path):
+        """A fresh token returns via the lock-free fast path even while a peer holds the
+        refresh lock mid-refresh — so a fresh-token caller never blocks behind another
+        process's in-flight refresh. Oracle: with the lock held, the call must still
+        complete within the timeout and yield the stored token. Kills lock-spanning code
+        (which would block on acquire and trip asyncio.wait_for's TimeoutError)."""
+        valid = _make_jwt({"exp": time.time() + 3600})
+        auth_data = {"auth_mode": "chatgpt", "access_token": valid, "refresh_token": "ref_xyz"}
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+
+        async with _refresh_lock:  # a peer is mid-refresh, holding the lock
+            result = await asyncio.wait_for(get_bearer_token(auth_file), timeout=1.0)
+        assert result == valid
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_refreshes_even_a_valid_token(self, monkeypatch, tmp_path: Path):
+        """Reactive 401 parity with xAI: a proactively-valid Codex token that upstream
+        rejected must be force-refreshed, not returned as-is. Oracle: the mocked refresh
+        returns a new access_token; force yields it, a no-op returns the old one."""
+        valid_token = _make_jwt({"exp": time.time() + 3600})
+        new_token = _make_jwt({"exp": time.time() + 7200})
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": valid_token,
+            "refresh_token": "ref_xyz",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+
+        class _FakeResp:
+            def __init__(self) -> None:
+                self._data = json.dumps({"access_token": new_token}).encode()
+
+            def read(self) -> bytes:
+                return self._data
+
+            def __enter__(self) -> _FakeResp:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open", lambda *a, **kw: _FakeResp()
+        )
+        result = await get_bearer_token(auth_file, force_refresh=True)
+        assert result == new_token
+
+    @pytest.mark.asyncio
     async def test_malformed_stored_token_raises_value_error(self, tmp_path: Path):
         """Malformed access_token in auth.json raises ValueError from is_token_expired."""
         auth_data = {
@@ -178,7 +256,9 @@ class TestGetBearerToken:
         def _raise_timeout(*args, **kwargs):
             raise TimeoutError("Connection timed out")
 
-        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open", _raise_timeout
+        )
         with pytest.raises(ValueError, match="Token refresh failed"):
             await get_bearer_token(auth_file)
 
@@ -240,7 +320,9 @@ class TestRefreshAccessTokenErrors:
                 None,
             )
 
-        monkeypatch.setattr("urllib.request.urlopen", _raise_http_error)
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open", _raise_http_error
+        )
         auth_file = tmp_path / "auth.json"
         auth_file.write_text("{}")
         with pytest.raises(ValueError, match="Token refresh failed"):
@@ -251,7 +333,9 @@ class TestRefreshAccessTokenErrors:
         def _raise_timeout(*args, **kwargs):
             raise TimeoutError("Connection timed out")
 
-        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open", _raise_timeout
+        )
         auth_file = tmp_path / "auth.json"
         auth_file.write_text("{}")
         with pytest.raises(ValueError, match="Token refresh failed"):
@@ -273,11 +357,360 @@ class TestRefreshAccessTokenErrors:
             def __exit__(self, *args):
                 pass
 
-        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: _FakeResp())
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open", lambda *a, **kw: _FakeResp()
+        )
         auth_file = tmp_path / "auth.json"
         auth_file.write_text("{}")
         with pytest.raises(ValueError, match="missing 'access_token'"):
             await refresh_access_token("fake-refresh-token", auth_path=auth_file)
+
+
+# --- _validated_bearer: header-safety gate for the outbound bearer ---
+
+
+class TestValidatedBearer:
+    """_validated_bearer — the header-safety gate for the outbound Codex bearer.
+
+    Oracle: RFC 7235 defines a bearer credential as ``token68`` — printable ASCII
+    with no control characters. Every expected verdict derives from that grammar,
+    never from running the validator. Security invariant: a rejection message never
+    contains the token value (CWE-532).
+    """
+
+    def test_clean_jwt_passes_through_unchanged(self):
+        token = _make_jwt({"exp": time.time() + 3600})
+        assert _validated_bearer(token) == token
+
+    def test_empty_token_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("")
+
+    def test_carriage_return_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("good\rX-Injected: evil")
+
+    def test_newline_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("good\nX-Injected: evil")
+
+    def test_tab_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("good\tinjected")
+
+    def test_non_ascii_rejected(self):
+        with pytest.raises(ValueError, match="malformed"):
+            _validated_bearer("tökén-with-unicode")
+
+    def test_message_never_contains_the_token_value(self):
+        bearer = "SUPER-SECRET-BEARER\r\ninjected"
+        with pytest.raises(ValueError) as excinfo:
+            _validated_bearer(bearer)
+        assert "SUPER-SECRET-BEARER" not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_control_char_bearer_rejected_end_to_end(self, tmp_path: Path):
+        # A fresh (valid-exp) but CR/LF-poisoned bearer must be rejected BEFORE it
+        # reaches an Authorization header — else http.client echoes the secret into an
+        # "Invalid header value" ValueError (CWE-532). Oracle: RFC 7235 forbids control
+        # chars, and the raised message must not contain the token. Fails against code
+        # that skips validation (it would return the poisoned token).
+        valid = _make_jwt({"exp": time.time() + 3600})
+        poisoned = valid + "\r\nX-Injected: evil"
+        auth_data = {"auth_mode": "chatgpt", "access_token": poisoned, "refresh_token": "ref"}
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+        with pytest.raises(ValueError, match="malformed") as excinfo:
+            await get_bearer_token(auth_file)
+        assert poisoned not in str(excinfo.value)
+        assert "evil" not in str(excinfo.value)
+
+
+# --- _NoRedirectHandler: the token endpoint never redirects (SSRF, CWE-918) ---
+
+
+class TestNoRedirectOpener:
+    """The refresh opener refuses every 3xx from the token endpoint.
+
+    Oracle: a token endpoint never legitimately redirects; following a
+    provider-controlled ``Location`` would drive an arbitrary internal request whose
+    response is then parsed as token JSON (SSRF). The refusal must carry no redirect URL.
+    """
+
+    def test_handler_is_wired_into_the_refresh_opener(self):
+        # Kills a mutant that drops _NoRedirectHandler from build_opener (redirects
+        # would then be followed automatically). OpenerDirector.handlers is a real
+        # documented CPython attribute the typeshed stub omits, hence the ignore.
+        handlers = _TOKEN_OPENER.handlers  # type: ignore[attr-defined]
+        assert any(isinstance(h, _NoRedirectHandler) for h in handlers)
+
+    def test_redirect_refused_without_echoing_target(self):
+        import http.client
+        import io
+        import urllib.error
+        import urllib.request
+
+        handler = _NoRedirectHandler()
+        target = "http://169.254.169.254/latest/meta-data/"
+        req = urllib.request.Request(_TOKEN_URL)
+        with pytest.raises(urllib.error.URLError) as excinfo:
+            handler.redirect_request(
+                req, io.BytesIO(), 302, "Found", http.client.HTTPMessage(), target
+            )
+        assert target not in str(excinfo.value)
+        assert "169.254.169.254" not in str(excinfo.value)
+
+
+# --- _on_disk_access_token: best-effort re-read for the cross-process double-check ---
+
+
+class TestOnDiskAccessToken:
+    def test_returns_none_when_file_absent(self, tmp_path: Path):
+        assert _on_disk_access_token(tmp_path / "nope.json") is None
+
+    def test_returns_none_on_corrupt_json(self, tmp_path: Path):
+        f = tmp_path / "auth.json"
+        f.write_text("{ not json")
+        assert _on_disk_access_token(f) is None
+
+    def test_reads_flat_access_token(self, tmp_path: Path):
+        f = tmp_path / "auth.json"
+        f.write_text(json.dumps({"access_token": "tok-flat"}))
+        assert _on_disk_access_token(f) == "tok-flat"
+
+    def test_reads_nested_access_token(self, tmp_path: Path):
+        f = tmp_path / "auth.json"
+        f.write_text(json.dumps({"tokens": {"access_token": "tok-nested"}}))
+        assert _on_disk_access_token(f) == "tok-nested"
+
+
+# --- refresh_access_token: persistence, permissions, endpoint pinning ---
+
+
+class TestRefreshAccessTokenPersistence:
+    """The refresh persists the rotated secret atomically at 0600 and pins the endpoint."""
+
+    def _expired_file(self, tmp_path: Path, **overrides) -> Path:
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": _make_jwt({"exp": time.time() - 100}),
+            "refresh_token": "ref-original",
+        }
+        auth_data.update(overrides)
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+        return auth_file
+
+    @pytest.mark.asyncio
+    async def test_persists_new_access_token_and_rotates_refresh(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Oracle: the mocked response carries a new access_token AND refresh_token; both
+        # must land in auth.json (RFC 6749 §6 single-use rotation). Fails against code that
+        # returns the token without persisting, or drops the rotated refresh_token.
+        new_access = _make_jwt({"exp": time.time() + 3600})
+        auth_file = self._expired_file(tmp_path)
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp(
+                {"access_token": new_access, "refresh_token": "ref-rotated"}
+            ),
+        )
+        returned = await refresh_access_token("ref-original", auth_path=auth_file)
+        assert returned == new_access
+        persisted = json.loads(auth_file.read_text())
+        assert persisted["access_token"] == new_access
+        assert persisted["refresh_token"] == "ref-rotated"
+
+    @pytest.mark.asyncio
+    async def test_keeps_refresh_token_when_response_omits_it(self, monkeypatch, tmp_path: Path):
+        # RFC 6749 §6: a token response MAY omit refresh_token, meaning "keep the current
+        # one". Fails against code that overwrites it with an empty/None value.
+        new_access = _make_jwt({"exp": time.time() + 3600})
+        auth_file = self._expired_file(tmp_path)
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_access}),
+        )
+        await refresh_access_token("ref-original", auth_path=auth_file)
+        assert json.loads(auth_file.read_text())["refresh_token"] == "ref-original"
+
+    @pytest.mark.asyncio
+    async def test_preserves_sibling_fields(self, monkeypatch, tmp_path: Path):
+        # Fields the bridge does not own (account_id, auth_mode) survive the rewrite —
+        # the whole document is re-serialized, only the two token fields change.
+        new_access = _make_jwt({"exp": time.time() + 3600})
+        auth_file = self._expired_file(tmp_path, account_id="acct-1")
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_access}),
+        )
+        await refresh_access_token("ref-original", auth_path=auth_file)
+        persisted = json.loads(auth_file.read_text())
+        assert persisted["account_id"] == "acct-1"
+        assert persisted["auth_mode"] == "chatgpt"
+
+    @pytest.mark.asyncio
+    async def test_tightens_permissions_to_owner_only(self, monkeypatch, tmp_path: Path):
+        # The rotated secret is ALWAYS rewritten owner-only (0600, CWE-732). Even when the
+        # prior file was world/group-readable, the refresh must tighten — never carry broad
+        # bits forward (0644 in must become 0600 out). Fails against mode-preserving code.
+        new_access = _make_jwt({"exp": time.time() + 3600})
+        auth_file = self._expired_file(tmp_path)
+        auth_file.chmod(0o644)  # start broad — a world-readable secret
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_access}),
+        )
+        await refresh_access_token("ref-original", auth_path=auth_file)
+        assert stat.S_IMODE(os.stat(auth_file).st_mode) == 0o600
+
+    @pytest.mark.asyncio
+    async def test_failure_leaves_file_byte_identical(self, monkeypatch, tmp_path: Path):
+        # A failed refresh must not partially rewrite auth.json — the mkstemp temp is
+        # unlinked and the original is untouched. Fails against code that truncates the
+        # file before the POST.
+        auth_file = self._expired_file(tmp_path)
+        before = auth_file.read_bytes()
+
+        def _boom(*a, **kw):
+            raise TimeoutError("boom")
+
+        monkeypatch.setattr("claude_bridge.providers.openai.auth._TOKEN_OPENER.open", _boom)
+        with pytest.raises(ValueError, match="Token refresh failed"):
+            await refresh_access_token("ref-original", auth_path=auth_file)
+        assert auth_file.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_untrusted_endpoint_refused(self, monkeypatch, tmp_path: Path):
+        # Defense in depth (CWE-918): the refresh_token is POSTed only to HTTPS on the
+        # pinned host. Point _TOKEN_URL at an attacker host (the derived _TRUSTED_TOKEN_HOST
+        # stays pinned to auth.openai.com) and the refresh must refuse before any network
+        # call. Oracle: the endpoint-mismatch guard raises; _boom proves no POST fired.
+        auth_file = self._expired_file(tmp_path)
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_URL",
+            "https://attacker.example/oauth/token",
+        )
+
+        def _boom(*a, **kw):
+            raise AssertionError("must refuse before contacting an untrusted endpoint")
+
+        monkeypatch.setattr("claude_bridge.providers.openai.auth._TOKEN_OPENER.open", _boom)
+        with pytest.raises(ValueError, match="untrusted Codex token endpoint"):
+            await refresh_access_token("ref-original", auth_path=auth_file)
+
+
+class TestCrossProcessRefreshLock:
+    """Refresh serializes across separate ``claude-codex`` processes and skips a
+    now-redundant POST — the cross-process advisory lock plus its double-check.
+
+    Codex shares the single-use refresh_token stampede risk (RFC 6749 §6): the
+    process-local ``asyncio.Lock`` guards one event loop, so without an OS-level lock
+    three separate processes each hold their own and stampede the endpoint, the first
+    consumes the refresh_token, and the losers fail on the dead one. Oracle: a loser
+    that re-reads a freshly-rotated valid token MUST use it and skip its own POST.
+    """
+
+    def _expired_file(self, tmp_path: Path) -> Path:
+        auth_data = {
+            "auth_mode": "chatgpt",
+            "access_token": _make_jwt({"exp": time.time() - 100}),
+            "refresh_token": "ref-original",
+        }
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+        return auth_file
+
+    def _valid_file(self, tmp_path: Path, token: str) -> Path:
+        auth_data = {"auth_mode": "chatgpt", "access_token": token, "refresh_token": "ref"}
+        auth_file = tmp_path / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(json.dumps(auth_data))
+        return auth_file
+
+    @pytest.mark.asyncio
+    async def test_refresh_skips_network_when_token_already_valid(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Double-check under the lock: a valid on-disk token (a peer rotated it while we
+        # waited) short-circuits — the POST is skipped and the fresh token returned. Fails
+        # against unconditional-POST code (which would call _boom and raise).
+        valid = _make_jwt({"exp": time.time() + 3600})
+        auth_file = self._valid_file(tmp_path, valid)
+
+        def _boom(*a, **kw):
+            raise AssertionError("network refresh must not run when the token is already valid")
+
+        monkeypatch.setattr("claude_bridge.providers.openai.auth._TOKEN_OPENER.open", _boom)
+        returned = await refresh_access_token("ref", auth_path=auth_file)
+        assert returned == valid
+
+    @pytest.mark.asyncio
+    async def test_reactive_refresh_posts_when_ondisk_is_the_rejected_token(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Reactive 401 path: the on-disk token passes the proactive expiry check yet
+        # upstream just rejected it. Passing it as stale_token must force the POST — the
+        # double-check may NOT short-circuit on "looks valid" and hand the rejected
+        # credential back. Oracle: the mocked refresh returns a new token; a correct force
+        # yields it. Kills a dropped ``!= stale_token`` clause and its flip.
+        rejected = _make_jwt({"exp": time.time() + 3600})
+        new_token = _make_jwt({"exp": time.time() + 7200})
+        auth_file = self._valid_file(tmp_path, rejected)
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token}),
+        )
+        returned = await refresh_access_token("ref", auth_path=auth_file, stale_token=rejected)
+        assert returned == new_token
+
+    @pytest.mark.asyncio
+    async def test_reactive_refresh_skips_when_a_peer_already_rotated(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # A peer refreshed while we waited: the on-disk token DIFFERS from the one we
+        # rejected and is valid. The double-check must return the peer's fresh token and
+        # skip the POST — our own refresh_token may be the single-use one the peer spent.
+        # Oracle: the opener must never fire; the returned token is the peer's.
+        rejected = _make_jwt({"exp": time.time() + 3600})
+        peer_token = _make_jwt({"exp": time.time() + 7200})
+        auth_file = self._valid_file(tmp_path, peer_token)
+
+        def _boom(*a, **kw):
+            raise AssertionError("refresh POST fired though a peer already rotated the token")
+
+        monkeypatch.setattr("claude_bridge.providers.openai.auth._TOKEN_OPENER.open", _boom)
+        returned = await refresh_access_token("ref", auth_path=auth_file, stale_token=rejected)
+        assert returned == peer_token
+
+    @pytest.mark.asyncio
+    async def test_lock_released_after_successful_refresh(self, monkeypatch, tmp_path: Path):
+        # After a successful refresh the lock is released — a subsequent non-blocking
+        # exclusive acquire succeeds (no BlockingIOError). Kills a mutant that leaks the
+        # fd/lock (dropped finally), which would deadlock every later refresh. The lock
+        # file is owner-only (0600), consistent with ~/.codex hygiene.
+        import fcntl
+
+        auth_file = self._expired_file(tmp_path)
+        new_token = _make_jwt({"exp": time.time() + 3600})
+        monkeypatch.setattr(
+            "claude_bridge.providers.openai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token}),
+        )
+        await refresh_access_token("ref-original", auth_path=auth_file)
+
+        lock_path = auth_file.parent / ".codex-refresh.lock"
+        assert stat.S_IMODE(os.stat(lock_path).st_mode) == 0o600
+        probe_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(probe_fd)
 
 
 # --- OpenAIProvider auth modes ---

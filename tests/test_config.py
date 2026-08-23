@@ -2,27 +2,60 @@
 
 from __future__ import annotations
 
+import pytest
 
-def test_upstream_timeout_defaults_and_env_override(monkeypatch):
-    """UPSTREAM_TIMEOUT is read at call time and falls back for invalid values."""
+
+@pytest.mark.parametrize(
+    ("accessor_name", "env_name", "default"),
+    [
+        ("connect_timeout", "CONNECT_TIMEOUT_ENV", 10.0),
+        ("stream_idle_timeout", "STREAM_IDLE_TIMEOUT_ENV", 300.0),
+        ("pool_idle", "POOL_IDLE_ENV", 90.0),
+    ],
+)
+def test_positive_float_timeout_accessor_default_override_and_invalid_fallback(
+    monkeypatch, accessor_name, env_name, default
+):
+    """Each HTTP/2 timeout accessor returns its spec default, honors a positive override,
+    and falls back (invoking on_invalid) for unparseable or non-positive values."""
     import claude_bridge.config as config
 
-    monkeypatch.delenv(config.UPSTREAM_TIMEOUT_ENV, raising=False)
-    assert config.upstream_timeout(60) == 60
-    assert config.upstream_timeout(120) == 120
+    accessor = getattr(config, accessor_name)
+    env_var = getattr(config, env_name)
 
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "30")
-    assert config.upstream_timeout(60) == 30
-    assert config.upstream_timeout(120) == 30
+    monkeypatch.delenv(env_var, raising=False)
+    assert accessor() == default
+
+    monkeypatch.setenv(env_var, "42.5")
+    assert accessor() == 42.5
 
     invalid_values: list[str] = []
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "not-a-number")
-    assert config.upstream_timeout(120, on_invalid=invalid_values.append) == 120
+    monkeypatch.setenv(env_var, "not-a-number")
+    assert accessor(on_invalid=invalid_values.append) == default
     assert invalid_values == ["not-a-number"]
 
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
-    assert config.upstream_timeout(120, on_invalid=invalid_values.append) == 120
+    monkeypatch.setenv(env_var, "0")
+    assert accessor(on_invalid=invalid_values.append) == default
     assert invalid_values == ["not-a-number", "0"]
+
+    monkeypatch.setenv(env_var, "-5")
+    assert accessor(on_invalid=invalid_values.append) == default
+    assert invalid_values == ["not-a-number", "0", "-5"]
+
+    # Non-finite floats parse cleanly but are not usable timeouts. NaN in particular slips
+    # past a bare ``value <= 0`` guard (every NaN comparison is False), so without an
+    # isfinite check these would return nan/inf instead of the default.
+    monkeypatch.setenv(env_var, "nan")
+    assert accessor(on_invalid=invalid_values.append) == default
+    assert invalid_values == ["not-a-number", "0", "-5", "nan"]
+
+    monkeypatch.setenv(env_var, "inf")
+    assert accessor(on_invalid=invalid_values.append) == default
+    assert invalid_values == ["not-a-number", "0", "-5", "nan", "inf"]
+
+    monkeypatch.setenv(env_var, "-inf")
+    assert accessor(on_invalid=invalid_values.append) == default
+    assert invalid_values == ["not-a-number", "0", "-5", "nan", "inf", "-inf"]
 
 
 def test_max_request_body_default_and_override(monkeypatch):
@@ -105,6 +138,34 @@ def test_xai_model_default_and_env_override(monkeypatch):
 
     monkeypatch.setenv(config.XAI_MODEL_ENV, "   ")
     assert config.xai_model() == "grok-4.6"
+
+
+def test_xai_reasoning_effort_default_and_env_override(monkeypatch):
+    """XAI_REASONING_EFFORT defaults to low and trims/normalizes blank overrides."""
+    import claude_bridge.config as config
+
+    monkeypatch.delenv(config.XAI_REASONING_EFFORT_ENV, raising=False)
+    assert config.xai_reasoning_effort() == "low"
+
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "medium")
+    assert config.xai_reasoning_effort() == "medium"
+
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "  high  ")
+    assert config.xai_reasoning_effort() == "high"
+
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "   ")
+    assert config.xai_reasoning_effort() == "low"
+
+    # A case-varied but valid override normalizes to the lowercase wire value.
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "HIGH")
+    assert config.xai_reasoning_effort() == "high"
+
+    # An out-of-set value (e.g. a typo) falls back to the default and reports the raw
+    # string through on_invalid, rather than shipping {'effort': 'hihg'} to every request.
+    invalid_values: list[str] = []
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "hihg")
+    assert config.xai_reasoning_effort(on_invalid=invalid_values.append) == "low"
+    assert invalid_values == ["hihg"]
 
 
 def test_xai_client_version_env_override_wins_verbatim(monkeypatch, tmp_path):
@@ -202,3 +263,33 @@ def test_xai_client_version_blank_env_falls_through_to_bundle(monkeypatch, tmp_p
     (tmp_path / "grok-0.2.93-macos-aarch64").mkdir()
     monkeypatch.setenv(config.XAI_CLIENT_VERSION_ENV, "   ")
     assert config.xai_client_version(downloads_dir=tmp_path) == "0.2.93"
+
+
+def test_validate_upstream_url_accepts_https_and_loopback_rejects_cleartext_and_userinfo():
+    """The passthrough upstream carries the prompt and x-api-key, so cleartext http to a
+    non-loopback host (CWE-319 exfiltration) and embedded userinfo credentials are refused;
+    https to any host and http to a loopback host (the local-mock path) pass through
+    unchanged. Expected outcomes derive from the require-https-or-loopback rule, not from
+    running the validator."""
+    import claude_bridge.config as config
+
+    for ok in (
+        "https://api.anthropic.com",
+        "https://internal.corp.example:8443/base",
+        "http://127.0.0.1:9999",
+        "http://localhost:8080",
+        "http://[::1]:9999",
+    ):
+        assert config.validate_upstream_url(ok) == ok
+
+    # Cleartext to a non-loopback host would leak the prompt and api key.
+    with pytest.raises(ValueError, match="https"):
+        config.validate_upstream_url("http://api.anthropic.com")
+
+    # Embedded userinfo credentials are rejected without echoing them.
+    with pytest.raises(ValueError, match="userinfo"):
+        config.validate_upstream_url("https://user:pass@api.anthropic.com")
+
+    # Unsupported scheme.
+    with pytest.raises(ValueError, match="scheme"):
+        config.validate_upstream_url("ftp://example.com")

@@ -3,14 +3,16 @@ name = "claude-bridge"
 version = "0.9.0"
 description = "Use your Claude Code setup with any LLM provider — transparent API translation proxy"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["httpx[http2]>=0.27"]
 
 # Build backend exists so the src-layout package is editable-installable into the
-# venv. This keeps the runtime stdlib-only (hatchling is a build-time tool, not a
-# runtime dependency — D-RUNTIME-001 holds) while making `claude_bridge` importable
-# to dev tooling that resolves via sys.path (import-linter/grimp for the
-# boundary-map architecture gate). Launchers still run `python -m claude_bridge`
-# with explicit PYTHONPATH=src and are unaffected.
+# venv (hatchling is a build-time tool, not a runtime dependency). The runtime
+# carries one dependency — httpx[http2] — for HTTP/2 + split-timeout streaming
+# transport (D-RUNTIME-002 supersedes the former stdlib-only D-RUNTIME-001).
+# Launchers run the bridge through the project venv interpreter as
+# `.venv/bin/python -I -m claude_bridge`: isolated mode (-I) drops CWD, PYTHONPATH, and
+# per-user site (CWE-427), so the package is importable only via its editable install into
+# the venv (D-BUILD-001), which also supplies httpx and its h2 extra. See D-RUNTIME-003.
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -22,7 +24,16 @@ packages = ["src/claude_bridge"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "--cov=claude_bridge --cov-report=term-missing --cov-fail-under=80"
+# Coverage is report-only (no --cov-fail-under): the branch-review roster runs the
+# hypothesis property-test check as `pytest -k property` — a subset that structurally
+# cannot reach a global fail-under — and claude-protocol's coverage model is report-only
+# (the ratchet is reviewer-enforced against trunk, not a hard addopts floor). A floor here
+# fails every subset invocation. See DECISIONS.md D-QUALITY-002.
+# --gremlin-no-coverage-filter: pytest-gremlins' coverage-guided test selection
+# under-reports the kill rate here (its per-test map collapses toward one-test-per-line,
+# marking mutants the full suite demonstrably kills as survivors). Full-suite-per-mutant
+# is the correct measurement; harmless (a registered no-op) when --gremlins is inactive.
+addopts = "--cov=claude_bridge --cov-report=term-missing --gremlin-no-coverage-filter"
 
 [dependency-groups]
 dev = [
@@ -35,6 +46,8 @@ dev = [
     "bandit>=1.9.4",
     "pip-audit>=2.10.0",
     "import-linter>=2.13",
+    "hypothesis>=6.165.10",
+    "deptry>=0.25.1",
 ]
 
 [tool.ruff]
@@ -45,7 +58,8 @@ line-length = 99
 select = ["E", "F", "W", "I", "S", "UP", "B", "C4", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "S105", "S108", "S310"]
+# S603: launcher/isolation tests drive subprocess with sys.executable + fixed args (trusted input).
+"tests/**/*.py" = ["S101", "S105", "S108", "S310", "S603"]
 
 [tool.basedpyright]
 pythonVersion = "3.12"
@@ -53,6 +67,23 @@ pythonPlatform = "All"
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
+
+# Dead-code detection (vulture). ignore_names lists interface-required identifiers that
+# are structurally unused but cannot be removed, so vulture reports them as 100%-confidence
+# false positives: fp/newurl (the urllib redirect_request override that refuses
+# token-endpoint redirects, CWE-918), kw (**kw catch-alls in test doubles), and format
+# (the BaseHTTPRequestHandler.log_message override in the test HTTP servers). ignore_names
+# is the only pyproject key that survives the runner's CLI; see DECISIONS.md D-QUALITY-001.
+[tool.vulture]
+ignore_names = ["fp", "newurl", "kw", "format"]
+
+# Dead-dependency detection (deptry). claude_bridge is this project's own package
+# (src-layout), not a third-party dependency. Without this, deptry flags every
+# `import claude_bridge...` as DEP003 "transitive dependency" — the editable install makes
+# it resolvable from site-packages, so deptry's auto-detection misclassifies it.
+# known_first_party is config-only, so it takes effect under the runner's `deptry .` CLI.
+[tool.deptry]
+known_first_party = ["claude_bridge"]
 
 # Architecture-boundary contracts (import-linter). Encodes the one-way import DAG
 # the proxy relies on: providers are self-contained and mutually independent, the
@@ -72,7 +103,7 @@ modules = [
 [[tool.importlinter.contracts]]
 name = "Proxy dispatches via the provider abstraction, never concrete providers"
 type = "forbidden"
-source_modules = ["claude_bridge.proxy"]
+source_modules = ["claude_bridge.proxy", "claude_bridge.proxy_streaming"]
 forbidden_modules = [
     "claude_bridge.providers.openai",
     "claude_bridge.providers.xai",
@@ -89,9 +120,13 @@ source_modules = [
     "claude_bridge.provider",
     "claude_bridge.stats",
     "claude_bridge.log",
+    "claude_bridge.http_client",
+    "claude_bridge.request_view",
+    "claude_bridge.wire",
 ]
 forbidden_modules = [
     "claude_bridge.proxy",
+    "claude_bridge.proxy_streaming",
     "claude_bridge.router",
     "claude_bridge.__main__",
     "claude_bridge.providers.openai",

@@ -81,31 +81,39 @@ class Router:
                     f"{self._consecutive_failures} consecutive failures",
                 )
 
-    def should_use_fallback(self) -> bool:
+    async def should_use_fallback(self) -> bool:
         """Return True if requests should go to the fallback provider.
 
         In HALF_OPEN: returns False for the first probe request, True for
         concurrent ones.  Also auto-transitions OPEN -> HALF_OPEN when the
         cooldown has expired.
+
+        Serialized through the same lock as record_success/record_failure: this
+        method *writes* circuit-breaker state (the OPEN -> HALF_OPEN transition and
+        the probe-in-flight claim), so the router stays a single writer of its own
+        state. Without the lock, an await added to this body later would let two
+        concurrent callers both claim the probe, defeating the single-probe
+        HALF_OPEN semantic.
         """
-        if self._state is RouterState.CLOSED:
-            return False
+        async with self._lock:
+            if self._state is RouterState.CLOSED:
+                return False
 
-        if self._state is RouterState.OPEN:
-            elapsed = time.monotonic() - self._last_failure_time
-            if elapsed >= self._cooldown_seconds:
-                old = self._state
-                self._state = RouterState.HALF_OPEN
+            if self._state is RouterState.OPEN:
+                elapsed = time.monotonic() - self._last_failure_time
+                if elapsed >= self._cooldown_seconds:
+                    old = self._state
+                    self._state = RouterState.HALF_OPEN
+                    self._probe_in_flight = True
+                    self._log_transition(old, self._state, "cooldown expired")
+                    return False  # first caller gets the probe
+                return True
+
+            # HALF_OPEN
+            if not self._probe_in_flight:
                 self._probe_in_flight = True
-                self._log_transition(old, self._state, "cooldown expired")
                 return False  # first caller gets the probe
-            return True
-
-        # HALF_OPEN
-        if not self._probe_in_flight:
-            self._probe_in_flight = True
-            return False  # first caller gets the probe
-        return True  # concurrent callers use fallback
+            return True  # concurrent callers use fallback
 
     @staticmethod
     def is_failover_eligible(request: dict) -> tuple[bool, str]:

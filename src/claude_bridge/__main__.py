@@ -108,14 +108,17 @@ async def _run(
     provider_kwargs: dict | None = None,
 ) -> None:
     """Start the server and serve until interrupted."""
-    server = await start_proxy(
+    server, client = await start_proxy(
         host=host,
         port=port,
         provider_name=provider_name,
         provider_kwargs=provider_kwargs or {},
     )
-    async with server:
-        await server.serve_forever()
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        await client.aclose()
 
 
 if __name__ == "__main__":

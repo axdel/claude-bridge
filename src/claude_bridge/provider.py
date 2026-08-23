@@ -3,14 +3,17 @@
 Every registered LLM provider implements the ``Provider`` protocol defined here.
 The proxy never imports provider-specific code — it only uses this interface.
 
-To add a new provider:
+To add a new provider (see ``providers/openai/`` as the reference layout):
 
-1. Create ``providers/<name>.py`` with a class implementing ``Provider``
+1. Create a ``providers/<name>/`` sub-package split into ``auth.py`` (credentials),
+   ``translate.py`` (format mapping), ``stream.py`` (SSE), and ``provider.py`` (the
+   ``Provider`` class); re-export the public surface from its ``__init__.py``
 2. Declare ``capabilities`` for proxy-visible transport behavior
 3. ``translate_request``: Anthropic Messages -> your API format
 4. ``translate_response``: your API format -> Anthropic Messages
 5. ``translate_stream``: raw response bytes -> Anthropic SSE events
-6. Register: ``PROVIDERS["<name>"] = YourProviderClass``
+6. Register at the bottom of ``provider.py``: ``PROVIDERS["<name>"] = YourProviderClass``
+7. Import the sub-package in ``__main__.py`` so it registers on startup
 """
 
 from __future__ import annotations
@@ -75,8 +78,14 @@ class Provider(Protocol):
     endpoint: str
     capabilities: ProviderCapabilities
 
-    async def authenticate(self) -> dict[str, str]:
-        """Return headers required to authenticate with this provider."""
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
+        """Return headers required to authenticate with this provider.
+
+        Args:
+            force_refresh: Force a credential refresh regardless of proactive expiry —
+                the reactive path the proxy takes after an upstream 401, before any
+                downstream byte. Default False resolves the credential normally.
+        """
         ...
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -101,3 +110,23 @@ class Provider(Protocol):
 
 # Provider registry — concrete implementations added in later tasks.
 PROVIDERS: dict[str, type[Provider]] = {}
+
+
+def provider_capabilities(provider: Provider) -> ProviderCapabilities:
+    """Return validated provider capabilities or raise a provider-named error.
+
+    Guards the proxy against a dynamically authored provider (e.g. a test double)
+    that omits or mis-declares ``capabilities`` before the transport layer reads it.
+    """
+    provider_name = getattr(provider, "name", type(provider).__name__)
+    capabilities = getattr(provider, "capabilities", None)
+    if not isinstance(capabilities, ProviderCapabilities):
+        msg = f"Provider '{provider_name}' declares invalid capabilities"
+        raise ValueError(msg)
+    return capabilities
+
+
+def validate_provider(provider: Provider) -> Provider:
+    """Validate proxy-visible provider contract fields before caching or serving."""
+    provider_capabilities(provider)
+    return provider

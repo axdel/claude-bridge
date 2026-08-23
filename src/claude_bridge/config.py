@@ -6,21 +6,27 @@ Shell-launcher environment handling remains owned by the launcher scripts.
 
 from __future__ import annotations
 
+import ipaddress
+import math
 import os
 import re
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 REASONING_MODE_ENV = "REASONING_MODE"
 LOG_LEVEL_ENV = "LOG_LEVEL"
-UPSTREAM_TIMEOUT_ENV = "UPSTREAM_TIMEOUT"
 MAX_REQUEST_BODY_ENV = "MAX_REQUEST_BODY"
 LLM_BRIDGE_FALLBACK_ENV = "LLM_BRIDGE_FALLBACK"
 ANTHROPIC_REAL_URL_ENV = "ANTHROPIC_REAL_URL"
 CLAUDE_BRIDGE_TRACE_PATH_ENV = "CLAUDE_BRIDGE_TRACE_PATH"
 XAI_MODEL_ENV = "XAI_MODEL"
 XAI_CLIENT_VERSION_ENV = "XAI_CLIENT_VERSION"
+XAI_REASONING_EFFORT_ENV = "XAI_REASONING_EFFORT"
+CONNECT_TIMEOUT_ENV = "CONNECT_TIMEOUT"
+STREAM_IDLE_TIMEOUT_ENV = "STREAM_IDLE_TIMEOUT"
+POOL_IDLE_ENV = "POOL_IDLE"
 
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_ANTHROPIC_REAL_URL = "https://api.anthropic.com"
@@ -32,6 +38,26 @@ DEFAULT_REASONING_MODE = "passthrough"
 # a known model version; if the id is later deprecated (as `grok-4.20` was), reverting to
 # `grok-build` is a one-line change. Supersedes D-XAI-008. Override per run with XAI_MODEL.
 DEFAULT_XAI_MODEL = "grok-4.6"
+
+# xAI reasoning effort. grok-4.6 accepts omit/low/medium/high (all HTTP 200); `low` is a
+# latency choice (63 vs 146 reasoning tokens at omit), not native-high parity. Sent only to
+# models that accept the field (see anthropic_to_xai's version gate). Override with
+# XAI_REASONING_EFFORT.
+DEFAULT_XAI_REASONING_EFFORT = "low"
+
+# The reasoning-effort values grok-4.6 accepts (all verified HTTP 200). Canonical owner of the
+# allowed set: xai_reasoning_effort() validates against it so a typo falls back to the default
+# rather than shipping an unrecognized effort to every upstream request.
+_XAI_REASONING_EFFORTS = ("low", "medium", "high")
+
+# HTTP/2 transport split timeouts (seconds). A single urllib socket timeout fired on
+# every recv and killed long-thinking grok-4.6 streams at ~120s; these separate
+# connection setup from per-chunk stream idle, so a healthy stream runs as long as
+# chunks keep arriving within DEFAULT_STREAM_IDLE_TIMEOUT. DEFAULT_POOL_IDLE overrides
+# httpx's 5s keepalive_expiry (grok-build holds an idle connection ~90s).
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_STREAM_IDLE_TIMEOUT = 300.0
+DEFAULT_POOL_IDLE = 90.0
 
 # cli-chat-proxy.grok.com answers HTTP 426 below this x-grok-client-version; the
 # resolver never sends a header older than this floor. Bundle dir layout:
@@ -63,22 +89,33 @@ def log_level(explicit_level: str | None = None) -> str:
     return explicit_level or os.environ.get(LOG_LEVEL_ENV, DEFAULT_LOG_LEVEL)
 
 
-def upstream_timeout(
-    default: int,
+def _positive_env_number[NumT: (int, float)](
+    name: str,
+    default: NumT,
     *,
+    cast: Callable[[str], NumT],
     on_invalid: Callable[[str], None] | None = None,
-) -> int:
-    """Return the positive UPSTREAM_TIMEOUT override or the caller's default."""
-    raw = os.environ.get(UPSTREAM_TIMEOUT_ENV)
+) -> NumT:
+    """Return a positive numeric env override parsed by *cast*, else *default*.
+
+    Shared validation for every positive-number setting: a missing var yields the
+    default silently; a present-but-invalid value (unparseable, or not > 0) invokes
+    *on_invalid* and falls back to the default.
+    """
+    raw = os.environ.get(name)
     if raw is None:
         return default
     try:
-        value = int(raw)
+        value = cast(raw)
     except (ValueError, TypeError):
         if on_invalid is not None:
             on_invalid(raw)
         return default
-    if value <= 0:
+    # ``float("nan")``/``float("inf")`` parse cleanly but are not usable timeouts, and NaN
+    # slips past ``value <= 0`` (every NaN comparison is False). Require a finite, positive
+    # value so a non-finite override falls back to the default instead of building a
+    # ``Timeout(connect=nan, ...)`` that never fires. ``math.isfinite`` accepts any int.
+    if not math.isfinite(value) or value <= 0:
         if on_invalid is not None:
             on_invalid(raw)
         return default
@@ -90,20 +127,40 @@ def max_request_body(
     on_invalid: Callable[[str], None] | None = None,
 ) -> int:
     """Return the positive request body limit in bytes, or the default when invalid."""
-    raw = os.environ.get(MAX_REQUEST_BODY_ENV)
-    if raw is None:
-        return DEFAULT_MAX_REQUEST_BODY
-    try:
-        value = int(raw)
-    except (ValueError, TypeError):
-        if on_invalid is not None:
-            on_invalid(raw)
-        return DEFAULT_MAX_REQUEST_BODY
-    if value <= 0:
-        if on_invalid is not None:
-            on_invalid(raw)
-        return DEFAULT_MAX_REQUEST_BODY
-    return value
+    return _positive_env_number(
+        MAX_REQUEST_BODY_ENV, DEFAULT_MAX_REQUEST_BODY, cast=int, on_invalid=on_invalid
+    )
+
+
+def connect_timeout(*, on_invalid: Callable[[str], None] | None = None) -> float:
+    """Return the positive CONNECT_TIMEOUT override (seconds) or the default."""
+    return _positive_env_number(
+        CONNECT_TIMEOUT_ENV, DEFAULT_CONNECT_TIMEOUT, cast=float, on_invalid=on_invalid
+    )
+
+
+def stream_idle_timeout(*, on_invalid: Callable[[str], None] | None = None) -> float:
+    """Return the positive STREAM_IDLE_TIMEOUT override (seconds) or the default.
+
+    httpx's per-read (per-chunk) timeout on a streaming response — the gap a stream
+    may sit idle *between* chunks, NOT a cap on total stream duration.
+    """
+    return _positive_env_number(
+        STREAM_IDLE_TIMEOUT_ENV, DEFAULT_STREAM_IDLE_TIMEOUT, cast=float, on_invalid=on_invalid
+    )
+
+
+def pool_idle(*, on_invalid: Callable[[str], None] | None = None) -> float:
+    """Return the positive POOL_IDLE override (seconds) or the default.
+
+    Maps to httpx ``Limits(keepalive_expiry=...)``: how long an idle keep-alive
+    connection is reused before being dropped. httpx defaults to 5s; upstreams like
+    grok-build hold ~90s, so the default is raised to match — a 5s expiry would
+    reconnect constantly and forfeit the HTTP/2 multiplex benefit.
+    """
+    return _positive_env_number(
+        POOL_IDLE_ENV, DEFAULT_POOL_IDLE, cast=float, on_invalid=on_invalid
+    )
 
 
 def fallback_chain() -> list[str]:
@@ -119,6 +176,48 @@ def anthropic_real_url() -> str:
     return os.environ.get(ANTHROPIC_REAL_URL_ENV, DEFAULT_ANTHROPIC_REAL_URL)
 
 
+def _is_loopback_host(host: str) -> bool:
+    """Return True if *host* is localhost or a loopback IP literal (127.0.0.0/8, ::1)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_upstream_url(url: str) -> str:
+    """Validate the passthrough upstream URL, returning it unchanged when acceptable.
+
+    The bridge forwards the client's prompt and ``x-api-key`` to this origin, so a
+    cleartext http target would leak both (CWE-319) and embedded userinfo would ship a
+    credential in the URL. Requires https, or http only for a loopback host (the
+    local-mock test path); rejects any other scheme and any userinfo. This is a
+    misconfiguration guard, not a remote-input filter — the URL originates from the
+    operator's environment, so private/internal https targets are intentionally allowed
+    (D-CONFIG-002).
+
+    Raises:
+        ValueError: The scheme is not http/https, an http target is non-loopback, or the
+            URL embeds userinfo. The message never echoes userinfo.
+    """
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        msg = f"ANTHROPIC_REAL_URL must be http or https, got scheme '{parsed.scheme}'"
+        raise ValueError(msg)
+    if parsed.username or parsed.password:
+        msg = "ANTHROPIC_REAL_URL must not embed userinfo credentials"
+        raise ValueError(msg)
+    host = parsed.hostname or ""
+    if parsed.scheme == "http" and not _is_loopback_host(host):
+        msg = (
+            f"ANTHROPIC_REAL_URL must use https for non-loopback host '{host}' "
+            f"(cleartext http would leak the prompt and api key)"
+        )
+        raise ValueError(msg)
+    return url
+
+
 def trace_path() -> str | None:
     """Return the redacted structural trace path, or None when tracing is disabled."""
     return os.environ.get(CLAUDE_BRIDGE_TRACE_PATH_ENV) or None
@@ -127,6 +226,29 @@ def trace_path() -> str | None:
 def xai_model() -> str:
     """Return the xAI Grok model id from XAI_MODEL, defaulting to grok-4.6."""
     return _non_empty_stripped_env(XAI_MODEL_ENV) or DEFAULT_XAI_MODEL
+
+
+def xai_reasoning_effort(*, on_invalid: Callable[[str], None] | None = None) -> str:
+    """Return the validated xAI reasoning effort from XAI_REASONING_EFFORT, defaulting to low.
+
+    grok-4.6 accepts low/medium/high; the value is only stamped onto requests for models
+    that accept the field (the version gate lives in ``anthropic_to_xai``). ``low`` is the
+    latency default, not xAI's native ``high``.
+
+    The override is validated against ``_XAI_REASONING_EFFORTS`` (case-insensitively). An
+    unrecognized value invokes *on_invalid* with the raw string and falls back to the
+    default, so a typo like ``XAI_REASONING_EFFORT=hihg`` never ships ``{'effort': 'hihg'}``
+    to every upstream request; a valid override is normalized to lowercase for the wire.
+    """
+    raw = _non_empty_stripped_env(XAI_REASONING_EFFORT_ENV)
+    if raw is None:
+        return DEFAULT_XAI_REASONING_EFFORT
+    normalized = raw.lower()
+    if normalized not in _XAI_REASONING_EFFORTS:
+        if on_invalid is not None:
+            on_invalid(raw)
+        return DEFAULT_XAI_REASONING_EFFORT
+    return normalized
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:

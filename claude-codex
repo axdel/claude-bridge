@@ -11,7 +11,17 @@ set -eo pipefail
 BRIDGE_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 PORT=$((9000 + RANDOM % 999))
 BRIDGE_PID=""
-LOG_LEVEL="${LOG_LEVEL:-INFO}"
+LOG_LEVEL="${LOG_LEVEL:-WARNING}"
+
+# The bridge's one runtime dependency (httpx[http2], the HTTP/2 data plane) lives in
+# the project venv that `uv sync` provisions at ${BRIDGE_DIR}/.venv — the system
+# python3 does not have it. Run every claude_bridge invocation through that
+# interpreter, and fail loud with the fix if the venv is missing (D-RUNTIME-003).
+BRIDGE_PY="${BRIDGE_DIR}/.venv/bin/python"
+if [[ ! -x "$BRIDGE_PY" ]]; then
+    echo "claude-codex: ${BRIDGE_DIR}/.venv not found — run 'uv sync' in ${BRIDGE_DIR} first." >&2
+    exit 1
+fi
 
 # Parse our flags (before --)
 CLAUDE_ARGS=()
@@ -34,18 +44,39 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Start bridge in background
-export PYTHONPATH="${BRIDGE_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
 export LOG_LEVEL
-python3 -m claude_bridge --port "$PORT" --provider openai 2>/dev/null &
+# `-I` (isolated mode, Python 3.11+) starts the bridge with NO untrusted path on
+# sys.path: it drops the current-directory prepend (like `-P`) AND ignores
+# PYTHONPATH/PYTHONHOME AND the per-user site dir. `claude_bridge` resolves from the
+# venv's editable install (the trusted ${BRIDGE_DIR}/src) and `httpx` from the venv
+# site-packages, so running claude-codex from an untrusted project dir cannot let a
+# local `sitecustomize.py`, `claude_bridge/`, or a shadowing `httpx.py` run ahead of
+# the real bridge and read the provider auth.json (search-path injection, CWE-427).
+# `-P` alone did NOT close this — it leaves an inherited PYTHONPATH (e.g. `.`) on the
+# path, and httpx, not in src, would resolve from it. The venv is selected by the
+# interpreter path, not env, so `-I` keeps it; LOG_LEVEL and the ANTHROPIC_* vars
+# below are not PYTHON* vars, so `-I` honors them too.
+# Bridge logs go to stderr at LOG_LEVEL (WARNING+ by default), so upstream timeouts
+# and stalled-stream deaths are visible on the terminal without `--debug`; `--debug`
+# raises the level to DEBUG. No `2>/dev/null` here — discarding the whole stream is
+# what hid the 120s upstream deaths; INFO/DEBUG chatter is filtered by the log level.
+"$BRIDGE_PY" -I -m claude_bridge --port "$PORT" --provider openai &
 BRIDGE_PID=$!
 
 # Wait for bridge to accept connections (max 3s)
 for _ in $(seq 1 30); do
-    if python3 -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
+    if "$BRIDGE_PY" -I -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',$PORT)); s.close()" 2>/dev/null; then
         break
     fi
     sleep 0.1
 done
+
+# Abort if the bridge died during startup (e.g. the port was already bound):
+# never hand Claude Code's prompts to whatever else may be listening on $PORT.
+if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+    echo "claude-codex: bridge failed to start on 127.0.0.1:${PORT} (port busy?)." >&2
+    exit 1
+fi
 
 cat <<'BANNER'
 
@@ -56,7 +87,7 @@ cat <<'BANNER'
  \___|_|\__,_|\__,_|\__,_|\___|     \___\___/ \__,_|\___/_/\_\
 
 BANNER
-BRIDGE_VERSION=$(python3 -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
+BRIDGE_VERSION=$("$BRIDGE_PY" -I -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
 echo " port:${PORT}  pid:${BRIDGE_PID}  model:gpt-5.6-sol  version:${BRIDGE_VERSION}"
 echo " by axdel  github.com/axdel/claude-bridge"
 echo ""

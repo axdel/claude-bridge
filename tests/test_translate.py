@@ -10,7 +10,7 @@ from claude_bridge.providers.openai import (
     anthropic_to_openai,
     openai_to_anthropic,
 )
-from claude_bridge.proxy import estimate_input_tokens
+from claude_bridge.request_view import estimate_input_tokens
 
 # A provider/auth mode that declares the full image+document input surface.
 # Built locally (not imported) so these behavior tests stay independent of any
@@ -236,9 +236,9 @@ class TestAnthropicToOpenaiStripping:
 
     def test_thinking_stripped_when_drop_mode(self, monkeypatch):
         """Thinking config stripped when REASONING_MODE=drop."""
-        import claude_bridge.providers.openai as oai_mod
+        import claude_bridge.providers.openai.translate as oai_translate
 
-        monkeypatch.setattr(oai_mod, "_REASONING_MODE", "drop")
+        monkeypatch.setattr(oai_translate, "_REASONING_MODE", "drop")
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -277,9 +277,11 @@ class TestAnthropicToOpenaiStripping:
             ],
         }
         result, warnings = anthropic_to_openai(request)
-        assert any("cache_control" in w.lower() for w in warnings)
         content = result["input"][0]["content"][0]
+        # The marker is dropped from the outbound request; caching now rides an explicit
+        # prompt_cache_key, so no advisory is emitted for it.
         assert "cache_control" not in content
+        assert not any("cache_control" in w.lower() for w in warnings)
 
     def test_cache_control_stripped_from_system_blocks(self):
         request = {
@@ -294,8 +296,10 @@ class TestAnthropicToOpenaiStripping:
             ],
             "messages": [{"role": "user", "content": "Hi"}],
         }
-        _, warnings = anthropic_to_openai(request)
-        assert any("cache_control" in w.lower() for w in warnings)
+        result, warnings = anthropic_to_openai(request)
+        # System-block marker is dropped from the outbound request; no advisory is emitted.
+        assert "cache_control" not in json.dumps(result)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
     def test_cache_control_stripped_from_tool_definitions(self):
         request = {
@@ -312,17 +316,20 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, warnings = anthropic_to_openai(request)
-        assert any("cache_control" in w.lower() for w in warnings)
         tool = result["tools"][0]
         assert "cache_control" not in tool
+        assert not any("cache_control" in w.lower() for w in warnings)
 
-    def test_no_cache_control_no_warning(self):
+    def test_clean_request_leaves_no_cache_control_in_output(self):
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Hello"}],
         }
-        _, warnings = anthropic_to_openai(request)
+        result, warnings = anthropic_to_openai(request)
+        # A request with no cache_control yields output with none and no advisory — the
+        # invariant that survives the "caching is automatic" warning's removal.
+        assert "cache_control" not in json.dumps(result)
         assert not any("cache_control" in w.lower() for w in warnings)
 
 
@@ -358,9 +365,9 @@ class TestThinkingBlockPassthrough:
 
     def test_thinking_block_dropped_in_drop_mode(self, monkeypatch):
         """In drop mode, thinking blocks become empty text."""
-        import claude_bridge.providers.openai as oai_mod
+        import claude_bridge.providers.openai.translate as oai_translate
 
-        monkeypatch.setattr(oai_mod, "_REASONING_MODE", "drop")
+        monkeypatch.setattr(oai_translate, "_REASONING_MODE", "drop")
         request = {
             "model": "claude-opus-4-6",
             "messages": [

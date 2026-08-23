@@ -19,12 +19,14 @@ import json
 import os
 import stat
 import time
+import uuid
 from pathlib import Path
 
 import pytest
 
 from claude_bridge.auth import decode_jwt_exp
 from claude_bridge.content import parse_media_source
+from claude_bridge.log import upstream_request_id_var
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.providers.xai import (
     _MAX_SSE_BUFFER,
@@ -47,6 +49,11 @@ from claude_bridge.providers.xai import (
     refresh_xai_token,
     translate_xai_sse_event,
     xai_to_anthropic,
+)
+from claude_bridge.providers.xai.auth import (
+    _TOKEN_OPENER,
+    _NoRedirectHandler,
+    _xai_refresh_lock,
 )
 
 _CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -313,6 +320,19 @@ class TestGetXaiBearerToken:
         assert result == data[_ENTRY_KEY]["key"]
 
     @pytest.mark.asyncio
+    async def test_valid_token_returns_without_waiting_on_the_refresh_lock(self, tmp_path: Path):
+        """A fresh token returns via the lock-free fast path even while a peer holds the
+        refresh lock mid-refresh — so a fresh-token caller never blocks behind another
+        process's in-flight refresh. Oracle: with the lock held, the call must still
+        complete within the timeout and yield the stored token. Kills lock-spanning code
+        (which would block on acquire and trip asyncio.wait_for's TimeoutError)."""
+        data = _grok_auth()
+        auth_file = _write_grok_auth(tmp_path, data)
+        async with _xai_refresh_lock:  # a peer is mid-refresh, holding the lock
+            result = await asyncio.wait_for(get_xai_bearer_token(auth_file), timeout=1.0)
+        assert result == data[_ENTRY_KEY]["key"]
+
+    @pytest.mark.asyncio
     async def test_expired_triggers_refresh(self, monkeypatch, tmp_path: Path):
         new_token = _make_jwt({"exp": time.time() + 3600})
         data = _grok_auth(
@@ -320,11 +340,31 @@ class TestGetXaiBearerToken:
         )
         auth_file = _write_grok_auth(tmp_path, data)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         result = await get_xai_bearer_token(auth_file)
         assert result == new_token
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_refreshes_even_a_proactively_valid_token(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Reactive entry point: a token that passes the proactive expiry check was still
+        # rejected upstream (401). force_refresh=True bypasses the fast path and drives a
+        # real refresh (threading the rejected token through as stale_token so the
+        # double-check does not hand it back), returning a genuinely new bearer. Fails
+        # against code that ignores force_refresh (returns the still-valid on-disk token).
+        new_token = _make_jwt({"exp": time.time() + 7200})
+        data = _grok_auth()  # default entry: far-future exp -> proactively valid
+        auth_file = _write_grok_auth(tmp_path, data)
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 7200}),
+        )
+        result = await get_xai_bearer_token(auth_file, force_refresh=True)
+        assert result == new_token
+        assert result != data[_ENTRY_KEY]["key"]
 
     @pytest.mark.asyncio
     async def test_expired_no_refresh_token_raises(self, tmp_path: Path):
@@ -349,7 +389,7 @@ class TestGetXaiBearerToken:
         def _raise_timeout(*args, **kwargs):
             raise TimeoutError("Connection timed out")
 
-        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _raise_timeout)
         with pytest.raises(ValueError, match="Token refresh failed"):
             await get_xai_bearer_token(auth_file)
 
@@ -383,7 +423,7 @@ class TestGetXaiBearerToken:
             captured["url"] = req.full_url
             return _FakeTokenResp({"access_token": new_token, "expires_in": 3600})
 
-        monkeypatch.setattr("urllib.request.urlopen", _capture)
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _capture)
         result = await get_xai_bearer_token(auth_file)
         assert result == new_token
         assert captured["url"] == "https://auth.x.ai/oauth2/token"
@@ -466,7 +506,7 @@ class TestRefreshXaiToken:
         new_token = _make_jwt({"exp": time.time() + 3600})
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         returned = await refresh_xai_token(
@@ -481,7 +521,7 @@ class TestRefreshXaiToken:
         new_token = _make_jwt({"exp": time.time() + 3600})
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp(
                 {"access_token": new_token, "refresh_token": "refresh-rotated", "expires_in": 3600}
             ),
@@ -495,7 +535,7 @@ class TestRefreshXaiToken:
         new_token = _make_jwt({"exp": time.time() + 3600})
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -511,7 +551,7 @@ class TestRefreshXaiToken:
         )
         auth_file = _write_grok_auth(tmp_path, data)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -533,7 +573,7 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)
         auth_file.chmod(0o644)  # start broad — a world-readable secret
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -548,7 +588,7 @@ class TestRefreshXaiToken:
         def _raise_http(*args, **kwargs):
             raise TimeoutError("boom")
 
-        monkeypatch.setattr("urllib.request.urlopen", _raise_http)
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _raise_http)
         with pytest.raises(ValueError, match="Token refresh failed"):
             await refresh_xai_token(
                 _ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file
@@ -563,7 +603,7 @@ class TestRefreshXaiToken:
         new_token = _make_jwt({"exp": new_exp})
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 4321}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -577,7 +617,7 @@ class TestRefreshXaiToken:
     async def test_missing_access_token_raises(self, monkeypatch, tmp_path: Path):
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"refresh_token": "r", "expires_in": 3600}),
         )
         with pytest.raises(ValueError, match="access_token"):
@@ -594,7 +634,7 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)
         before = time.time()
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp(
                 {"access_token": "opaque-not-a-jwt", "expires_in": 4321}
             ),
@@ -615,7 +655,7 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)  # entry starts WITH an expires_at
         assert "expires_at" in json.loads(auth_file.read_text())[_ENTRY_KEY]
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": "opaque-not-a-jwt"}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -633,7 +673,7 @@ class TestRefreshXaiToken:
             tmp_path, {_ENTRY_KEY: "corrupted-non-dict", "sibling": {"k": 1}}
         )
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         returned = await refresh_xai_token(
@@ -654,7 +694,7 @@ class TestRefreshXaiToken:
         auth_file.parent.mkdir(parents=True, exist_ok=True)  # dir exists, file does not
         assert not auth_file.exists()
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -671,7 +711,9 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)
         before = auth_file.read_bytes()
         calls: list[int] = []
-        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: calls.append(1))
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open", lambda *a, **kw: calls.append(1)
+        )
         with pytest.raises(ValueError, match="untrusted"):
             await refresh_xai_token(
                 _ENTRY_KEY,
@@ -693,7 +735,9 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)
         before = auth_file.read_bytes()
         calls: list[int] = []
-        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: calls.append(1))
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open", lambda *a, **kw: calls.append(1)
+        )
         with pytest.raises(ValueError, match="untrusted"):
             await refresh_xai_token(
                 _ENTRY_KEY,
@@ -704,6 +748,198 @@ class TestRefreshXaiToken:
             )
         assert calls == []
         assert auth_file.read_bytes() == before
+
+
+# --- cross-process refresh serialization (advisory flock + double-check) ---
+
+
+class TestCrossProcessRefreshLock:
+    """The refresh serializes across separate bridge processes and skips a
+    now-redundant POST — the cross-process advisory lock plus its double-check.
+
+    Motivation: the process-local ``asyncio.Lock`` guards one event loop; three
+    separate ``claude-grok`` processes each hold their own, so without an OS-level
+    lock they stampede the refresh endpoint. RFC 6749 §6 permits single-use
+    refresh_token rotation (xAI rotates — see ``test_rotates_refresh_token``), so
+    the first POST consumes the token and the losers would ``400`` on the dead one.
+
+    Oracle: every expected value derives from that contract — a loser that
+    re-reads a freshly-rotated valid token MUST use it and skip its own POST —
+    never from running the refresh.
+    """
+
+    def _expired_file(self, tmp_path: Path) -> Path:
+        expired = _make_jwt({"exp": time.time() - 100})
+        return _write_grok_auth(
+            tmp_path, _grok_auth({"key": expired, "expires_at": _iso(time.time() - 100)})
+        )
+
+    @pytest.mark.asyncio
+    async def test_refresh_skips_network_when_token_already_valid(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Double-check under the lock: a valid on-disk token (another claude-grok
+        # rotated it while we waited for the lock) short-circuits — the network POST
+        # is skipped and the fresh token returned. Fails against unconditional-POST
+        # code (which would call _boom and raise).
+        valid = _make_jwt({"exp": time.time() + 3600})
+        auth_file = _write_grok_auth(
+            tmp_path, _grok_auth({"key": valid, "expires_at": _iso(time.time() + 3600)})
+        )
+
+        def _boom(*a, **kw):
+            raise AssertionError("network refresh must not run when the token is already valid")
+
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _boom)
+        returned = await refresh_xai_token(
+            _ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file
+        )
+        assert returned == valid
+
+    @pytest.mark.asyncio
+    async def test_refresh_blocks_while_a_peer_holds_the_lock(self, monkeypatch, tmp_path: Path):
+        # Mutual exclusion: while a peer holds a SHARED lock on .xai-refresh.lock,
+        # the refresh's EXCLUSIVE acquire must block (exclusive is incompatible with a
+        # held shared lock), so wait_for times out. This single assertion kills two
+        # mutants: a dropped flock (would not block -> completes -> no TimeoutError)
+        # and LOCK_EX->LOCK_SH (shared is compatible with the held shared -> proceeds).
+        import fcntl
+
+        auth_file = self._expired_file(tmp_path)
+        lock_path = auth_file.parent / ".xai-refresh.lock"
+        new_token = _make_jwt({"exp": time.time() + 3600})
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
+        )
+        peer_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(peer_fd, fcntl.LOCK_SH)
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    refresh_xai_token(
+                        _ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file
+                    ),
+                    timeout=0.5,
+                )
+        finally:
+            fcntl.flock(peer_fd, fcntl.LOCK_UN)
+            os.close(peer_fd)
+
+    @pytest.mark.asyncio
+    async def test_lock_released_after_successful_refresh(self, monkeypatch, tmp_path: Path):
+        # After a successful refresh the lock is released — a subsequent non-blocking
+        # exclusive acquire succeeds (no BlockingIOError). Kills a mutant that leaks
+        # the fd/lock (dropped finally), which would deadlock every later refresh.
+        # The lock file is owner-only (0600), consistent with ~/.grok hygiene.
+        import fcntl
+
+        auth_file = self._expired_file(tmp_path)
+        new_token = _make_jwt({"exp": time.time() + 3600})
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
+        )
+        await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
+
+        lock_path = auth_file.parent / ".xai-refresh.lock"
+        assert stat.S_IMODE(os.stat(lock_path).st_mode) == 0o600
+        probe_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(probe_fd)
+
+    @pytest.mark.asyncio
+    async def test_reactive_refresh_posts_when_ondisk_is_the_rejected_token(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Reactive 401 path: the on-disk token passes the proactive expiry check yet
+        # upstream just rejected it. Passing it as ``stale_token`` must force the POST —
+        # the double-check may NOT short-circuit on "looks valid" and hand the rejected
+        # credential straight back. Oracle: the mocked refresh returns a new token, so a
+        # correct force yields it; a double-check that ignores stale_token returns the
+        # rejected one and fails. Kills a dropped ``!= stale_token`` clause and its flip.
+        rejected = _make_jwt({"exp": time.time() + 3600})
+        new_token = _make_jwt({"exp": time.time() + 7200})
+        auth_file = _write_grok_auth(
+            tmp_path, _grok_auth({"key": rejected, "expires_at": _iso(time.time() + 3600)})
+        )
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 7200}),
+        )
+        returned = await refresh_xai_token(
+            _ENTRY_KEY,
+            "refresh-original",
+            _CLIENT_ID,
+            auth_path=auth_file,
+            stale_token=rejected,
+        )
+        assert returned == new_token
+
+    @pytest.mark.asyncio
+    async def test_reactive_refresh_skips_when_a_peer_already_rotated(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # A peer claude-grok refreshed while we waited for the lock: the on-disk token
+        # DIFFERS from the one we rejected and is valid. The double-check must return the
+        # peer's fresh token and skip the POST — our own refresh_token may be the
+        # single-use one the peer already consumed. Oracle: urlopen must never fire, and
+        # the returned token is the peer's. Kills a mutant that unconditionally POSTs in
+        # reactive mode (which would call _boom).
+        rejected = _make_jwt({"exp": time.time() + 3600})
+        peer_token = _make_jwt({"exp": time.time() + 7200})
+        auth_file = _write_grok_auth(
+            tmp_path, _grok_auth({"key": peer_token, "expires_at": _iso(time.time() + 3600)})
+        )
+
+        def _boom(*a, **kw):
+            raise AssertionError("refresh POST fired though a peer already rotated the token")
+
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _boom)
+        returned = await refresh_xai_token(
+            _ENTRY_KEY,
+            "refresh-original",
+            _CLIENT_ID,
+            auth_path=auth_file,
+            stale_token=rejected,
+        )
+        assert returned == peer_token
+
+
+class TestNoRedirectOpener:
+    """The refresh opener refuses every 3xx from the xAI token endpoint.
+
+    Oracle: a token endpoint never legitimately redirects; following a
+    provider-controlled ``Location`` would drive an arbitrary internal request whose
+    response is then parsed as token JSON (SSRF, CWE-918). The refusal must carry no
+    redirect URL (never echo the attacker's target).
+    """
+
+    def test_handler_is_wired_into_the_refresh_opener(self):
+        # Kills a mutant that drops _NoRedirectHandler from build_opener (redirects
+        # would then be followed automatically). OpenerDirector.handlers is a real
+        # documented CPython attribute the typeshed stub omits, hence the ignore.
+        handlers = _TOKEN_OPENER.handlers  # type: ignore[attr-defined]
+        assert any(isinstance(h, _NoRedirectHandler) for h in handlers)
+
+    def test_redirect_refused_without_echoing_target(self):
+        import http.client
+        import io
+        import urllib.error
+        import urllib.request
+
+        handler = _NoRedirectHandler()
+        target = "http://169.254.169.254/latest/meta-data/"
+        req = urllib.request.Request("https://auth.x.ai/oauth2/token")
+        with pytest.raises(urllib.error.URLError) as excinfo:
+            handler.redirect_request(
+                req, io.BytesIO(), 302, "Found", http.client.HTTPMessage(), target
+            )
+        assert target not in str(excinfo.value)
+        assert "169.254.169.254" not in str(excinfo.value)
 
 
 # --- import decode_jwt_exp used to keep the oracle honest (no unused import) ---
@@ -718,8 +954,8 @@ class TestRequestTranslation:
     never from running the translator. The load-bearing divergence from the OpenAI
     path is proven here: xAI links a tool call to its result by ``call_id`` ALONE and
     accepts it verbatim, so the Anthropic tool id is forwarded unchanged (NO ``fc_``
-    rewrite, NO synthesized ``id`` field), and ``reasoning.effort`` is never sent
-    (field_effort_low.json shows it 400s).
+    rewrite, NO synthesized ``id`` field), and ``reasoning.effort`` is sent only to
+    models that accept it (grok-4.6+; grok-4.20 and earlier 400 — field_effort_low.json).
     """
 
     # -- request envelope -----------------------------------------------------
@@ -740,18 +976,74 @@ class TestRequestTranslation:
         result, _ = anthropic_to_xai({"messages": []})
         assert result["model"] == "grok-3-mini"
 
-    def test_request_omits_reasoning_key_entirely(self):
-        """xAI 400s on reasoning.effort (field_effort_low.json) — the key must be absent."""
+    def test_grok46_default_sends_reasoning_effort_low(self, monkeypatch):
+        """grok-4.6 accepts reasoning.effort (U-EFFORT: omit/low/medium/high all HTTP 200),
+        so the default request carries the config effort ``low`` (63 vs 146 reasoning tokens
+        at omit — a latency choice, not native-high parity)."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, _ = anthropic_to_xai({"messages": []})
+        assert result["reasoning"] == {"effort": "low"}
+
+    def test_gated_older_model_omits_reasoning_effort(self, monkeypatch):
+        """grok-4.20 (a pre-4.6 model) 400s on reasoning.effort (field_effort_low.json), so the
+        version gate omits the key. Decimal compare, not tuple: 4.20 == 4.2 < 4.6."""
+        monkeypatch.setenv("XAI_MODEL", "grok-4.20")
         result, _ = anthropic_to_xai({"messages": []})
         assert "reasoning" not in result
 
-    def test_thinking_config_warns_without_adding_reasoning_effort(self):
-        """A thinking config is acknowledged in warnings but never becomes reasoning.effort."""
+    def test_lower_boundary_model_omits_reasoning_effort(self, monkeypatch):
+        """A model just below the 4.6 floor is gated out — pins the >= 4.6 threshold."""
+        monkeypatch.setenv("XAI_MODEL", "grok-4.5")
+        result, _ = anthropic_to_xai({"messages": []})
+        assert "reasoning" not in result
+
+    def test_grok_build_alias_sends_reasoning_effort(self, monkeypatch):
+        """grok-build (the rolling latest-coding alias, no parseable version) is assumed modern
+        and carries reasoning.effort — only a model that parses below 4.6 is gated out, so an
+        XAI_MODEL override cannot silently lose effort on a supported model."""
+        monkeypatch.setenv("XAI_MODEL", "grok-build")
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, _ = anthropic_to_xai({"messages": []})
+        assert result["reasoning"] == {"effort": "low"}
+
+    def test_reasoning_effort_honors_env_override(self, monkeypatch):
+        """XAI_REASONING_EFFORT overrides the default effort on an accepting model."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.setenv("XAI_REASONING_EFFORT", "medium")
+        result, _ = anthropic_to_xai({"messages": []})
+        assert result["reasoning"] == {"effort": "medium"}
+
+    def test_thinking_config_does_not_drive_reasoning_effort(self, monkeypatch):
+        """A thinking config is acknowledged in warnings, but reasoning.effort comes from config,
+        never from the thinking budget (budget_tokens never becomes the effort value)."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
         result, warnings = anthropic_to_xai(
             {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 1024}}
         )
-        assert "reasoning" not in result
+        assert result["reasoning"] == {"effort": "low"}
         assert any("thinking" in w.lower() for w in warnings)
+
+    # -- max output tokens ----------------------------------------------------
+
+    def test_max_tokens_maps_to_max_output_tokens(self):
+        """Anthropic max_tokens becomes Responses max_output_tokens: grok-4.6 has no fixed text
+        cap, so forwarding Claude's limit keeps slow turns bounded. The Anthropic key name
+        does not survive."""
+        result, _ = anthropic_to_xai({"messages": [], "max_tokens": 4096})
+        assert result["max_output_tokens"] == 4096
+        assert "max_tokens" not in result
+
+    def test_absent_max_tokens_omits_max_output_tokens(self):
+        """No Anthropic max_tokens -> no cap forwarded; grok applies its own default."""
+        result, _ = anthropic_to_xai({"messages": []})
+        assert "max_output_tokens" not in result
+
+    def test_nonpositive_max_tokens_omits_max_output_tokens(self):
+        """A malformed non-positive max_tokens is ignored rather than forwarded as a cap."""
+        result, _ = anthropic_to_xai({"messages": [], "max_tokens": 0})
+        assert "max_output_tokens" not in result
 
     # -- system / instructions ------------------------------------------------
 
@@ -1067,10 +1359,10 @@ class TestRequestTranslation:
 
     def test_thinking_block_dropped_in_drop_mode(self, monkeypatch):
         """reasoning_mode=drop empties the thinking block — the text never survives."""
-        import claude_bridge.providers.xai as xai
+        import claude_bridge.providers.xai.translate as xai_translate
 
-        monkeypatch.setattr(xai, "_XAI_REASONING_MODE", "drop")
-        result, warnings = xai.anthropic_to_xai(
+        monkeypatch.setattr(xai_translate, "_XAI_REASONING_MODE", "drop")
+        result, warnings = xai_translate.anthropic_to_xai(
             {
                 "messages": [
                     {
@@ -1134,25 +1426,29 @@ class TestRequestTranslation:
 
     def test_thinking_config_drop_mode_warns_stripped(self, monkeypatch):
         """In drop mode a top-level thinking config is reported as stripped."""
-        import claude_bridge.providers.xai as xai
+        import claude_bridge.providers.xai.translate as xai_translate
 
-        monkeypatch.setattr(xai, "_XAI_REASONING_MODE", "drop")
-        _, warnings = xai.anthropic_to_xai(
+        monkeypatch.setattr(xai_translate, "_XAI_REASONING_MODE", "drop")
+        _, warnings = xai_translate.anthropic_to_xai(
             {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 5}}
         )
         assert any("drop" in w.lower() for w in warnings)
 
-    def test_cache_control_on_system_warned(self):
-        _, warnings = anthropic_to_xai(
+    def test_cache_control_on_system_stripped_without_warning(self):
+        result, warnings = anthropic_to_xai(
             {
                 "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
                 "messages": [],
             }
         )
-        assert any("cache_control" in w for w in warnings)
+        # The Anthropic per-block marker has no Responses equivalent, so it is dropped
+        # from the outbound request. Sticky caching now rides an explicit prompt_cache_key,
+        # so the old "caching is automatic" advisory is no longer emitted (noise on every turn).
+        assert "cache_control" not in json.dumps(result)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
-    def test_cache_control_on_tool_warned(self):
-        _, warnings = anthropic_to_xai(
+    def test_cache_control_on_tool_stripped_without_warning(self):
+        result, warnings = anthropic_to_xai(
             {
                 "messages": [],
                 "tools": [
@@ -1164,10 +1460,11 @@ class TestRequestTranslation:
                 ],
             }
         )
-        assert any("cache_control" in w for w in warnings)
+        assert "cache_control" not in json.dumps(result)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
-    def test_cache_control_hints_warned(self):
-        _, warnings = anthropic_to_xai(
+    def test_cache_control_on_content_stripped_without_warning(self):
+        result, warnings = anthropic_to_xai(
             {
                 "messages": [
                     {
@@ -1183,7 +1480,8 @@ class TestRequestTranslation:
                 ]
             }
         )
-        assert any("cache_control" in w for w in warnings)
+        assert "cache_control" not in json.dumps(result)
+        assert not any("cache_control" in w.lower() for w in warnings)
 
     # -- provider delegation --------------------------------------------------
 
@@ -2334,15 +2632,15 @@ class TestReasoningCacheBound:
     def test_cache_never_exceeds_the_bound(self):
         provider = XAIProvider()
         self._fill(provider, _REASONING_CACHE_MAX + 50)
-        assert len(provider._reasoning_by_call_id) == _REASONING_CACHE_MAX
+        assert len(provider._reasoning_cache) == _REASONING_CACHE_MAX
 
     def test_oldest_entry_is_evicted_first(self):
         provider = XAIProvider()
         self._fill(provider, _REASONING_CACHE_MAX)
         provider._stash_reasoning({"call-new": self._entry(9999)})
-        assert "call-0" not in provider._reasoning_by_call_id
-        assert "call-new" in provider._reasoning_by_call_id
-        assert "call-1" in provider._reasoning_by_call_id
+        assert "call-0" not in provider._reasoning_cache
+        assert "call-new" in provider._reasoning_cache
+        assert "call-1" in provider._reasoning_cache
 
     def test_restash_refreshes_recency_so_touched_entry_survives(self):
         provider = XAIProvider()
@@ -2350,8 +2648,8 @@ class TestReasoningCacheBound:
         # Touch call-0 → most-recent; the next insert must now evict call-1, not call-0.
         provider._stash_reasoning({"call-0": self._entry(1000)})
         provider._stash_reasoning({"call-new": self._entry(9999)})
-        assert "call-0" in provider._reasoning_by_call_id
-        assert "call-1" not in provider._reasoning_by_call_id
+        assert "call-0" in provider._reasoning_cache
+        assert "call-1" not in provider._reasoning_cache
 
 
 # --- authenticate (subscription OAuth headers) ---
@@ -2371,15 +2669,25 @@ class TestAuthenticate:
         auth_file = _write_grok_auth(tmp_path, data)
         monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
 
-        headers = await XAIProvider(auth_path=auth_file).authenticate()
+        provider = XAIProvider(auth_path=auth_file)
+        reset = upstream_request_id_var.set("req-fixed-001")
+        try:
+            headers = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset)
 
         # Oracle: token is the exact bearer we wrote; version is the env override
-        # (config resolver returns it verbatim); identifier is the fixed client string.
+        # (config resolver returns it verbatim); identifier is the fixed client string;
+        # conv-id is this instance's sticky prompt cache key; req-id is the per-request
+        # value carried on the contextvar. The exact-dict match also proves no extra
+        # header leaks in.
         token = data[_ENTRY_KEY]["key"]
         assert headers == {
             "Authorization": f"Bearer {token}",
             "x-grok-client-version": "1.2.3",
             "x-grok-client-identifier": _XAI_CLIENT_IDENTIFIER,
+            "x-grok-conv-id": provider._prompt_cache_key,
+            "x-grok-req-id": "req-fixed-001",
         }
 
     @pytest.mark.asyncio
@@ -2421,10 +2729,140 @@ class TestAuthenticate:
         headers = await XAIProvider(auth_path=auth_file).authenticate()
 
         # Security oracle: the opaque bearer must appear ONLY in Authorization —
-        # never smuggled into the version or identifier header.
+        # never smuggled into the version, identifier, or request-id header.
         token = data[_ENTRY_KEY]["key"]
         assert token not in headers["x-grok-client-version"]
         assert token not in headers["x-grok-client-identifier"]
+        assert token not in headers["x-grok-req-id"]
+
+
+# --- prompt cache identity (sticky routing key) ---
+
+
+class TestPromptCacheIdentity:
+    """The prompt cache key is a per-instance sticky-routing identity: stable across
+    every request on one provider (so grok-4.6 reuses the cached prefix), distinct across
+    instances (so three concurrent launchers never collide), and never derived from request
+    content. It rides both the body ``prompt_cache_key`` and the ``x-grok-conv-id`` header
+    as the same value, because grok-build resolves cache identity as ``key.or(conv_id)``.
+    """
+
+    @staticmethod
+    def _request(text: str) -> dict:
+        return {"messages": [{"role": "user", "content": text}]}
+
+    def test_prompt_cache_key_present_and_stable_across_requests_on_one_instance(self):
+        provider = XAIProvider()
+        first, _ = provider.translate_request(self._request("alpha"))
+        second, _ = provider.translate_request(self._request("beta"))
+        # Oracle: sticky routing requires ONE identity across the process, so the key is
+        # invariant across requests on a single instance despite differing content.
+        assert first["prompt_cache_key"]
+        assert first["prompt_cache_key"] == second["prompt_cache_key"]
+
+    def test_prompt_cache_key_differs_across_instances_for_identical_input(self):
+        # Identical input to both instances: same content, different key proves the key is
+        # instance identity, NOT hash(instructions) — the security constraint (INV-SEC-01/06).
+        a, _ = XAIProvider().translate_request(self._request("same"))
+        b, _ = XAIProvider().translate_request(self._request("same"))
+        assert a["prompt_cache_key"] != b["prompt_cache_key"]
+
+    @pytest.mark.asyncio
+    async def test_conv_id_header_equals_body_prompt_cache_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        provider = XAIProvider(auth_path=auth_file)
+
+        headers = await provider.authenticate()
+        body, _ = provider.translate_request(self._request("hi"))
+
+        # Oracle (plan sub-item 3): the one sticky key rides BOTH the header and the body,
+        # as the SAME value — cli-chat-proxy accepts either (grok-build is key.or(conv_id)).
+        assert headers["x-grok-conv-id"] == body["prompt_cache_key"]
+        assert body["prompt_cache_key"]
+
+
+# --- per-request upstream request id (x-grok-req-id) ---
+
+
+class TestUpstreamRequestIdHeader:
+    """``x-grok-req-id`` carries a per-request id the grok CLI sends on every responses
+    call (verified against the CLI binary). Unlike the sticky ``x-grok-conv-id`` (one
+    identity per process), this is fresh per request and set once by the proxy on the
+    ``upstream_request_id_var`` contextvar — so it stays STABLE across the transport retry
+    and the reactive 401 retry (both re-call ``authenticate`` within the one request
+    context), which is what lets an upstream dedup a retried request instead of double-
+    processing it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_header_carries_the_contextvar_value(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        reset = upstream_request_id_var.set("req-from-proxy-42")
+        try:
+            headers = await XAIProvider(auth_path=auth_file).authenticate()
+        finally:
+            upstream_request_id_var.reset(reset)
+        # Oracle: the header value IS the contextvar the proxy set for this request —
+        # not derived, not random, when a request id is present.
+        assert headers["x-grok-req-id"] == "req-from-proxy-42"
+
+    @pytest.mark.asyncio
+    async def test_stable_across_two_authenticate_calls_in_one_request(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        provider = XAIProvider(auth_path=auth_file)
+        reset = upstream_request_id_var.set("req-stable-across-retry")
+        try:
+            first = await provider.authenticate()
+            # The reactive-401 path re-calls authenticate within the SAME request context;
+            # the id must not change or the upstream can't dedup the retry.
+            second = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset)
+        assert first["x-grok-req-id"] == second["x-grok-req-id"] == "req-stable-across-retry"
+
+    @pytest.mark.asyncio
+    async def test_fresh_per_request(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        provider = XAIProvider(auth_path=auth_file)
+        reset_a = upstream_request_id_var.set("req-A")
+        try:
+            headers_a = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset_a)
+        reset_b = upstream_request_id_var.set("req-B")
+        try:
+            headers_b = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset_b)
+        # Oracle: a distinct id per request (the proxy stamps a fresh uuid each request),
+        # so two requests are never conflated by the upstream.
+        assert headers_a["x-grok-req-id"] == "req-A"
+        assert headers_b["x-grok-req-id"] == "req-B"
+        assert headers_a["x-grok-req-id"] != headers_b["x-grok-req-id"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_a_fresh_uuid_when_contextvar_unset(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "1.2.3")
+        auth_file = _write_grok_auth(tmp_path, _grok_auth())
+        provider = XAIProvider(auth_path=auth_file)
+        # Force the empty/unset state deterministically (order-independent under
+        # pytest-randomly): the header must NEVER go out empty, so authenticate mints
+        # a uuid when the proxy left no id.
+        reset = upstream_request_id_var.set("")
+        try:
+            headers = await provider.authenticate()
+        finally:
+            upstream_request_id_var.reset(reset)
+        upstream_request_id = headers["x-grok-req-id"]
+        assert upstream_request_id  # never empty
+        # A parseable uuid proves the fallback minted a real id, not a placeholder.
+        uuid.UUID(upstream_request_id)
 
 
 # --- provider contract: capabilities, endpoint, registration ---

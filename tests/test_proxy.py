@@ -6,22 +6,27 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import socket
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
+from typing import cast
 
+import httpx
 import pytest
 
+from claude_bridge.http_client import create_client
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities, StreamRequestMode
-from claude_bridge.proxy import (
+from claude_bridge.proxy import _route_request, start_proxy
+from claude_bridge.request_view import (
     _approx_decoded_bytes,
     _oversized_media,
     estimate_input_tokens,
-    start_proxy,
 )
+from claude_bridge.router import Router, RouterState
 
 
 def _find_free_port() -> int:
@@ -66,10 +71,21 @@ def upstream_url():
 @pytest.fixture()
 async def proxy_url(upstream_url: str):
     port = _find_free_port()
-    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    server, client = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
     yield f"http://127.0.0.1:{port}"
     server.close()
     await server.wait_closed()
+    await client.aclose()
+
+
+@pytest.fixture()
+async def http_client() -> AsyncIterator[httpx.AsyncClient]:
+    """A real HTTP/2 client for tests that call transport-layer functions directly."""
+    client = create_client()
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 def _http_post(url: str, body: dict, headers: dict | None = None) -> tuple[int, dict]:
@@ -101,14 +117,14 @@ def _http_post_stream_raw(url: str, body: dict) -> tuple[int, bytes]:
         return resp.status, resp.read()
 
 
-def _http_get(url: str) -> int:
-    """Stdlib HTTP GET — returns status code only."""
+def _http_get_raw(url: str) -> tuple[int, bytes]:
+    """Stdlib HTTP GET — returns (status_code, raw_body)."""
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status
+            return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code
+        return exc.code, exc.read()
 
 
 @pytest.mark.asyncio
@@ -168,16 +184,22 @@ async def test_stats_endpoint_returns_metrics(proxy_url: str):
 
 @pytest.mark.asyncio
 async def test_wrong_path_returns_404(proxy_url: str):
-    """GET to an unknown path returns 404."""
-    status = await asyncio.to_thread(_http_get, f"{proxy_url}/v1/completions")
+    """GET to an unknown path returns 404 with the Anthropic error envelope."""
+    status, raw_body = await asyncio.to_thread(_http_get_raw, f"{proxy_url}/v1/completions")
     assert status == 404
+    # Oracle: the bridge impersonates the Anthropic API, whose 404 body is the error
+    # envelope with type not_found_error (docs.anthropic.com/en/api/errors) — not a bare
+    # {"error": <str>}. A bare body has no ["error"]["type"], so this bites the regression.
+    body = json.loads(raw_body)
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "not_found_error"
 
 
 @pytest.mark.asyncio
 async def test_malformed_content_length_returns_400(upstream_url: str):
     """Malformed Content-Length header returns 400 instead of crashing."""
     port = _find_free_port()
-    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    server, client = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
     try:
         # Send a raw HTTP request with a bad Content-Length
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -185,10 +207,16 @@ async def test_malformed_content_length_returns_400(upstream_url: str):
         await writer.drain()
         response = await asyncio.wait_for(reader.read(4096), timeout=2)
         writer.close()
-        assert b"400" in response
+        assert response.startswith(b"HTTP/1.1 400")
+        # Oracle: Anthropic 400 body is the error envelope with type invalid_request_error
+        # (docs.anthropic.com/en/api/errors), not a bare {"error": <str>}.
+        envelope = json.loads(response.split(b"\r\n\r\n", 1)[1])
+        assert envelope["type"] == "error"
+        assert envelope["error"]["type"] == "invalid_request_error"
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -196,7 +224,7 @@ async def test_upstream_unreachable_returns_502():
     """When upstream is unreachable, proxy returns 502."""
     port = _find_free_port()
     dead_upstream = f"http://127.0.0.1:{_find_free_port()}"
-    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=dead_upstream)
+    server, client = await start_proxy(host="127.0.0.1", port=port, upstream_url=dead_upstream)
     try:
         status, data = await asyncio.to_thread(
             _http_post,
@@ -204,10 +232,12 @@ async def test_upstream_unreachable_returns_502():
             {"model": "test", "messages": []},
         )
         assert status == 502
-        assert "upstream unavailable" in data["error"]
+        assert data["type"] == "error"
+        assert data["error"]["message"] == "upstream unavailable"
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +405,7 @@ class _FakeOpenAIProvider:
     def __init__(self, endpoint: str) -> None:
         self.endpoint = endpoint
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {"Authorization": "Bearer fake-token"}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -436,7 +466,9 @@ async def test_failover_on_upstream_500(_openai_mock_url: str):
     anthropic_url = f"http://127.0.0.1:{anthropic_port}"
 
     proxy_port = _find_free_port()
-    server = await start_proxy(host="127.0.0.1", port=proxy_port, upstream_url=anthropic_url)
+    server, client = await start_proxy(
+        host="127.0.0.1", port=proxy_port, upstream_url=anthropic_url
+    )
     try:
         request_body = {
             "model": "claude-sonnet-4-6",
@@ -466,6 +498,7 @@ async def test_failover_on_upstream_500(_openai_mock_url: str):
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
         anthropic_server.shutdown()
 
 
@@ -475,7 +508,7 @@ async def test_direct_mode_skips_anthropic(_openai_mock_url: str):
     proxy_port = _find_free_port()
     # Use a dead upstream URL — if the proxy tries Anthropic, it will get 502
     dead_upstream = f"http://127.0.0.1:{_find_free_port()}"
-    server = await start_proxy(
+    server, client = await start_proxy(
         host="127.0.0.1",
         port=proxy_port,
         upstream_url=dead_upstream,
@@ -500,6 +533,7 @@ async def test_direct_mode_skips_anthropic(_openai_mock_url: str):
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -519,7 +553,7 @@ async def test_direct_mode_binds_real_registered_xai_provider():
     assert PROVIDERS["xai"] is claude_bridge.providers.xai.XAIProvider
     proxy_port = _find_free_port()
     dead_upstream = f"http://127.0.0.1:{_find_free_port()}"
-    server = await start_proxy(
+    server, client = await start_proxy(
         host="127.0.0.1",
         port=proxy_port,
         upstream_url=dead_upstream,
@@ -530,6 +564,7 @@ async def test_direct_mode_binds_real_registered_xai_provider():
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -552,6 +587,20 @@ async def test_direct_mode_threads_provider_kwargs_to_real_xai_constructor():
             port=_find_free_port(),
             provider_name="xai",
             provider_kwargs={"unexpected_kwarg": True},
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_proxy_rejects_cleartext_non_loopback_upstream():
+    """start_proxy validates the passthrough upstream before binding: a non-loopback http
+    URL — which would forward the prompt and x-api-key in cleartext — raises ValueError and
+    no server is bound. Oracle: the require-https-or-loopback rule refuses http to a public
+    host; the message flags https. Kills a mutant that drops the validate_upstream_url call."""
+    with pytest.raises(ValueError, match="https"):
+        await start_proxy(
+            host="127.0.0.1",
+            port=_find_free_port(),
+            upstream_url="http://api.anthropic.com",
         )
 
 
@@ -649,47 +698,6 @@ def test_get_fallback_provider_warns_for_unknown_provider(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_get_timeout_returns_default_when_unset(monkeypatch):
-    """Without UPSTREAM_TIMEOUT env var, _get_timeout returns the provided default."""
-    import claude_bridge.config as config
-    from claude_bridge.proxy import _get_timeout
-
-    monkeypatch.delenv(config.UPSTREAM_TIMEOUT_ENV, raising=False)
-    assert _get_timeout(60) == 60
-    assert _get_timeout(120) == 120
-
-
-def test_get_timeout_reads_env_var(monkeypatch):
-    """UPSTREAM_TIMEOUT overrides the default for all callsites."""
-    import claude_bridge.config as config
-    from claude_bridge.proxy import _get_timeout
-
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "30")
-    assert _get_timeout(60) == 30
-    assert _get_timeout(120) == 30
-
-
-def test_get_timeout_ignores_invalid_env_var(monkeypatch):
-    """Non-numeric UPSTREAM_TIMEOUT falls back to default."""
-    import claude_bridge.config as config
-    from claude_bridge.proxy import _get_timeout
-
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "not-a-number")
-    assert _get_timeout(120) == 120
-
-
-def test_get_timeout_ignores_zero_and_negative(monkeypatch):
-    """Zero or negative UPSTREAM_TIMEOUT falls back to default."""
-    import claude_bridge.config as config
-    from claude_bridge.proxy import _get_timeout
-
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
-    assert _get_timeout(120) == 120
-
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "-5")
-    assert _get_timeout(60) == 60
-
-
 def test_max_request_body_warns_for_invalid_import_value(monkeypatch):
     """Invalid import-time body limits are diagnosable and fall back safely."""
     import importlib
@@ -708,19 +716,77 @@ def test_max_request_body_warns_for_invalid_import_value(monkeypatch):
     assert "Invalid MAX_REQUEST_BODY='0', using default 10485760B" in stream.getvalue()
 
 
-def test_get_timeout_warns_for_nonpositive_values(monkeypatch):
-    """Invalid positive syntax and nonpositive timeouts are both diagnosable."""
-    import claude_bridge.config as config
-    from claude_bridge.log import configure_logging
-    from claude_bridge.proxy import _get_timeout
+# ---------------------------------------------------------------------------
+# _extract_model log-sanitization tests
+# ---------------------------------------------------------------------------
 
-    stream = io.StringIO()
-    configure_logging(level="WARNING", stream=stream)
-    monkeypatch.setenv(config.UPSTREAM_TIMEOUT_ENV, "0")
 
-    assert _get_timeout(120) == 120
+def test_extract_model_strips_control_chars_to_prevent_log_forging():
+    """A request-controlled model reaching INFO logs must not carry control chars.
 
-    assert "Invalid UPSTREAM_TIMEOUT='0', using default 120s" in stream.getvalue()
+    The extracted value is interpolated into log lines (CWE-117 log forging), so an
+    embedded newline would let a caller inject a forged log record. safe_log_excerpt
+    collapses every control-char run ([\\x00-\\x1f\\x7f]) to a single space, so the
+    oracle here is derived from that regex, not from running the function.
+    """
+    from claude_bridge.proxy import _extract_model
+
+    body = json.dumps({"model": "legit\nERROR forged log line"}).encode()
+
+    result = _extract_model(body)
+
+    assert "\n" not in result
+    assert "\r" not in result
+    assert result == "legit ERROR forged log line"
+
+
+def test_extract_model_bounds_length():
+    """An over-long model value is truncated so it cannot flood the logs."""
+    from claude_bridge.proxy import _MODEL_LOG_LIMIT, _extract_model
+
+    body = json.dumps({"model": "g" * (_MODEL_LOG_LIMIT + 150)}).encode()
+
+    result = _extract_model(body)
+
+    assert result == "g" * _MODEL_LOG_LIMIT + "..."
+
+
+def test_extract_model_non_string_returns_unknown():
+    """A non-string model (int, null, list) is not a valid id — report 'unknown'."""
+    from claude_bridge.proxy import _extract_model
+
+    assert _extract_model(json.dumps({"model": 123}).encode()) == "unknown"
+    assert _extract_model(json.dumps({"model": None}).encode()) == "unknown"
+    assert _extract_model(json.dumps({"model": ["grok"]}).encode()) == "unknown"
+
+
+def test_extract_model_passes_through_normal_token():
+    """A normal short model id is returned unchanged."""
+    from claude_bridge.proxy import _extract_model
+
+    assert _extract_model(json.dumps({"model": "grok-4.6"}).encode()) == "grok-4.6"
+
+
+def test_extract_model_missing_and_malformed_return_unknown():
+    """Missing key, malformed JSON, and empty body all fall back to 'unknown'."""
+    from claude_bridge.proxy import _extract_model
+
+    assert _extract_model(json.dumps({}).encode()) == "unknown"
+    assert _extract_model(b"not json") == "unknown"
+    assert _extract_model(b"") == "unknown"
+
+
+def test_extract_model_non_dict_json_returns_unknown():
+    """Valid-but-non-dict JSON (array, scalar) has no model — 'unknown', never a crash.
+
+    The body is request-controlled and reaches this helper during request processing,
+    so a valid JSON array or scalar must not raise AttributeError on the .get() call.
+    """
+    from claude_bridge.proxy import _extract_model
+
+    assert _extract_model(b"[1, 2, 3]") == "unknown"
+    assert _extract_model(b'"just a string"') == "unknown"
+    assert _extract_model(b"42") == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -736,7 +802,7 @@ async def test_oversized_body_returns_413(upstream_url: str, monkeypatch):
     monkeypatch.setattr(proxy_mod, "_MAX_REQUEST_BODY", 100)
 
     port = _find_free_port()
-    server = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    server, client = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 200\r\n\r\n")
@@ -749,6 +815,66 @@ async def test_oversized_body_returns_413(upstream_url: str, monkeypatch):
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_too_many_request_headers_returns_413(upstream_url: str, monkeypatch):
+    """More header lines than _MAX_REQUEST_HEADERS is rejected with 413, not buffered.
+
+    Bounds the inbound header-count vector (CWE-400): without the cap the loop accepts
+    unlimited header lines. 413 is the request-too-large status from the HTTP spec; the
+    expected value is derived from the spec, not from running the parser.
+    """
+    import claude_bridge.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "_MAX_REQUEST_HEADERS", 5)
+
+    port = _find_free_port()
+    server, client = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        padding = b"".join(b"X-Pad-%d: v\r\n" % i for i in range(20))
+        writer.write(b"POST /v1/messages HTTP/1.1\r\n" + padding + b"Content-Length: 0\r\n\r\n")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(-1), timeout=2)
+        writer.close()
+        assert b"413" in response
+        assert b"request_too_large" in response
+    finally:
+        server.close()
+        await server.wait_closed()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oversized_request_headers_return_413(upstream_url: str, monkeypatch):
+    """Aggregate header bytes over _MAX_REQUEST_HEADER_BYTES is rejected with 413.
+
+    Bounds the duplicate-key/large-value header flood the count cap alone misses: a dict
+    overwrites duplicate keys so len(headers) stays small, but the accumulated bytes are
+    what exhaust memory. 413 is the spec status for a too-large request.
+    """
+    import claude_bridge.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "_MAX_REQUEST_HEADER_BYTES", 200)
+
+    port = _find_free_port()
+    server, client = await start_proxy(host="127.0.0.1", port=port, upstream_url=upstream_url)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        # Same key repeated (dict keeps one entry) but the bytes accumulate past the cap.
+        flood = b"".join(b"X-Same: %s\r\n" % (b"v" * 40) for _ in range(20))
+        writer.write(b"POST /v1/messages HTTP/1.1\r\n" + flood + b"Content-Length: 0\r\n\r\n")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(-1), timeout=2)
+        writer.close()
+        assert b"413" in response
+        assert b"request_too_large" in response
+    finally:
+        server.close()
+        await server.wait_closed()
+        await client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +892,7 @@ class _BrokenProvider:
         sync_response_mode="sse",
     )
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -790,7 +916,9 @@ async def test_translate_request_returns_none_gives_502():
     """Provider returning None from translate_request produces 502, not crash."""
     port = _find_free_port()
     provider = _BrokenProvider()
-    server = await start_proxy(host="127.0.0.1", port=port, upstream_url="http://127.0.0.1:1")
+    server, client = await start_proxy(
+        host="127.0.0.1", port=port, upstream_url="http://127.0.0.1:1"
+    )
     # We need to patch the handler's provider directly
     server.close()
     await server.wait_closed()
@@ -799,7 +927,7 @@ async def test_translate_request_returns_none_gives_502():
     from claude_bridge.router import Router
     from claude_bridge.stats import BridgeStats
 
-    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats())
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats(), client=client)
     server = await asyncio.start_server(handler, "127.0.0.1", port)
     try:
         status, data = await asyncio.to_thread(
@@ -814,6 +942,7 @@ async def test_translate_request_returns_none_gives_502():
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -859,7 +988,9 @@ async def test_rate_limit_headers_forwarded():
     upstream_url = f"http://127.0.0.1:{upstream_port}"
 
     proxy_port = _find_free_port()
-    server = await start_proxy(host="127.0.0.1", port=proxy_port, upstream_url=upstream_url)
+    server, client = await start_proxy(
+        host="127.0.0.1", port=proxy_port, upstream_url=upstream_url
+    )
     try:
 
         def _check_headers():
@@ -883,6 +1014,7 @@ async def test_rate_limit_headers_forwarded():
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
         upstream_server.shutdown()
 
 
@@ -1105,7 +1237,7 @@ class TestMediaAwareTokenEstimation:
             def emit(self, record: logging.LogRecord) -> None:
                 records.append(record)
 
-        bridge_logger = logging.getLogger("claude_bridge.proxy")
+        bridge_logger = logging.getLogger("claude_bridge.request_view")
         handler = _Capture(level=logging.WARNING)
         previous_level = bridge_logger.level
         bridge_logger.addHandler(handler)
@@ -1194,7 +1326,7 @@ class _StreamModeProvider:
             sync_response_mode="sse",
         )
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -1214,7 +1346,8 @@ async def _send_streaming_request_to_provider(provider: _StreamModeProvider) -> 
     from claude_bridge.stats import BridgeStats
 
     port = _find_free_port()
-    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats())
+    client = create_client()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats(), client=client)
     server = await asyncio.start_server(handler, "127.0.0.1", port)
     try:
         request_body = {
@@ -1232,6 +1365,7 @@ async def _send_streaming_request_to_provider(provider: _StreamModeProvider) -> 
     finally:
         server.close()
         await server.wait_closed()
+        await client.aclose()
 
 
 @pytest.fixture()
@@ -1331,7 +1465,7 @@ async def test_stream_via_provider_http_error_log_omits_raw_body_secret():
     cleanup = _register_provider_at(f"http://127.0.0.1:{port}")
     try:
         proxy_port = _find_free_port()
-        proxy_server = await start_proxy(
+        proxy_server, client = await start_proxy(
             host="127.0.0.1",
             port=proxy_port,
             upstream_url="http://127.0.0.1:1",  # unused — direct mode
@@ -1363,6 +1497,7 @@ async def test_stream_via_provider_http_error_log_omits_raw_body_secret():
         finally:
             proxy_server.close()
             await proxy_server.wait_closed()
+            await client.aclose()
     finally:
         cleanup()
         server.shutdown()
@@ -1375,7 +1510,7 @@ async def test_stream_via_provider_connection_refused_returns_502():
     cleanup = _register_provider_at(f"http://127.0.0.1:{dead_port}")
     try:
         proxy_port = _find_free_port()
-        proxy_server = await start_proxy(
+        proxy_server, client = await start_proxy(
             host="127.0.0.1",
             port=proxy_port,
             upstream_url="http://127.0.0.1:1",
@@ -1397,6 +1532,7 @@ async def test_stream_via_provider_connection_refused_returns_502():
         finally:
             proxy_server.close()
             await proxy_server.wait_closed()
+            await client.aclose()
     finally:
         cleanup()
 
@@ -1411,7 +1547,7 @@ class _StreamFailureProvider:
         sync_response_mode="sse",
     )
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -1423,7 +1559,7 @@ class _StreamFailureProvider:
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
         async for _chunk in raw_chunks:
             raise ValueError("stream translation failed")
-            yield {}
+        yield {}  # only reached on an empty stream; present so this stays an async generator
 
 
 class _ProviderOkStreamHandler(BaseHTTPRequestHandler):
@@ -1458,7 +1594,8 @@ async def test_stream_via_provider_post_header_failure_emits_error_event_and_sta
 
     stats = BridgeStats()
     proxy_port = _find_free_port()
-    handler = _make_handler("http://127.0.0.1:1", Router(), provider, stats)
+    client = create_client()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, stats, client=client)
     proxy_server = await asyncio.start_server(handler, "127.0.0.1", proxy_port)
     try:
         status, raw_body = await asyncio.to_thread(
@@ -1486,6 +1623,7 @@ async def test_stream_via_provider_post_header_failure_emits_error_event_and_sta
     finally:
         proxy_server.close()
         await proxy_server.wait_closed()
+        await client.aclose()
         provider_server.shutdown()
 
 
@@ -1494,7 +1632,7 @@ async def test_stream_passthrough_upstream_unavailable_returns_502():
     """Upstream unreachable during streaming passthrough returns 502."""
     dead_port = _find_free_port()
     proxy_port = _find_free_port()
-    proxy_server = await start_proxy(
+    proxy_server, client = await start_proxy(
         host="127.0.0.1",
         port=proxy_port,
         upstream_url=f"http://127.0.0.1:{dead_port}",
@@ -1516,67 +1654,310 @@ async def test_stream_passthrough_upstream_unavailable_returns_502():
     finally:
         proxy_server.close()
         await proxy_server.wait_closed()
+        await client.aclose()
 
 
-# --- Retry logic tests ---
+# ---------------------------------------------------------------------------
+# start_proxy client lifecycle on start-failure: it closes a self-created client
+# but never an injected one (the caller owns an injected client).
+# ---------------------------------------------------------------------------
 
 
-def test_retry_request_retries_on_transient_error():
-    """_retry_request retries once on URLError, then succeeds."""
-    import urllib.error
+@pytest.mark.asyncio
+async def test_start_proxy_closes_self_created_client_on_start_failure(monkeypatch):
+    """A self-created client is aclosed when the bind fails, before the error propagates."""
+    import claude_bridge.proxy as proxy_mod
 
-    from claude_bridge.proxy import _retry_request
+    # Occupy a port with a live listener so asyncio.start_server fails address-in-use.
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
 
-    call_count = 0
+    created: list[httpx.AsyncClient] = []
 
-    def flaky_fn():
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            raise urllib.error.URLError("Connection reset")
-        return 200, b"ok"
+    def _spy_create_client() -> httpx.AsyncClient:
+        client = create_client()
+        created.append(client)
+        return client
 
-    status, body = _retry_request(flaky_fn, retries=1, backoff=0.0)
-    assert status == 200
-    assert body == b"ok"
-    assert call_count == 2
-
-
-def test_retry_request_gives_up_after_max_retries():
-    """_retry_request returns error after exhausting retries."""
-    import urllib.error
-
-    from claude_bridge.proxy import _retry_request
-
-    def always_fails():
-        raise urllib.error.URLError("Connection refused")
-
-    status, _body = _retry_request(always_fails, retries=1, backoff=0.0)
-    assert status == 502
+    monkeypatch.setattr(proxy_mod, "create_client", _spy_create_client)
+    try:
+        with pytest.raises(OSError):
+            await start_proxy(host="127.0.0.1", port=port)
+        assert len(created) == 1
+        assert created[0].is_closed is True
+    finally:
+        blocker.close()
 
 
-def test_retry_request_no_retry_on_http_error():
-    """_retry_request does not retry on HTTPError (non-transient)."""
-    import urllib.error
+@pytest.mark.asyncio
+async def test_start_proxy_leaves_injected_client_open_on_start_failure():
+    """An injected client is the caller's to close; start_proxy never acloses it on failure."""
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
 
-    from claude_bridge.proxy import _retry_request
+    injected = create_client()
+    try:
+        with pytest.raises(OSError):
+            await start_proxy(host="127.0.0.1", port=port, http_client_instance=injected)
+        assert injected.is_closed is False
+    finally:
+        await injected.aclose()
+        blocker.close()
 
-    call_count = 0
 
-    def http_error():
-        nonlocal call_count
-        call_count += 1
-        raise urllib.error.HTTPError(
-            "http://test",
-            400,
-            "Bad Request",
-            {},  # type: ignore[arg-type]
-            None,  # type: ignore[arg-type]
+# ---------------------------------------------------------------------------
+# "No 200 before SSE Content-Type": the stream validators must commit the real
+# error status, never a bare SSE 200 header followed by a failed body.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingWriter:
+    """Minimal StreamWriter stand-in that captures every byte written to the client."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self.buffer.extend(data)
+
+
+class _WarningCapture(logging.Handler):
+    """Capture WARNING+ records emitted on the ``claude_bridge.proxy`` logger.
+
+    The bridge logger sets ``propagate=False``, so pytest's ``caplog`` fixture never
+    sees its records; a handler attached directly to the named logger is the only way
+    to observe them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+async def _route_streaming_auto(router: Router) -> list[logging.LogRecord]:
+    """Drive ``_route_request`` down the streaming auto-mode branch, returning WARNINGs.
+
+    Auto mode = ``provider is None`` + ``streaming is True``. ``stream_passthrough`` is
+    replaced by an instant no-network stub so the test isolates the routing decision (and
+    its diagnostics) from the passthrough transport. Returns every WARNING record the
+    proxy logger emitted while routing.
+    """
+    from claude_bridge import proxy as proxy_module
+    from claude_bridge.wire import StreamOutcome
+
+    async def _stub_passthrough(*_args: object, **_kwargs: object) -> StreamOutcome:
+        return StreamOutcome(status=200)
+
+    capture = _WarningCapture()
+    bridge_logger = logging.getLogger("claude_bridge.proxy")
+    previous_level = bridge_logger.level
+    bridge_logger.addHandler(capture)
+    bridge_logger.setLevel(logging.WARNING)
+    client = create_client()
+    real_passthrough = proxy_module.stream_passthrough
+    proxy_module.stream_passthrough = _stub_passthrough  # type: ignore[assignment]
+    try:
+        await _route_request(
+            None,  # provider -> auto mode
+            "http://127.0.0.1:9",  # upstream_url (never dialed — passthrough is stubbed)
+            {},  # headers
+            b'{"model":"claude-sonnet-4-6","stream":true,"messages":[]}',
+            cast(asyncio.StreamWriter, _RecordingWriter()),
+            router,
+            None,  # stats
+            True,  # streaming
+            "claude-sonnet-4-6",
+            0.0,  # request_start
+            client,
         )
+    finally:
+        proxy_module.stream_passthrough = real_passthrough  # type: ignore[assignment]
+        bridge_logger.removeHandler(capture)
+        bridge_logger.setLevel(previous_level)
+        await client.aclose()
+    return capture.records
 
-    status, _body = _retry_request(http_error, retries=1, backoff=0.0)
-    assert status == 400
-    assert call_count == 1
+
+def _failover_bypass_warnings(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    """Filter to the streaming-has-no-failover WARNING (excludes router transition logs)."""
+    return [
+        r for r in records if r.levelno == logging.WARNING and "failover" in r.getMessage().lower()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_auto_mode_warns_when_circuit_open():
+    """When the circuit breaker is OPEN, a streaming auto-mode request warns the operator.
+
+    Contract (D-STREAM-001): streaming auto-mode has no failover — a provider switch
+    mid-stream is impossible — so an OPEN circuit means the stream is served unprotected
+    via Anthropic passthrough. The operator MUST be told. The expected value (a failover
+    WARNING is present) is the design contract, not a value read from the implementation.
+    """
+    router = Router(failure_threshold=1)
+    await router.record_failure()  # CLOSED -> OPEN
+    assert router.state is RouterState.OPEN
+
+    warnings = _failover_bypass_warnings(await _route_streaming_auto(router))
+
+    assert len(warnings) == 1
+    assert "claude-sonnet-4-6" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_streaming_auto_mode_silent_when_circuit_closed():
+    """A healthy (CLOSED) circuit emits no failover-bypass warning for a streaming request.
+
+    The warning is conditional on the OPEN state so the signal stays meaningful; a CLOSED
+    circuit must stay silent. Guards against an unconditional-warning regression (drop the
+    OPEN guard and this test fails).
+    """
+    router = Router(failure_threshold=1)
+    assert router.state is RouterState.CLOSED
+
+    warnings = _failover_bypass_warnings(await _route_streaming_auto(router))
+
+    assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_validate_stream_response_non_sse_200_writes_502_never_sse_header():
+    """A provider 200 that is not text/event-stream is refused with a 502 — the client never
+    first receives a committed SSE 200 header."""
+    from claude_bridge.proxy_streaming import validate_stream_response
+
+    response = httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        content=b'{"error": "not a stream"}',
+    )
+    writer = _RecordingWriter()
+
+    outcome = await validate_stream_response(response, cast(asyncio.StreamWriter, writer))
+
+    assert outcome is not None
+    assert outcome.status == 502
+    written = bytes(writer.buffer)
+    assert written.startswith(b"HTTP/1.1 502 Bad Gateway\r\n")
+    assert b"text/event-stream" not in written
+    assert b"provider did not return a stream" in written
+
+
+@pytest.mark.asyncio
+async def test_validate_stream_response_passes_real_sse_stream_through():
+    """A genuine 200 text/event-stream returns None so the caller pumps it, writing nothing."""
+    from claude_bridge.proxy_streaming import validate_stream_response
+
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=b"data: {}\n\n",
+    )
+    writer = _RecordingWriter()
+
+    outcome = await validate_stream_response(response, cast(asyncio.StreamWriter, writer))
+
+    assert outcome is None
+    assert bytes(writer.buffer) == b""
+    await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_validate_stream_response_accepts_sse_with_absent_content_type():
+    """A 200 SSE stream with NO content-type header is pumped (returns None), not refused 502.
+
+    Captured live 2026-08-23: the Codex backend (chatgpt.com/backend-api/codex/responses,
+    behind Cloudflare) streams valid SSE — ``event: response.created\\ndata: {...}`` — with the
+    content-type header ABSENT. A guard requiring ``text/event-stream`` turns every Codex
+    stream into a 502 while sync (which never checks content-type) succeeds. The guard must
+    reject only a PRESENT non-SSE content-type, never an absent/empty one. Fixture is the real
+    captured wire shape (empty headers + SSE body); the expected accept comes from the SSE
+    contract, not from running the guard.
+    """
+    from claude_bridge.proxy_streaming import validate_stream_response
+
+    response = httpx.Response(
+        200,
+        headers={},  # Codex/Cloudflare omits content-type on the stream
+        content=b'event: response.created\ndata: {"type":"response.created"}\n\n',
+    )
+    writer = _RecordingWriter()
+
+    outcome = await validate_stream_response(response, cast(asyncio.StreamWriter, writer))
+
+    assert outcome is None  # proceed to pump — never a 502
+    assert bytes(writer.buffer) == b""
+    await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_validate_passthrough_response_non_sse_200_forwards_buffered_body():
+    """A non-SSE 200 upstream body is buffered and forwarded as a normal 200, not pumped."""
+    from claude_bridge.proxy_streaming import validate_passthrough_response
+
+    response = httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        content=b'{"ok": true}',
+    )
+    writer = _RecordingWriter()
+
+    outcome = await validate_passthrough_response(response, cast(asyncio.StreamWriter, writer))
+
+    assert outcome is not None
+    assert outcome.status == 200
+    written = bytes(writer.buffer)
+    assert written.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert b"text/event-stream" not in written
+    assert written.endswith(b'{"ok": true}')
+
+
+@pytest.mark.asyncio
+async def test_validate_passthrough_response_non_200_forwards_error_verbatim():
+    """A non-200 upstream response is forwarded transparently with its own status and body."""
+    from claude_bridge.proxy_streaming import validate_passthrough_response
+
+    response = httpx.Response(
+        429,
+        headers={"content-type": "application/json"},
+        content=b'{"error": "rate limited"}',
+    )
+    writer = _RecordingWriter()
+
+    outcome = await validate_passthrough_response(response, cast(asyncio.StreamWriter, writer))
+
+    assert outcome is not None
+    assert outcome.status == 429
+    written = bytes(writer.buffer)
+    assert b"429" in written
+    assert b"text/event-stream" not in written
+    assert written.endswith(b'{"error": "rate limited"}')
+
+
+@pytest.mark.asyncio
+async def test_validate_passthrough_response_passes_real_sse_stream_through():
+    """A real upstream SSE stream returns None so the caller pumps it, writing nothing here."""
+    from claude_bridge.proxy_streaming import validate_passthrough_response
+
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=b"data: {}\n\n",
+    )
+    writer = _RecordingWriter()
+
+    outcome = await validate_passthrough_response(response, cast(asyncio.StreamWriter, writer))
+
+    assert outcome is None
+    assert bytes(writer.buffer) == b""
+    await response.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -1694,9 +2075,9 @@ def _text_stream_events() -> list[dict]:
 
 def test_aggregate_stream_to_message_concatenates_text_deltas():
     """Text deltas fold into a single text block; id/model/stop/usage preserved."""
-    from claude_bridge.proxy import _aggregate_stream_to_message
+    from claude_bridge.proxy_streaming import aggregate_stream_to_message
 
-    message = _aggregate_stream_to_message(_text_stream_events())
+    message = aggregate_stream_to_message(_text_stream_events())
     assert message is not None
 
     # Oracle: "Hel" + "lo" = "Hello" by the streaming spec (deltas concatenate).
@@ -1712,7 +2093,7 @@ def test_aggregate_stream_to_message_concatenates_text_deltas():
 
 def test_aggregate_stream_to_message_parses_tool_use_json():
     """input_json_delta fragments fold into a parsed tool_use input dict."""
-    from claude_bridge.proxy import _aggregate_stream_to_message
+    from claude_bridge.proxy_streaming import aggregate_stream_to_message
 
     events = [
         {
@@ -1767,7 +2148,7 @@ def test_aggregate_stream_to_message_parses_tool_use_json():
         {"event": "message_stop", "data": {"type": "message_stop"}},
     ]
 
-    message = _aggregate_stream_to_message(events)
+    message = aggregate_stream_to_message(events)
     assert message is not None
 
     # Oracle: json.loads('{"city:' + '"NYC"}') == {"city": "NYC"} — hand-derivable.
@@ -1779,7 +2160,7 @@ def test_aggregate_stream_to_message_parses_tool_use_json():
 
 def test_aggregate_stream_to_message_preserves_block_order():
     """A text block followed by a tool_use block keeps arrival order."""
-    from claude_bridge.proxy import _aggregate_stream_to_message
+    from claude_bridge.proxy_streaming import aggregate_stream_to_message
 
     events = [
         {
@@ -1843,7 +2224,7 @@ def test_aggregate_stream_to_message_preserves_block_order():
         {"event": "message_stop", "data": {"type": "message_stop"}},
     ]
 
-    message = _aggregate_stream_to_message(events)
+    message = aggregate_stream_to_message(events)
     assert message is not None
 
     assert [b["type"] for b in message["content"]] == ["text", "tool_use"]
@@ -1853,7 +2234,7 @@ def test_aggregate_stream_to_message_preserves_block_order():
 
 def test_aggregate_stream_to_message_malformed_tool_json_keeps_raw():
     """Unparseable tool arguments fall back to {'_raw': ...} (never crash)."""
-    from claude_bridge.proxy import _aggregate_stream_to_message
+    from claude_bridge.proxy_streaming import aggregate_stream_to_message
 
     events = [
         {
@@ -1895,7 +2276,7 @@ def test_aggregate_stream_to_message_malformed_tool_json_keeps_raw():
         {"event": "message_stop", "data": {"type": "message_stop"}},
     ]
 
-    message = _aggregate_stream_to_message(events)
+    message = aggregate_stream_to_message(events)
     assert message is not None
 
     assert message["content"][0]["input"] == {"_raw": "{not json"}
@@ -1903,14 +2284,16 @@ def test_aggregate_stream_to_message_malformed_tool_json_keeps_raw():
 
 def test_aggregate_stream_to_message_no_message_start_returns_none():
     """A stream with no message_start (malformed/empty) is unusable → None."""
-    from claude_bridge.proxy import _aggregate_stream_to_message
+    from claude_bridge.proxy_streaming import aggregate_stream_to_message
 
-    assert _aggregate_stream_to_message([]) is None
-    assert _aggregate_stream_to_message([{"event": "ping", "data": {"type": "ping"}}]) is None
+    assert aggregate_stream_to_message([]) is None
+    assert aggregate_stream_to_message([{"event": "ping", "data": {"type": "ping"}}]) is None
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_codex_empty_output_populates_text(_codex_sse_mock):
+async def test_forward_via_provider_codex_empty_output_populates_text(
+    _codex_sse_mock, http_client
+):
     """REGRESSION: Codex completed.output is [] — text must come from deltas.
 
     F2P: against the pre-fix code (_extract_completed_response reads the empty
@@ -1921,7 +2304,7 @@ async def test_forward_via_provider_codex_empty_output_populates_text(_codex_sse
     url, _payload = _codex_sse_mock
     provider = _provider_at(f"{url}/v1/responses")
 
-    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
 
     assert status == 200
     response = json.loads(body)
@@ -1935,7 +2318,9 @@ async def test_forward_via_provider_codex_empty_output_populates_text(_codex_sse
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_codex_tool_call_populates_tool_use(_codex_sse_mock):
+async def test_forward_via_provider_codex_tool_call_populates_tool_use(
+    _codex_sse_mock, http_client
+):
     """A Codex tool turn (empty completed.output) folds into a tool_use block."""
     from claude_bridge.proxy import _forward_via_provider
 
@@ -1943,7 +2328,7 @@ async def test_forward_via_provider_codex_tool_call_populates_tool_use(_codex_ss
     payload["bytes"] = _codex_tool_sse()
     provider = _provider_at(f"{url}/v1/responses")
 
-    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
 
     assert status == 200
     response = json.loads(body)
@@ -1961,7 +2346,7 @@ async def test_forward_via_provider_codex_tool_call_populates_tool_use(_codex_ss
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_unparseable_stream_returns_502(_codex_sse_mock):
+async def test_forward_via_provider_unparseable_stream_returns_502(_codex_sse_mock, http_client):
     """A non-SSE provider body (no message_start) is a 502, not a blank message."""
     from claude_bridge.proxy import _forward_via_provider
 
@@ -1969,7 +2354,7 @@ async def test_forward_via_provider_unparseable_stream_returns_502(_codex_sse_mo
     payload["bytes"] = b"this is not an SSE stream at all"
     provider = _provider_at(f"{url}/v1/responses")
 
-    status, _body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    status, _body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
 
     assert status == 502
 
@@ -1977,6 +2362,7 @@ async def test_forward_via_provider_unparseable_stream_returns_502(_codex_sse_mo
 @pytest.mark.asyncio
 async def test_forward_via_provider_unparseable_stream_log_omits_raw_body_secret(
     _codex_sse_mock,
+    http_client,
 ):
     """Malformed provider SSE logs status/summary, never the raw provider payload."""
     from claude_bridge.log import configure_logging
@@ -1988,7 +2374,7 @@ async def test_forward_via_provider_unparseable_stream_log_omits_raw_body_secret
     payload["bytes"] = b"PLACEHOLDER_SECRET_BAD_SSE_BODY"
     provider = _provider_at(f"{url}/v1/responses")
 
-    status, _body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    status, _body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
 
     assert status == 502
     logs = stream.getvalue()
@@ -2007,7 +2393,7 @@ class _FailingAuthProvider:
         sync_response_mode="json",
     )
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         raise ValueError("missing provider token")
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
@@ -2017,18 +2403,19 @@ class _FailingAuthProvider:
         return provider_resp
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
-        if False:
+        for _ in ():  # empty async generator: this provider double is not driven for streaming
             yield {}
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_preflight_exception_returns_502():
+async def test_forward_via_provider_preflight_exception_returns_502(http_client):
     """Provider auth/translation preflight failures return Anthropic-shaped 502."""
     from claude_bridge.proxy import _forward_via_provider
 
     status, body = await _forward_via_provider(
         _FailingAuthProvider(),
         _anthropic_request_bytes(),
+        http_client,
     )
 
     assert status == 502
@@ -2050,17 +2437,14 @@ class _JsonSyncProvider:
     def __init__(self, endpoint: str, *, fail_translate: bool = False) -> None:
         self.endpoint = endpoint
         self.fail_translate = fail_translate
-        self.translated_responses: list[dict] = []
-        self.stream_calls = 0
 
-    async def authenticate(self) -> dict[str, str]:
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
         return {"Authorization": "Bearer json-token"}
 
     def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
         return {"provider_prompt": anthropic_req["messages"][0]["content"]}, []
 
     def translate_response(self, provider_resp: dict) -> dict:
-        self.translated_responses.append(provider_resp)
         if self.fail_translate:
             raise ValueError("translator exploded")
         return {
@@ -2077,8 +2461,7 @@ class _JsonSyncProvider:
         }
 
     async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
-        self.stream_calls += 1
-        if False:
+        for _ in ():  # empty async generator: this provider double is not driven for streaming
             yield {}
 
 
@@ -2130,13 +2513,17 @@ def _json_provider_mock():
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_json_sync_calls_translate_response(_json_provider_mock):
+async def test_forward_via_provider_json_sync_calls_translate_response(
+    _json_provider_mock, http_client
+):
     """JSON-sync providers parse the body and use translate_response, not SSE folding."""
     from claude_bridge.proxy import _forward_via_provider
 
     provider = _JsonSyncProvider(_json_provider_mock)
 
-    status, body = await _forward_via_provider(provider, _anthropic_request_bytes("hello json"))
+    status, body = await _forward_via_provider(
+        provider, _anthropic_request_bytes("hello json"), http_client
+    )
 
     assert status == 200
     response = json.loads(body)
@@ -2149,27 +2536,19 @@ async def test_forward_via_provider_json_sync_calls_translate_response(_json_pro
         "content": [{"type": "text", "text": "hello from json mode"}],
         "usage": {"input_tokens": 11, "output_tokens": 7},
     }
-    assert provider.translated_responses == [
-        {
-            "id": "provider-123",
-            "model": "json-model",
-            "text": "hello from json mode",
-            "finish_reason": "end_turn",
-            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
-        }
-    ]
-    assert provider.stream_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_json_sync_malformed_json_returns_502(_json_provider_mock):
+async def test_forward_via_provider_json_sync_malformed_json_returns_502(
+    _json_provider_mock, http_client
+):
     """Malformed JSON provider bodies become Anthropic-shaped 502 envelopes."""
     from claude_bridge.proxy import _forward_via_provider
 
     _ProviderJsonHandler.payload = b"not json at all"
     provider = _JsonSyncProvider(_json_provider_mock)
 
-    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
 
     assert status == 502
     response = json.loads(body)
@@ -2177,41 +2556,38 @@ async def test_forward_via_provider_json_sync_malformed_json_returns_502(_json_p
         "type": "error",
         "error": {"type": "api_error", "message": "could not parse provider response"},
     }
-    assert provider.translated_responses == []
-    assert provider.stream_calls == 0
 
 
 @pytest.mark.asyncio
 async def test_forward_via_provider_json_sync_translate_failure_returns_502(
     _json_provider_mock,
+    http_client,
 ):
-    """Provider translate_response failures become Anthropic-shaped 502 envelopes."""
+    """A translate_response failure returns a translation-specific 502 message.
+
+    The provider body parsed fine, so the message must differ from the malformed-JSON
+    case ("could not parse provider response"). That distinguishable message is the
+    behavioral oracle proving the translate path — not the parse path — produced the
+    502, without inspecting internal call shape.
+    """
     from claude_bridge.proxy import _forward_via_provider
 
     provider = _JsonSyncProvider(_json_provider_mock, fail_translate=True)
 
-    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
 
     assert status == 502
     response = json.loads(body)
     assert response == {
         "type": "error",
-        "error": {"type": "api_error", "message": "could not parse provider response"},
+        "error": {"type": "api_error", "message": "provider response translation failed"},
     }
-    assert provider.translated_responses == [
-        {
-            "id": "provider-123",
-            "model": "json-model",
-            "text": "hello from json mode",
-            "finish_reason": "end_turn",
-            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
-        }
-    ]
-    assert provider.stream_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_sse_sync_does_not_call_translate_response(_codex_sse_mock):
+async def test_forward_via_provider_sse_sync_does_not_call_translate_response(
+    _codex_sse_mock, http_client
+):
     """SSE-sync providers keep the translate_stream aggregation path."""
     from claude_bridge.proxy import _forward_via_provider
 
@@ -2223,7 +2599,7 @@ async def test_forward_via_provider_sse_sync_does_not_call_translate_response(_c
     payload["bytes"] = _codex_tool_sse()
     provider = _SseOnlyProvider(endpoint=f"{url}/v1/responses")
 
-    status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
 
     assert status == 200
     response = json.loads(body)
@@ -2238,6 +2614,38 @@ async def test_forward_via_provider_sse_sync_does_not_call_translate_response(_c
     assert response["stop_reason"] == "tool_use"
 
 
+@pytest.mark.asyncio
+async def test_forward_via_provider_sse_sync_translate_stream_failure_returns_502(
+    _codex_sse_mock, http_client
+):
+    """An SSE-sync translate_stream failure yields the translation-specific 502.
+
+    Same distinguishable-message contract as the JSON path: a translator that raises is
+    reported as a translation failure, not a parse failure ("could not parse..."). The
+    message is the behavioral oracle — both response-translation paths share it.
+    """
+    from claude_bridge.proxy import _forward_via_provider
+
+    class _SseTranslateFailProvider(_FakeOpenAIProvider):
+        async def translate_stream(self, raw_chunks):
+            async for _chunk in raw_chunks:
+                raise ValueError("stream translator exploded")
+            yield {}  # unreachable — present so this is an async generator
+
+    url, payload = _codex_sse_mock
+    payload["bytes"] = b"data: {}\n\n"
+    provider = _SseTranslateFailProvider(endpoint=f"{url}/v1/responses")
+
+    status, body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
+
+    assert status == 502
+    response = json.loads(body)
+    assert response == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "provider response translation failed"},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Provider error translation: upstream OpenAI errors → Anthropic error envelope
 # (so a Codex 400 context_length_exceeded reaches Claude Code cleanly, not as a
@@ -2247,7 +2655,7 @@ async def test_forward_via_provider_sse_sync_does_not_call_translate_response(_c
 
 def test_anthropic_error_body_maps_status_to_type():
     """HTTP status maps to the Anthropic error type from the API spec table."""
-    from claude_bridge.proxy import _anthropic_error_body
+    from claude_bridge.wire import anthropic_error_body
 
     # Oracle: Anthropic API error types (docs.anthropic.com/en/api/errors).
     cases = {
@@ -2261,22 +2669,22 @@ def test_anthropic_error_body_maps_status_to_type():
         529: "overloaded_error",
     }
     for status, expected_type in cases.items():
-        body = json.loads(_anthropic_error_body(status, "boom"))
+        body = json.loads(anthropic_error_body(status, "boom"))
         assert body == {"type": "error", "error": {"type": expected_type, "message": "boom"}}
 
 
 def test_anthropic_error_body_unknown_status_is_api_error():
     """An unmapped status defaults to api_error (never crashes)."""
-    from claude_bridge.proxy import _anthropic_error_body
+    from claude_bridge.wire import anthropic_error_body
 
-    body = json.loads(_anthropic_error_body(418, "teapot"))
+    body = json.loads(anthropic_error_body(418, "teapot"))
     assert body["error"]["type"] == "api_error"
     assert body["error"]["message"] == "teapot"
 
 
 def test_provider_error_message_extracts_openai_message():
     """The OpenAI {'error': {'message': ...}} shape yields just the message."""
-    from claude_bridge.proxy import _provider_error_message
+    from claude_bridge.wire import provider_error_message
 
     raw = json.dumps(
         {
@@ -2289,30 +2697,49 @@ def test_provider_error_message_extracts_openai_message():
     ).encode()
     # Oracle: the human-readable string is .error.message, not the whole envelope.
     assert (
-        _provider_error_message(raw)
-        == "Input tokens exceed the configured limit of 400000 tokens."
+        provider_error_message(raw) == "Input tokens exceed the configured limit of 400000 tokens."
     )
 
 
 def test_provider_error_message_non_json_falls_back_to_body():
     """A non-JSON error body is surfaced verbatim (decoded, truncated)."""
-    from claude_bridge.proxy import _provider_error_message
+    from claude_bridge.wire import provider_error_message
 
-    assert _provider_error_message(b"502 Bad Gateway") == "502 Bad Gateway"
+    assert provider_error_message(b"502 Bad Gateway") == "502 Bad Gateway"
+
+
+def test_provider_error_message_bounds_the_relayed_message():
+    """A long provider message is truncated before it is relayed to the client.
+
+    The message field is provider-authored free text relayed to the requesting client
+    (the 'visible errors' feature, D-SEC-001). A compromised first-party provider could
+    echo request content — an encrypted reasoning blob (INV-SEC-06) or the prompt-cache
+    key (INV-SEC-01) — in that field; bounding it caps an echoed opaque value to a prefix
+    instead of relaying it whole. Oracle: the cap matches the [:limit] slice the non-JSON
+    fallbacks in the same function already use.
+    """
+    from claude_bridge.wire import _PROVIDER_MESSAGE_LIMIT, provider_error_message
+
+    long_message = "b" * (_PROVIDER_MESSAGE_LIMIT + 500)
+    raw = json.dumps({"error": {"message": long_message}}).encode()
+
+    result = provider_error_message(raw)
+
+    assert result == "b" * _PROVIDER_MESSAGE_LIMIT
 
 
 def test_provider_error_log_summary_non_json_omits_raw_body_secret():
     """Malformed provider bodies log only metadata, never raw body text."""
-    from claude_bridge.proxy import _provider_error_log_summary
+    from claude_bridge.wire import provider_error_log_summary
 
-    summary = _provider_error_log_summary(b"PLACEHOLDER_SECRET_MALFORMED_RAW_BODY")
+    summary = provider_error_log_summary(b"PLACEHOLDER_SECRET_MALFORMED_RAW_BODY")
 
     assert summary == "unparseable provider error body (37B)"
     assert "PLACEHOLDER_SECRET_MALFORMED_RAW_BODY" not in summary
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_error_log_omits_raw_body_secret():
+async def test_forward_via_provider_error_log_omits_raw_body_secret(http_client):
     """Sync provider errors log status/message, never the raw provider body."""
     from claude_bridge.log import configure_logging
     from claude_bridge.proxy import _forward_via_provider
@@ -2347,7 +2774,9 @@ async def test_forward_via_provider_error_log_omits_raw_body_secret():
     thread.start()
     try:
         provider = _provider_at(f"http://127.0.0.1:{port}/v1/responses")
-        status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+        status, body = await _forward_via_provider(
+            provider, _anthropic_request_bytes(), http_client
+        )
     finally:
         server.shutdown()
 
@@ -2387,7 +2816,7 @@ class _MockOverflowHandler(BaseHTTPRequestHandler):
 
 
 @pytest.mark.asyncio
-async def test_forward_via_provider_overflow_returns_anthropic_error():
+async def test_forward_via_provider_overflow_returns_anthropic_error(http_client):
     """A Codex 400 overflow is translated to an Anthropic error envelope (not raw)."""
     from claude_bridge.proxy import _forward_via_provider
 
@@ -2397,7 +2826,9 @@ async def test_forward_via_provider_overflow_returns_anthropic_error():
     thread.start()
     try:
         provider = _provider_at(f"http://127.0.0.1:{port}/v1/responses")
-        status, body = await _forward_via_provider(provider, _anthropic_request_bytes())
+        status, body = await _forward_via_provider(
+            provider, _anthropic_request_bytes(), http_client
+        )
     finally:
         server.shutdown()
 
@@ -2409,3 +2840,410 @@ async def test_forward_via_provider_overflow_returns_anthropic_error():
     assert "400000" in response["error"]["message"]
     # The raw OpenAI envelope must NOT leak through.
     assert "error" not in json.loads(body).get("error", {})
+
+
+# ---------------------------------------------------------------------------
+# Reactive 401 refresh + retry: a bearer rejected upstream (rotated/expired since
+# the proactive check) triggers exactly ONE forced credential refresh and retry,
+# before any downstream byte — sync (_forward_via_provider) and stream paths alike.
+# ---------------------------------------------------------------------------
+
+
+_REAUTH_JSON_PAYLOAD = json.dumps(
+    {
+        "id": "reauth-1",
+        "model": "reauth-model",
+        "text": "fresh-bearer response",
+        "finish_reason": "end_turn",
+        "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+    }
+).encode()
+
+
+class _Json200IfFreshHandler(BaseHTTPRequestHandler):
+    """JSON 200 iff the request carries the refreshed bearer, else 401.
+
+    Models a credential the upstream rejects until a reactive refresh replaces it, so a
+    200 here can only mean the retry forwarded the fresh bearer.
+    """
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.headers.get("Authorization") == "Bearer fresh-token":
+            body, code = _REAUTH_JSON_PAYLOAD, 200
+        else:
+            body, code = b'{"error": {"message": "unauthorized"}}', 401
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _Json401Handler(BaseHTTPRequestHandler):
+    """Always 401 — even the refreshed bearer is rejected, so the retry cannot recover."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = b'{"error": {"message": "still unauthorized"}}'
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _Sse200IfFreshHandler(BaseHTTPRequestHandler):
+    """SSE 200 iff the request carries the refreshed bearer, else a JSON 401."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.headers.get("Authorization") == "Bearer fresh-token":
+            body = b"data: {}\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+        else:
+            body = b'{"error": {"message": "unauthorized"}}'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _Sse401Handler(BaseHTTPRequestHandler):
+    """Always 401 on the streaming open — the retry cannot recover."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = b'{"error": {"message": "still unauthorized"}}'
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class _ReauthProviderBase:
+    """Shared credential behaviour: a stale bearer first, the fresh one only on a forced refresh.
+
+    Records how many times ``authenticate`` ran and how many of those were forced, so a test
+    can assert the retry fired exactly once and only in reaction to a 401.
+    """
+
+    def __init__(self, endpoint: str, *, fail_force_refresh: bool = False) -> None:
+        self.endpoint = endpoint
+        self.fail_force_refresh = fail_force_refresh
+        self.auth_calls = 0
+        self.force_refresh_calls = 0
+
+    async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
+        self.auth_calls += 1
+        if force_refresh:
+            self.force_refresh_calls += 1
+            if self.fail_force_refresh:
+                raise RuntimeError("reactive refresh failed")
+            return {"Authorization": "Bearer fresh-token"}
+        return {"Authorization": "Bearer stale-token"}
+
+
+class _ReauthJsonProvider(_ReauthProviderBase):
+    """JSON-sync provider whose credential is rejected until a reactive refresh."""
+
+    name = "reauth-json"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="json",
+    )
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        return {"prompt": anthropic_req["messages"][0]["content"]}, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return {
+            "id": f"msg_{provider_resp['id']}",
+            "type": "message",
+            "role": "assistant",
+            "model": provider_resp["model"],
+            "stop_reason": provider_resp["finish_reason"],
+            "content": [{"type": "text", "text": provider_resp["text"]}],
+            "usage": {
+                "input_tokens": provider_resp["usage"]["prompt_tokens"],
+                "output_tokens": provider_resp["usage"]["completion_tokens"],
+            },
+        }
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        for _ in ():  # empty async generator: this provider double is not driven for streaming
+            yield {}
+
+
+class _ReauthStreamProvider(_ReauthProviderBase):
+    """SSE provider mirroring _ReauthJsonProvider's credential behaviour for the stream path."""
+
+    name = "reauth-stream"
+    capabilities = ProviderCapabilities(
+        stream_request_mode="body_parameter",
+        sync_response_mode="sse",
+    )
+
+    def translate_request(self, anthropic_req: dict) -> tuple[dict, list[str]]:
+        return {"model": anthropic_req["model"], "input": []}, []
+
+    def translate_response(self, provider_resp: dict) -> dict:
+        return provider_resp
+
+    async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        async for _chunk in raw_chunks:
+            pass
+        for event in _text_stream_events():
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_forward_reactive_401_refreshes_and_retries(http_client):
+    """A provider 401 triggers one forced refresh and a retry; the fresh bearer succeeds."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _Json200IfFreshHandler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    provider = _ReauthJsonProvider(f"http://127.0.0.1:{port}/v1/messages")
+    try:
+        status, body = await _forward_via_provider(
+            provider, _anthropic_request_bytes(), http_client
+        )
+    finally:
+        server.shutdown()
+
+    # Oracle: the mock returns 200 ONLY for the refreshed bearer, so a 200 here proves the
+    # 401 drove a forced refresh AND the retry forwarded the fresh credential.
+    assert status == 200
+    assert json.loads(body)["content"][0]["text"] == "fresh-bearer response"
+    assert provider.auth_calls == 2
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_reactive_401_retries_exactly_once(http_client):
+    """When even the refreshed bearer is rejected, the 401 is surfaced after ONE retry."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _Json401Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    provider = _ReauthJsonProvider(f"http://127.0.0.1:{port}/v1/messages")
+    try:
+        status, _body = await _forward_via_provider(
+            provider, _anthropic_request_bytes(), http_client
+        )
+    finally:
+        server.shutdown()
+
+    # Oracle: exactly one forced refresh (no unbounded loop), and the 401 is surfaced.
+    assert status == 401
+    assert provider.auth_calls == 2
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_reactive_401_reauth_failure_returns_502(http_client):
+    """If the reactive refresh itself fails, the request returns 502, not the raw 401."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    port = _find_free_port()
+    server = HTTPServer(("127.0.0.1", port), _Json401Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    provider = _ReauthJsonProvider(f"http://127.0.0.1:{port}/v1/messages", fail_force_refresh=True)
+    try:
+        status, body = await _forward_via_provider(
+            provider, _anthropic_request_bytes(), http_client
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 502
+    assert json.loads(body)["type"] == "error"
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_no_401_does_not_force_refresh(_json_provider_mock, http_client):
+    """A first-try 200 never triggers a reactive refresh (retry fires only on a 401)."""
+    from claude_bridge.proxy import _forward_via_provider
+
+    provider = _ReauthJsonProvider(_json_provider_mock)
+    status, _body = await _forward_via_provider(provider, _anthropic_request_bytes(), http_client)
+
+    assert status == 200
+    assert provider.auth_calls == 1
+    assert provider.force_refresh_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_reactive_401_refreshes_and_retries():
+    """A streaming 401 on open triggers one forced refresh and a retry before any SSE byte."""
+    from claude_bridge.proxy import _make_handler
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    provider_port = _find_free_port()
+    provider_server = HTTPServer(("127.0.0.1", provider_port), _Sse200IfFreshHandler)
+    Thread(target=provider_server.serve_forever, daemon=True).start()
+    provider = _ReauthStreamProvider(f"http://127.0.0.1:{provider_port}/v1/responses")
+    client = create_client()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats(), client=client)
+    proxy_port = _find_free_port()
+    proxy_server = await asyncio.start_server(handler, "127.0.0.1", proxy_port)
+    try:
+        status, raw = await asyncio.to_thread(
+            _http_post_stream_raw,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+        await client.aclose()
+        provider_server.shutdown()
+
+    # Oracle: a 200 SSE stream is reachable only with the refreshed bearer, so the client
+    # receiving message_start proves the reactive refresh + retry happened before any byte.
+    assert status == 200
+    assert b"event: message_start" in raw
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_reactive_401_retries_once_then_surfaces_401():
+    """A refreshed bearer that is also rejected surfaces the 401 after ONE retry — never a
+    committed SSE 200."""
+    from claude_bridge.proxy import _make_handler
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    provider_port = _find_free_port()
+    provider_server = HTTPServer(("127.0.0.1", provider_port), _Sse401Handler)
+    Thread(target=provider_server.serve_forever, daemon=True).start()
+    provider = _ReauthStreamProvider(f"http://127.0.0.1:{provider_port}/v1/responses")
+    client = create_client()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats(), client=client)
+    proxy_port = _find_free_port()
+    proxy_server = await asyncio.start_server(handler, "127.0.0.1", proxy_port)
+    try:
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+        await client.aclose()
+        provider_server.shutdown()
+
+    assert status == 401
+    assert data["type"] == "error"
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_reactive_401_reauth_failure_returns_502():
+    """If the reactive refresh fails mid-stream-open, the client gets 502 before any SSE byte."""
+    from claude_bridge.proxy import _make_handler
+    from claude_bridge.router import Router
+    from claude_bridge.stats import BridgeStats
+
+    provider_port = _find_free_port()
+    provider_server = HTTPServer(("127.0.0.1", provider_port), _Sse401Handler)
+    Thread(target=provider_server.serve_forever, daemon=True).start()
+    provider = _ReauthStreamProvider(
+        f"http://127.0.0.1:{provider_port}/v1/responses", fail_force_refresh=True
+    )
+    client = create_client()
+    handler = _make_handler("http://127.0.0.1:1", Router(), provider, BridgeStats(), client=client)
+    proxy_port = _find_free_port()
+    proxy_server = await asyncio.start_server(handler, "127.0.0.1", proxy_port)
+    try:
+        status, data = await asyncio.to_thread(
+            _http_post,
+            f"http://127.0.0.1:{proxy_port}/v1/messages",
+            {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+        await client.aclose()
+        provider_server.shutdown()
+
+    assert status == 502
+    assert data["type"] == "error"
+    assert provider.force_refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_open_stream_with_reauth_transport_error_after_refresh_returns_502(monkeypatch):
+    """A refreshed re-open that hits a transport error returns 502 before any SSE byte.
+
+    A transport failure on the SECOND open is not reproducible with a real socket (the
+    server cannot fail exactly one of two attempts), so the failure is injected at the
+    ``open_stream`` transport seam — the thin adapter over ``client.send``.
+    """
+    import claude_bridge.proxy_streaming as ps
+    from claude_bridge.proxy_streaming import _open_stream_with_reauth
+    from claude_bridge.wire import StreamOutcome
+
+    calls = {"n": 0}
+
+    async def _fake_open_stream(client, url, *, content, headers, retries=1):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(401, headers={"content-type": "application/json"}, content=b"{}")
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(ps, "open_stream", _fake_open_stream)
+
+    provider = _ReauthStreamProvider("http://unused")
+    writer = _RecordingWriter()
+    outcome = await _open_stream_with_reauth(
+        provider,
+        {"model": "m", "input": []},
+        {"Authorization": "Bearer stale-token"},
+        cast(asyncio.StreamWriter, writer),
+        cast(httpx.AsyncClient, None),
+    )
+
+    # Oracle: 401 on open drove exactly one forced refresh + one re-open; the re-open's
+    # transport error becomes a 502 written before any SSE byte, never a raised exception.
+    assert isinstance(outcome, StreamOutcome)
+    assert outcome.status == 502
+    assert provider.force_refresh_calls == 1
+    assert calls["n"] == 2
+    assert bytes(writer.buffer).startswith(b"HTTP/1.1 502 Bad Gateway")

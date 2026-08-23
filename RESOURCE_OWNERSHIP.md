@@ -1,17 +1,18 @@
 # Resource Ownership
 
-> Every shared or mutable resource has exactly one writer; everyone else reads through
-> a contract. A second writer to any row below is a single-writer violation. This file
-> carries a single table; every row below the header is a resource.
+## Ownership
 
-| Resource | Owner (single writer) | Consumers (read-only) | Enforcement |
-|-|-|-|-|
-| Environment configuration values | `config.py` | every module, via `config.get_*()` accessors | `os.environ` is read only inside `config.py`; no other module reads env (Boundary Rule 4) |
-| The `PROVIDERS` registry (dispatch table + contract) | `provider.py` | `proxy.py`, `__main__.py` | Declared once in `provider.py`; each provider self-registers its own key at import; the proxy dispatches by lookup, never by naming a concrete provider |
-| The grok credential file `~/.grok/auth.json` | `providers/xai.py` | none — the file is private to the xAI provider | Refresh rewrites only the selected entry via `mkstemp` O_EXCL at mode 0600, atomic rename; never widens bits (D-XAI-003) |
-| The xAI reasoning cache (`_reasoning_by_call_id`) | `providers/xai.py` | same provider instance only | Per-instance dict, `threading.Lock`-guarded, LRU-evicted at a fixed bound; in-memory only — never logged or persisted |
-| The OpenAI reasoning cache | `providers/openai.py` | same provider instance only | Separate per-instance cache; the two providers never share reasoning state (contract 1) |
-| Router failover state (circuit `CLOSED`/`OPEN`) | `router.py` (`Router`) | `proxy.py` | State transitions only through `record_success` / `record_failure`; consumers read `state` |
-| Bridge usage counters (requests, tokens, failovers) | `stats.py` (`BridgeStats`) | `proxy.py`, `__main__.py` | Mutated only through `record_*` methods under the stats lock |
-| The listening socket and bind address | `proxy.py` | `__main__.py` passes the host/port | Binds `127.0.0.1` by default; never `0.0.0.0` unless the operator sets an explicit host |
-| Logging configuration | `log.py` (`configure_logging`) | every module, via `get_logger` | Configured once at startup; helpers redact — the auth mode name is logged, never a secret value |
+| Resource | Area | Owner | Consumers | Enforcement | Status | Superseded By |
+|-|-|-|-|-|-|-|
+| PROVIDERS | provider | provider.py | proxy.py, __main__.py | Declared once in provider.py; each provider self-registers its own key at import; the proxy dispatches by lookup, never by naming a concrete provider | active |  |
+| bridge_stats | observability | stats.py (BridgeStats) | proxy.py, __main__.py | Mutated only through record_* methods under the stats lock | active |  |
+| config_values | config | config.py | every module, via config.get_* accessors | os.environ is read only inside config.py; no other module reads env (Boundary Rule 4) | active |  |
+| credential_file | auth | providers/xai/auth.py | none — the file is private to the xAI provider | Refresh rewrites only the selected entry via mkstemp O_EXCL at mode 0600, atomic rename; never widens bits (D-XAI-003) | active |  |
+| http_client | transport | __main__._run obtains the (server, client) pair from start_proxy and aclose()s the client in a finally block after the server stops. start_proxy creates a client via create_client when none is injected, and aclose()s that self-created client only if server startup fails, before re-raising (D-STRUCT-002). | proxy.py (forward_request, post_provider) and proxy_streaming.py (open_stream) borrow the client per call through http_client.py helpers; neither closes it. Providers never receive the client — they are passed into the helpers, not handed the transport. | http_client.py builds it (http2=True, split connect/idle Timeout, keepalive Limits). owns_client = (http_client_instance is None) gates start_proxy's failure-path close; the caller/injector closes on success, and the proxy closes only a self-created client on a startup failure — never an injected one (D-STRUCT-002). | active |  |
+| listen_address | network | proxy.py | __main__.py passes the host/port | Binds 127.0.0.1 by default; never 0.0.0.0 unless the operator sets an explicit host | active |  |
+| logging_config | observability | log.py (configure_logging) | every module, via get_logger | Configured once at startup; helpers redact — the auth mode name is logged, never a secret value | active |  |
+| openai_credential_file | auth | providers/openai/auth.py | none — the file is private to the OpenAI/Codex provider | Refresh rewrites only the selected entry via mkstemp O_EXCL at mode 0600, atomic os.replace; never widens bits. Serialized by a module asyncio.Lock plus a cross-process flock, double-checking on-disk token state before the POST; mirrors the xAI credential_file discipline under the per-provider duplication license (D-XAI-002) | active |  |
+| openai_reasoning_cache | reasoning | providers/openai/provider.py | same provider instance only | Separate per-instance cache; the two providers never share reasoning state (independence contract) | active |  |
+| prompt_cache_key | caching | providers/xai/provider.py, providers/openai/provider.py (each __init__) | the same provider instance's request builder | Minted once as str(uuid.uuid4()) per provider instance, never mutated; sent as the prompt_cache_key body field and, for xAI, the x-grok-conv-id header; never logged, embeds no secret (INV-SEC-01, INV-SEC-06) | active |  |
+| router_state | routing | router.py (Router) | proxy.py | State transitions only through record_success / record_failure; consumers read state | active |  |
+| xai_reasoning_cache | reasoning | providers/xai/provider.py | same provider instance only | Per-instance dict, threading.Lock-guarded, LRU-evicted at a fixed bound; in-memory only — never logged or persisted | active |  |

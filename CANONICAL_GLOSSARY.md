@@ -1,32 +1,38 @@
 # Canonical Glossary
 
-> One name per domain concept, used identically across `__main__`, `config`, the
-> `Provider` abstraction, both concrete providers, the launchers, tests, and docs.
-> Before introducing a name, search this table; a concept that already exists under a
-> different name is reused, never re-encoded. Column 2 is the canonical name in bold;
-> column 3 lists rejected aliases that must not reappear in code.
+## Concepts
 
-## Core Domain
+| Canonical Name | Domain | Concept | Rejected Aliases | Notes | Status | Superseded By |
+|-|-|-|-|-|-|-|
+| ClientDisconnected | streaming | The exception raised when writing or draining a streamed response fails because the client closed the connection first | client_disconnect, connection_dropped, peer_disconnected | `wire.ClientDisconnected`; `proxy_streaming` catches it and maps it to `StreamOutcome(status=499)` — a client-initiated disconnect, distinct from an upstream provider error (BOUNDARY_MAP Error Ownership). Raised only by the client write/drain path, never by an upstream failure. | active |  |
+| PROVIDERS | provider | The registry mapping a provider name to its `Provider` class | provider_map, registry_dict, handlers | `PROVIDERS: dict[str, type[Provider]]` in `provider.py`; the single dispatch table | active |  |
+| Provider | provider | The translation adapter that converts Anthropic Messages ↔ an upstream API | adapter, backend, engine, connector | The `Provider` protocol in `provider.py`; each concrete one lives in `providers/` | active |  |
+| ProviderCapabilities | provider | The per-provider feature/flag descriptor | features, provider_config, options | Frozen descriptor in `provider.py` (image/document input, tool round-trip) | active |  |
+| Router | routing | The circuit-breaker that fails Anthropic traffic over to a fallback | failover_controller, load_balancer, switch | `Router` in `router.py`; `CLOSED`/`OPEN` state | active |  |
+| StreamOutcome | streaming | The result of a streamed response — its client-visible status, token usage, and whether it failed semantically | stream_result, response_result, StreamResult | `StreamOutcome` frozen dataclass in `wire.py` (`status`, `tokens_in`, `tokens_out`, `error`); returned by the streaming paths and consumed by the proxy's streaming branch — the sync path uses raw status/body, not this type. `error=True` marks a semantic failure — a truncated stream or a provider error event — even when the client already received a 200, the case D-STATS-001 records so `stats.record_response` counts it as an error | active |  |
+| api_key | auth | The operator's static OpenAI API key credential (`OPENAI_API_KEY`), distinct from the OAuth-issued `bearer` | openai_key, static_key, apikey | OpenAI api-key auth mode (`auth_mode == 'api_key'`): read once from the environment at construction, never refreshed — `authenticate(force_refresh=True)` returns it unchanged. Validated by the shared `_validated_bearer` gate and sent as `Authorization: Bearer`, like the OAuth `bearer`, but a distinct credential KIND — static vs refreshable, env vs `credential_file`, memory surface MS-CRED-OPENAI vs MS-CRED-CODEX (D-AUTH-004). | active |  |
+| auth_mode | auth | The name of the credential mechanism, logged in place of any secret value | auth_type, credential_kind, scheme | Only the mode name (`grok_oauth`) is ever logged; never the bearer or refresh-token value | active |  |
+| bearer | auth | The opaque subscription JWT sent upstream | secret | Rides only in the `Authorization: Bearer` header; validated as RFC 7235 token68 before use. `bearer` names the outbound credential at the provider boundary. Within the auth token-management layer, `token` (the generic JWT / RFC 7235 token68 term) and the OAuth2 credential-file and response fields `access_token` / `refresh_token` (RFC 6749) are standard external vocabulary kept verbatim — not drift. | active |  |
+| bridge | proxy | The running proxy process that fronts Claude Code | proxy-server, gateway, shim | The product itself; `proxy.py` serves it, bound to loopback | active |  |
+| credential_file | auth | A provider CLI's OAuth credential file, reused for bridge auth | keyfile, token_store, secrets_file | xAI: `~/.grok/auth.json` (owner `credential_file`); OpenAI/Codex: `~/.codex/auth.json` (owner `openai_credential_file`) — two owned instances per the per-provider duplication license (D-XAI-002). Read-only except during token refresh. | active |  |
+| fallback_provider | routing | The provider used when Anthropic is unavailable | secondary, backup_model, standby | Selected by the `Router` on an open circuit | active |  |
+| http_client | transport | The shared, retryable httpx HTTP/2 client both providers borrow per call to reach the upstream API | http2_client, httpx_client, shared_client, transport_client | Built once by http_client.py (http2=True, split connect/idle timeouts, keepalive limits); borrowed per call by proxy.py and proxy_streaming.py via http_client helpers; the caller/injector owns and aclose()s it (D-STRUCT-002). The parameter http_client_instance (start_proxy) is a sanctioned instance name, not an alias — it avoids shadowing the http_client module import. | active |  |
+| media_source | media | A parsed base64 image or document input | attachment, blob, file_input | `content.parse_media_source`; base64 payload never leaks into text, warnings, or logs | active |  |
+| prompt_cache_key | caching | The sticky per-instance identity that pins a session's requests to the upstream provider's cached prompt prefix | conv_id, session_key, cache_token, instruction_hash | A process-stable `str(uuid.uuid4())` minted once per provider instance (D-CACHE-002); sent as the `prompt_cache_key` body field and, for xAI, the `x-grok-conv-id` header. Never logged, never derived from prompt content, embeds no secret (INV-SEC-01, INV-SEC-06) | active |  |
+| reasoning_cache | reasoning | The in-memory map from Anthropic call id to encrypted reasoning | reasoning_store, thought_cache, memo | Per-provider, LRU-bounded, lock-guarded; stays in memory, never logged or persisted | active |  |
+| reasoning_effort | reasoning | The model-gated depth hint sent to grok-4.6+ that trades latency for reasoning quality | effort, thinking_level, reasoning_depth | Config-owned via `XAI_REASONING_EFFORT` (default low), sent as `reasoning.effort`; `_model_accepts_reasoning_effort` gates on provably-old, so it reaches grok-4.6+ and rolling aliases but is omitted for pre-4.6 models that 400 on the field (D-XAI-010) | active |  |
+| reauth | auth | Re-establishing authentication after a credential is rejected — distinct from the `refresh` mechanism it uses | relogin, retry_auth | The reactive-401 path `_open_stream_with_reauth` (proxy_streaming.py) forces one `refresh` and retries once before any downstream byte (D-AUTH-003). The user-facing `codex login` / `grok` re-authenticate messages name the full re-login flow, which `refresh` (token renewal) cannot perform once the refresh token itself is dead. Uses `refresh` as its automated mechanism but is a distinct concept — never a rejected alias of it. | active |  |
+| refresh | auth | OIDC token renewal that rewrites the credential file | token_renewal, rotate | Rewrites only the selected entry, atomically at mode 0600 (D-XAI-003) | active |  |
+| stats | observability | The running usage/latency/error counters | metrics, telemetry, tally | `BridgeStats` in `stats.py`; request/response/token/failover counts | active |  |
+| token_expiry | auth | The bearer's expiry instant, read from the JWT exp claim rather than persisted under a project field | expires_at, ttl, valid_until, expiry_date | `decode_jwt_exp` reads it from the token; effective expiry is the earlier of the JWT `exp` and the credential file's `expires_at` (xAI's own schema field, kept in sync on refresh — `providers/xai/auth.py`). The bridge introduces no expiry column of its own, so Rule 6's `_at`/`_date` convention governs no bridge-owned field here. Drives proactive refresh | active |  |
+| upstream_request_id | transport | The per-request identifier the proxy stamps and sends upstream so a retried request is dedup-able by the provider | req_id, upstream_req_id, grok_req_id, correlation_id | A fresh `str(uuid.uuid4())` set once per inbound request on `upstream_request_id_var` (`log.py`), held stable across transport and reactive-401 retries so the upstream can dedup a retried request; sent as the `x-grok-req-id` header (`providers/xai/provider.py`). Distinct from `request_id` (local 8-hex log token, never sent upstream) and `prompt_cache_key` (sticky per-instance identity, `x-grok-conv-id`). Never logged | active |  |
 
-| Concept | Canonical Name | NOT (rejected aliases) | Notes |
+## Track Prefixes
+
+| Track | Branch Prefix | Notes | Status | Superseded By |
+|-|-|-|-|-|
+
+## State Locations
+
+| State | Path Pattern | Status | Superseded By |
 |-|-|-|-|
-| The translation adapter that converts Anthropic Messages ↔ an upstream API | **Provider** | adapter, backend, engine, connector | The `Provider` protocol in `provider.py`; each concrete one lives in `providers/` |
-| The running proxy process that fronts Claude Code | **bridge** | proxy-server, gateway, shim | The product itself; `proxy.py` serves it, bound to loopback |
-| The registry mapping a provider name to its `Provider` class | **PROVIDERS** | provider map, registry dict, handlers | `PROVIDERS: dict[str, type[Provider]]` in `provider.py`; the single dispatch table |
-| The per-provider feature/flag descriptor | **ProviderCapabilities** | features, provider config, options | Frozen descriptor in `provider.py` (image/document input, tool round-trip) |
-| The opaque subscription JWT sent upstream | **bearer** | token, api key, access token, secret | Rides only in the `Authorization` header; validated as RFC 7235 token68 before use |
-| The grok CLI credential file reused for auth | **credential file** | keyfile, token store, secrets file | `~/.grok/auth.json`; read-only except on refresh |
-| OIDC token renewal that rewrites the credential file | **refresh** | reauth, token renewal, rotate | Rewrites only the selected entry, atomically at mode 0600 (D-XAI-003) |
-| The name of the credential mechanism, logged in place of any secret value | **auth mode** | auth type, credential kind, scheme | Only the mode name (`grok_oauth`) is ever logged; never the bearer or refresh-token value |
-| The in-memory map from Anthropic call id to encrypted reasoning | **reasoning cache** | reasoning store, thought cache, memo | Per-provider, LRU-bounded, lock-guarded; stays in memory, never logged or persisted |
-| The circuit-breaker that fails Anthropic traffic over to a fallback | **Router** | failover controller, load balancer, switch | `Router` in `router.py`; `CLOSED`/`OPEN` state |
-| The provider used when Anthropic is unavailable | **fallback provider** | secondary, backup model, standby | Selected by the `Router` on an open circuit |
-| The running usage/latency/error counters | **stats** | metrics, telemetry, tally | `BridgeStats` in `stats.py`; request/response/token/failover counts |
-| A parsed base64 image or document input | **media source** | attachment, blob, file input | `content.parse_media_source`; base64 payload never leaks into text, warnings, or logs |
-
-## Temporal Conventions
-
-This project persists no timestamped records of its own; the only durable state it
-writes is the credential file's refreshed token, whose expiry is read from the JWT
-`exp` claim (`decode_jwt_exp`), not stored under a project field. No `_at`/`_date`
-convention applies.

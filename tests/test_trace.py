@@ -122,7 +122,7 @@ class TestSummarizeAnthropicRequest:
     names, tool names, lengths — and never the underlying prompt content."""
 
     def test_structural_fields_match_input(self):
-        from claude_bridge.proxy import _summarize_anthropic_request
+        from claude_bridge.request_view import _summarize_anthropic_request
 
         summary = _summarize_anthropic_request(_secret_laden_request())
         assert summary["model"] == "claude-opus-4-8"
@@ -139,7 +139,7 @@ class TestSummarizeAnthropicRequest:
         }
 
     def test_system_chars_is_positive_length_not_content(self):
-        from claude_bridge.proxy import _summarize_anthropic_request
+        from claude_bridge.request_view import _summarize_anthropic_request
 
         summary = _summarize_anthropic_request(_secret_laden_request())
         # A length, derived structurally — present and positive for a non-empty system.
@@ -147,12 +147,12 @@ class TestSummarizeAnthropicRequest:
         assert summary["system_chars"] > 0
 
     def test_no_secrets_leak(self):
-        from claude_bridge.proxy import _summarize_anthropic_request
+        from claude_bridge.request_view import _summarize_anthropic_request
 
         _assert_no_secrets(_summarize_anthropic_request(_secret_laden_request()))
 
     def test_string_content_counts_as_text_block(self):
-        from claude_bridge.proxy import _summarize_anthropic_request
+        from claude_bridge.request_view import _summarize_anthropic_request
 
         # Anthropic shorthand: content may be a bare string (one text block).
         request = {"model": "m", "messages": [{"role": "user", "content": "SECRET_STRING"}]}
@@ -161,7 +161,7 @@ class TestSummarizeAnthropicRequest:
         assert "SECRET_STRING" not in json.dumps(summary)
 
     def test_absent_tools_and_choice_are_empty(self):
-        from claude_bridge.proxy import _summarize_anthropic_request
+        from claude_bridge.request_view import _summarize_anthropic_request
 
         summary = _summarize_anthropic_request({"model": "m", "messages": []})
         assert summary["tool_count"] == 0
@@ -176,7 +176,7 @@ class TestSummarizeProviderRequest:
 
     def test_structural_fields_and_warning_count(self):
         from claude_bridge.providers.openai import anthropic_to_openai
-        from claude_bridge.proxy import _summarize_provider_request
+        from claude_bridge.request_view import _summarize_provider_request
 
         translated, warnings = anthropic_to_openai(_secret_laden_request())
         summary = _summarize_provider_request(translated, warnings)
@@ -189,7 +189,7 @@ class TestSummarizeProviderRequest:
     def test_warning_strings_included_for_trace(self):
         # REQ1: the trace carries the sanitized warning *strings*, not just a count,
         # so a degraded translation is diagnosable from the trace alone (T-003 spec).
-        from claude_bridge.proxy import _summarize_provider_request
+        from claude_bridge.request_view import _summarize_provider_request
 
         warnings = [
             "Stripped 'thinking' config (reasoning_mode=drop)",
@@ -200,7 +200,7 @@ class TestSummarizeProviderRequest:
         assert summary["warning_count"] == 2
 
     def test_forced_tool_choice_renders_structurally(self):
-        from claude_bridge.proxy import _summarize_provider_request
+        from claude_bridge.request_view import _summarize_provider_request
 
         translated = {
             "model": "gpt-5.6-sol",
@@ -212,7 +212,7 @@ class TestSummarizeProviderRequest:
         assert summary["tool_choice"] == "function:Read"
 
     def test_parallel_flag_emitted_only_when_present(self):
-        from claude_bridge.proxy import _summarize_provider_request
+        from claude_bridge.request_view import _summarize_provider_request
 
         with_flag = _summarize_provider_request(
             {"model": "m", "input": [], "parallel_tool_calls": False}, []
@@ -223,7 +223,7 @@ class TestSummarizeProviderRequest:
 
     def test_no_secrets_leak(self):
         from claude_bridge.providers.openai import anthropic_to_openai
-        from claude_bridge.proxy import _summarize_provider_request
+        from claude_bridge.request_view import _summarize_provider_request
 
         translated, warnings = anthropic_to_openai(_secret_laden_request())
         _assert_no_secrets(_summarize_provider_request(translated, warnings))
@@ -231,7 +231,7 @@ class TestSummarizeProviderRequest:
     def test_injected_encrypted_reasoning_never_leaks(self):
         # The provider echoes opaque encrypted reasoning into the outbound request
         # (T-005). The summarizer must count it as an input item, never serialize it.
-        from claude_bridge.proxy import _summarize_provider_request
+        from claude_bridge.request_view import _summarize_provider_request
 
         translated = {
             "model": "gpt-5.6-sol",
@@ -251,7 +251,7 @@ class TestMediaTraceSummary:
     and _summarize_provider_request never echoes a translated data-URL part."""
 
     def test_inbound_media_summarized_as_kind_type_bytes(self):
-        from claude_bridge.proxy import _summarize_anthropic_request
+        from claude_bridge.request_view import _summarize_anthropic_request
 
         # 404-byte payload (b"\x89PNG" + 400 zero bytes); approx_bytes recovers it.
         img_b64 = base64.b64encode(b"\x89PNG" + b"\x00" * 400).decode()
@@ -282,8 +282,47 @@ class TestMediaTraceSummary:
         assert abs(media[0]["approx_bytes"] - 404) <= 2  # recovers the 404-byte payload
         assert img_b64 not in json.dumps(summary)
 
+    def test_url_media_source_reports_zero_bytes_not_a_stray_data_field(self):
+        """A url-source block sizes to 0 bytes — the descriptor derives from
+        content.parse_media_source (INV-MEDIA-01's single owner of the block shape),
+        so a base64-looking ``data`` field on a non-base64 source is never mistaken
+        for a payload.
+
+        Oracle: parse_media_source's documented contract — a ``url`` source populates
+        ``.url`` and leaves ``.data`` None — so approx_bytes must be 0 regardless of a
+        malformed stray ``data`` key. Re-reading ``source['data']`` inline (the removed
+        re-encoding) would instead size the 4000-char stray field to ~3000 bytes.
+        """
+        from claude_bridge.request_view import _summarize_anthropic_request
+
+        stray = "A" * 4000
+        request = {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": "https://example.test/x.png",
+                                "media_type": "image/png",
+                                "data": stray,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        summary = _summarize_anthropic_request(request)
+        assert summary["media"] == [
+            {"kind": "image", "media_type": "image/png", "approx_bytes": 0}
+        ]
+        assert stray not in json.dumps(summary)
+
     def test_tool_result_nested_media_is_summarized(self):
-        from claude_bridge.proxy import _summarize_anthropic_request
+        from claude_bridge.request_view import _summarize_anthropic_request
 
         pdf_b64 = base64.b64encode(b"%PDF-1.4" + b"\x00" * 800).decode()
         request = {
@@ -316,7 +355,7 @@ class TestMediaTraceSummary:
         assert pdf_b64 not in json.dumps(summary)
 
     def test_no_media_yields_empty_media_list(self):
-        from claude_bridge.proxy import _summarize_anthropic_request
+        from claude_bridge.request_view import _summarize_anthropic_request
 
         summary = _summarize_anthropic_request(
             {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
@@ -326,7 +365,7 @@ class TestMediaTraceSummary:
     def test_provider_request_summary_never_echoes_base64_dataurl(self):
         # _summarize_provider_request must not serialize translated input content —
         # even a real input_image data-URL part stays out of the trace.
-        from claude_bridge.proxy import _summarize_provider_request
+        from claude_bridge.request_view import _summarize_provider_request
 
         img_b64 = base64.b64encode(b"\x89PNG" + b"\x00" * 400).decode()
         translated = {
@@ -353,7 +392,7 @@ class TestSummarizeAnthropicResponse:
     usage — never response text or tool_use arguments."""
 
     def test_structural_fields_match_input(self):
-        from claude_bridge.proxy import _summarize_anthropic_response
+        from claude_bridge.request_view import _summarize_anthropic_response
 
         summary = _summarize_anthropic_response(_secret_laden_response())
         assert summary["model"] == "claude-opus-4-8"
@@ -363,7 +402,7 @@ class TestSummarizeAnthropicResponse:
         assert summary["output_tokens"] == 56
 
     def test_no_secrets_leak(self):
-        from claude_bridge.proxy import _summarize_anthropic_response
+        from claude_bridge.request_view import _summarize_anthropic_response
 
         summary = _summarize_anthropic_response(_secret_laden_response())
         assert "SECRET_RESPONSE_TEXT" not in json.dumps(summary)
@@ -375,7 +414,7 @@ class TestSummarizeStreamEvent:
     (event name, block index, block/delta type, stop_reason) and drops content."""
 
     def test_content_block_start_emits_block_type(self):
-        from claude_bridge.proxy import _summarize_stream_event
+        from claude_bridge.request_view import _summarize_stream_event
 
         event = {
             "event": "content_block_start",
@@ -390,7 +429,7 @@ class TestSummarizeStreamEvent:
         assert summary["block_type"] == "tool_use"
 
     def test_text_delta_drops_text_keeps_type(self):
-        from claude_bridge.proxy import _summarize_stream_event
+        from claude_bridge.request_view import _summarize_stream_event
 
         event = {
             "event": "content_block_delta",
@@ -402,7 +441,7 @@ class TestSummarizeStreamEvent:
         assert "SECRET_DELTA_TEXT" not in json.dumps(summary)
 
     def test_input_json_delta_drops_partial_json(self):
-        from claude_bridge.proxy import _summarize_stream_event
+        from claude_bridge.request_view import _summarize_stream_event
 
         event = {
             "event": "content_block_delta",
@@ -416,7 +455,7 @@ class TestSummarizeStreamEvent:
         assert "SECRET_PATH" not in json.dumps(summary)
 
     def test_message_delta_emits_stop_reason(self):
-        from claude_bridge.proxy import _summarize_stream_event
+        from claude_bridge.request_view import _summarize_stream_event
 
         event = {
             "event": "message_delta",
@@ -433,19 +472,19 @@ class TestTraceHooks:
     and never raise — tracing can never break a request."""
 
     def test_inbound_disabled_writes_nothing(self, tmp_path, monkeypatch):
-        from claude_bridge.proxy import _trace_inbound_request
+        from claude_bridge.request_view import trace_inbound_request
 
         monkeypatch.delenv("CLAUDE_BRIDGE_TRACE_PATH", raising=False)
         target = tmp_path / "trace.jsonl"
-        _trace_inbound_request(json.dumps(_secret_laden_request()).encode())
+        trace_inbound_request(json.dumps(_secret_laden_request()).encode())
         assert not target.exists()
 
     def test_inbound_enabled_writes_redacted_structural_line(self, tmp_path, monkeypatch):
-        from claude_bridge.proxy import _trace_inbound_request
+        from claude_bridge.request_view import trace_inbound_request
 
         target = tmp_path / "trace.jsonl"
         monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
-        _trace_inbound_request(json.dumps(_secret_laden_request()).encode())
+        trace_inbound_request(json.dumps(_secret_laden_request()).encode())
         content = target.read_text(encoding="utf-8")
         for marker in _SECRET_MARKERS:
             assert marker not in content, f"secret leaked into trace file: {marker!r}"
@@ -455,16 +494,16 @@ class TestTraceHooks:
         assert record["message_count"] == 3
 
     def test_inbound_malformed_body_never_raises(self, tmp_path, monkeypatch):
-        from claude_bridge.proxy import _trace_inbound_request
+        from claude_bridge.request_view import trace_inbound_request
 
         target = tmp_path / "trace.jsonl"
         monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
         # Must swallow the JSON parse error — no file line, no exception.
-        _trace_inbound_request(b"not json{{{")
+        trace_inbound_request(b"not json{{{")
 
     def test_provider_request_hook_redacts(self, tmp_path, monkeypatch):
         from claude_bridge.providers.openai import anthropic_to_openai
-        from claude_bridge.proxy import _trace_provider_request
+        from claude_bridge.request_view import _trace_provider_request
 
         target = tmp_path / "trace.jsonl"
         monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
@@ -476,22 +515,22 @@ class TestTraceHooks:
         assert json.loads(content.splitlines()[0])["event"] == "provider_request"
 
     def test_provider_response_hook_redacts(self, tmp_path, monkeypatch):
-        from claude_bridge.proxy import _trace_provider_response
+        from claude_bridge.request_view import trace_provider_response
 
         target = tmp_path / "trace.jsonl"
         monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
-        _trace_provider_response(_secret_laden_response())
+        trace_provider_response(_secret_laden_response())
         content = target.read_text(encoding="utf-8")
         assert "SECRET_RESPONSE_TEXT" not in content
         assert "SECRET_COMMAND" not in content
         assert json.loads(content.splitlines()[0])["stop_reason"] == "tool_use"
 
     def test_stream_event_hook_redacts(self, tmp_path, monkeypatch):
-        from claude_bridge.proxy import _trace_stream_event
+        from claude_bridge.request_view import trace_stream_event
 
         target = tmp_path / "trace.jsonl"
         monkeypatch.setenv("CLAUDE_BRIDGE_TRACE_PATH", str(target))
-        _trace_stream_event(
+        trace_stream_event(
             {
                 "event": "content_block_delta",
                 "data": {"index": 0, "delta": {"type": "text_delta", "text": "SECRET_DELTA_TEXT"}},
@@ -502,9 +541,9 @@ class TestTraceHooks:
         assert json.loads(content.splitlines()[0])["delta_type"] == "text_delta"
 
     def test_stream_event_disabled_writes_nothing(self, tmp_path, monkeypatch):
-        from claude_bridge.proxy import _trace_stream_event
+        from claude_bridge.request_view import trace_stream_event
 
         monkeypatch.delenv("CLAUDE_BRIDGE_TRACE_PATH", raising=False)
         target = tmp_path / "trace.jsonl"
-        _trace_stream_event({"event": "message_stop", "data": {}})
+        trace_stream_event({"event": "message_stop", "data": {}})
         assert not target.exists()

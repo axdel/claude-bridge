@@ -25,4 +25,4 @@ text (which is non-deterministic). The fixtures pin structure.
 | `incomplete_max_tokens.json` | `status:"incomplete"`, `incomplete_details:{"reason":"max_output_tokens"}`; still carries completed reasoning + message | stream/response incomplete terminal |
 | `tool_result_replay_exact.json` | Multi-turn: replaying `function_call_output` with the **exact** `call_id` → model consumes the result ("18°C and sunny") | request continuity |
 | `image_input.json` | `input_image` via `data:image/png;base64,…` accepted (≥8px/dim AND ≥512 total px required) → model describes it | media forwarding |
-| `field_effort_low.json` | **Negative:** `reasoning.effort` → `400 "Model grok-4.20 does not support parameter reasoningEffort."` — the request must NOT send `reasoning.effort` | request translation (strip reasoning config) |
+| `field_effort_low.json` | **Negative:** `reasoning.effort` → `400 "Model grok-4.20 does not support parameter reasoningEffort."` — the oracle for the version gate: pre-4.6 models 400, so effort is sent only to grok-4.6+ and omitted below | request translation (model-gated `reasoning.effort`) |

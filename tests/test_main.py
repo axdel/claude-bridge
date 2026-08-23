@@ -107,15 +107,26 @@ class _FakeServer:
         raise _StopServing
 
 
+class _FakeClient:
+    """httpx.AsyncClient stand-in that records whether _run closed it."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class TestMainWiring:
     def test_main_wires_defaults_and_routes_xai_with_no_kwargs(self, monkeypatch):
         import claude_bridge.__main__ as main_mod
 
         captured: dict = {}
+        fake_client = _FakeClient()
 
-        async def _fake_start(**kwargs: object) -> _FakeServer:
+        async def _fake_start(**kwargs: object) -> tuple[_FakeServer, _FakeClient]:
             captured.update(kwargs)
-            return _FakeServer()
+            return _FakeServer(), fake_client
 
         monkeypatch.setattr(main_mod, "start_proxy", _fake_start)
         monkeypatch.setattr(sys, "argv", ["claude-bridge", "--provider", "xai"])
@@ -128,15 +139,17 @@ class TestMainWiring:
         assert captured["port"] == 9999
         assert captured["provider_name"] == "xai"
         assert captured["provider_kwargs"] == {}
+        # The entry point must close the transport client even when serve_forever aborts.
+        assert fake_client.closed is True
 
     def test_main_honors_explicit_host_and_port(self, monkeypatch):
         import claude_bridge.__main__ as main_mod
 
         captured: dict = {}
 
-        async def _fake_start(**kwargs: object) -> _FakeServer:
+        async def _fake_start(**kwargs: object) -> tuple[_FakeServer, _FakeClient]:
             captured.update(kwargs)
-            return _FakeServer()
+            return _FakeServer(), _FakeClient()
 
         monkeypatch.setattr(main_mod, "start_proxy", _fake_start)
         # 192.0.2.1 is RFC 5737 TEST-NET-1 — a non-loopback value that proves the explicit

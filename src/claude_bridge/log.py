@@ -31,6 +31,15 @@ _NAMESPACE = "claude_bridge"
 
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="")
 
+# Per-request UPSTREAM id — the value sent to the provider as ``x-grok-req-id`` so a retried
+# request is dedup-able upstream. Distinct from ``request_id_var`` (an 8-hex local LOG
+# correlation token): this is a full uuid the proxy sets once per request, read by the xAI
+# provider's ``authenticate`` and held STABLE across the transport and reactive-401 retries
+# (both re-call authenticate within the one request context). Never logged; embeds no secret.
+upstream_request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "upstream_request_id", default=""
+)
+
 
 class _BridgeFormatter(logging.Formatter):
     """Format log records as ``LEVEL  [BRIDGE:<module>] req=<id> <message>``."""

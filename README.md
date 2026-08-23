@@ -55,7 +55,7 @@ of leaking provider-incompatible content.
 
 ## Features
 
-- **Zero dependencies** — stdlib-only Python, no `pip install`
+- **One dependency** — `httpx[http2]` for the HTTP/2 data plane (installed once via `uv sync`); everything else is stdlib
 - **Direct API key auth** — set `OPENAI_API_KEY` for the official OpenAI Responses API
 - **Subscription OAuth** — no API key? Uses Codex OAuth (OpenAI, `~/.codex/auth.json`) or Grok CLI OAuth (xAI, `~/.grok/auth.json`) automatically — xAI is subscription-only, no API key
 - **Reasoning continuity** — encrypted reasoning blobs are cached in memory and echoed across tool turns (OpenAI and xAI)
@@ -73,7 +73,7 @@ of leaking provider-incompatible content.
 - **Compatibility trace** — optional redacted structural trace for wire-contract debugging
 - **Provider error redaction** — logs status and extracted summaries, never raw upstream error bodies
 - **Multi-provider** — adding a provider = one provider file with declared capabilities plus registration import
-- **570 tests** — coverage enforced, type-checked with basedpyright, linted with ruff
+- **671 tests** — coverage measured, type-checked with basedpyright, linted with ruff
 
 ## Prerequisites
 
@@ -86,13 +86,14 @@ of leaking provider-incompatible content.
 ### Software (macOS)
 
 ```bash
-brew install python claude-code codex
+brew install python claude-code codex uv
 
 # xAI's grok CLI self-installs its own binary under ~/.grok/bin (not via brew).
 # Install it per xAI's grok CLI instructions, then it is on your PATH as `grok`.
 
 # Verify
 python3 --version    # 3.12+
+uv --version         # provisions the bridge's httpx dependency (uv sync)
 claude --version
 codex --version
 grok --version
@@ -105,7 +106,7 @@ cat ~/.grok/auth.json              # should show an xAI OAuth entry (keyed by is
 ```
 
 > **macOS only** for now (brew dependencies). Linux support is untested.
-> **No `pip install` needed** — the bridge is stdlib-only Python.
+> **One dependency** — run `uv sync` once to install `httpx[http2]` (the HTTP/2 data plane); the rest is stdlib Python.
 > Codex CLI is for the OpenAI OAuth path, grok CLI is for the xAI OAuth path.
 > If you set `OPENAI_API_KEY`, direct OpenAI mode uses the official API instead. xAI has no
 > API-key mode — it always reuses the grok CLI subscription credentials.
@@ -115,6 +116,10 @@ cat ~/.grok/auth.json              # should show an xAI OAuth entry (keyed by is
 ```bash
 git clone https://github.com/axdel/claude-bridge.git
 cd claude-bridge
+
+# Provision the one runtime dependency (httpx[http2]) into ./.venv — the launchers
+# run the bridge with this venv's Python, so this step is required, not optional.
+uv sync
 
 # Make the launchers available system-wide
 mkdir -p ~/.local/bin
@@ -254,9 +259,12 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
 | `XAI_MODEL` | `grok-4.6` | xAI Grok model id used by the `xai` provider (pinned; set `grok-build` for the rolling latest-coding alias) |
 | `XAI_CLIENT_VERSION` | highest installed grok CLI bundle (floor `0.1.202`) | Override for the `x-grok-client-version` header the cli-chat-proxy gates on; when unset, resolved from the newest `~/.grok/downloads/grok-<ver>-*` bundle |
+| `XAI_REASONING_EFFORT` | `low` | xAI `reasoning.effort` for grok-4.6+ (`low` / `medium` / `high`); sent only to models that accept it, omitted for pre-4.6; an invalid value falls back to the default |
 | `REASONING_MODE` | `passthrough` | Thinking-block handling for OpenAI and xAI: `passthrough` preserves tagged thinking text, `drop` strips it |
-| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `UPSTREAM_TIMEOUT` | caller default (`60` sync / `120` streaming) | Upstream request timeout in seconds; invalid, zero, or negative values fall back to the caller default |
+| `LOG_LEVEL` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. The `claude-grok` / `claude-codex` launchers default to `WARNING` — upstream timeouts, transport errors, and failovers reach the terminal without `--debug`; raw `python -m claude_bridge` defaults to `INFO`. |
+| `CONNECT_TIMEOUT` | `10.0` | Data-plane TCP connect timeout in seconds (httpx transport) — a dead connect fails fast; invalid, zero, or negative values fall back to the default |
+| `STREAM_IDLE_TIMEOUT` | `300.0` | Data-plane read/write idle timeout in seconds — the gap between streamed chunks, so long grok-4.6 thinking survives as long as chunks keep arriving; invalid, zero, or negative values fall back to the default |
+| `POOL_IDLE` | `90.0` | Data-plane connection-pool idle timeout in seconds for the shared keep-alive `AsyncClient`; invalid, zero, or negative values fall back to the default |
 | `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10 MiB) |
 | `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback preference list; the first registered provider is used |
 | `LLM_BRIDGE_PORT` | `9999` | Shell launcher default proxy port |
@@ -332,7 +340,8 @@ translation rather than importing OpenAI's, because cross-provider imports are f
 | Auth | `~/.grok/auth.json` OIDC bearer + refresh (`grok login`); no API key |
 | Client gate | `x-grok-client-version` (auto-resolved from the installed grok CLI, floor `0.1.202`) + `grok-cli` client identifier |
 | Reasoning continuity | encrypted reasoning cached in memory, keyed by `call_id`, echoed across tool turns (never persisted or logged) |
-| Tool linkage | `call_id` alone — cli-chat-proxy has no separate `id`, and 400s if a `reasoning` key is sent |
+| Reasoning effort | `reasoning.effort` (default `low`, a latency choice) sent to grok-4.6+; omitted for pre-4.6 models that 400 on it |
+| Tool linkage | `call_id` alone — cli-chat-proxy has no separate `id` |
 | Token multiplier | `1.0` — subscription-metered, so no OpenAI-compat scaling |
 | Media | image + document (PDF) input and array-form tool output forwarded as `input_image` / `input_file` |
 
@@ -371,7 +380,23 @@ uv run pytest tests/ -v     # installs test deps on first run, shows coverage
 ```
 
 No external services — every test uses mock HTTP servers or pure-function
-fixtures. Coverage is enforced at 80%.
+fixtures. Coverage is measured and reported on every run (report-only; the ratchet is
+reviewer-enforced against trunk, not a hard addopts floor — see DECISIONS.md D-QUALITY-002).
+
+### Branch-review quality gate
+
+The full pre-merge quality roster (lint, types, security, complexity, dead code,
+dependencies, architecture, dependency metrics, property tests, coverage, clones)
+runs through a wrapper script:
+
+```bash
+scripts/quality-review.sh    # full branch-review roster
+```
+
+The wrapper sets `PYTHONPATH=src` before invoking the gate: the dependency-metrics
+tool (grimp) runs under the globally-installed claude-protocol interpreter, which
+does not carry this project's editable install, so the src-layout package must be on
+its import path (see DECISIONS.md D-QUALITY-003).
 
 ### Mutation testing
 
@@ -493,7 +518,7 @@ suite.
 | | Claude Bridge | [1rgs/claude-code-proxy](https://github.com/1rgs/claude-code-proxy) | [fuergaosi233/claude-code-proxy](https://github.com/fuergaosi233/claude-code-proxy) |
 |---|---|---|---|
 | Target API | **Responses API** | Chat Completions | Chat Completions |
-| Dependencies | **stdlib-only** | FastAPI + LiteLLM | FastAPI + openai SDK |
+| Dependencies | **httpx only** | FastAPI + LiteLLM | FastAPI + openai SDK |
 | Tool fidelity | **Proper function_call_output** | Lossy (text flatten) | Proper |
 | Auto-failover | Yes (circuit breaker) | No | No |
 | Metrics | `/stats` endpoint | No | No |

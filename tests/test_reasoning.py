@@ -283,7 +283,7 @@ class TestReasoningContinuity:
                 )
             )
         # Bounded memory.
-        assert len(provider._reasoning_by_call_id) <= _REASONING_CACHE_MAX
+        assert len(provider._reasoning_cache) <= _REASONING_CACHE_MAX
         # Behavioral oracle: the oldest call was evicted (no injection); the newest survives.
         oldest, _ = provider.translate_request(_tool_turn_request("toolu_0"))
         newest, _ = provider.translate_request(_tool_turn_request(f"toolu_{_REASONING_CACHE_MAX}"))
@@ -291,7 +291,7 @@ class TestReasoningContinuity:
         assert any(item.get("type") == "reasoning" for item in newest["input"])
 
     def test_reasoning_cache_is_thread_safe_under_concurrent_eviction(self):
-        # T-005 claims _reasoning_by_call_id is concurrency-safe via _reasoning_lock.
+        # The provider guarantees _reasoning_cache is concurrency-safe via _reasoning_lock.
         # The eviction loop reads `oldest = next(iter(...))` then `del`s that key.
         # Without the lock two threads read the same oldest key and the second `del`
         # raises KeyError. The GIL does NOT close this window — it spans two bytecodes,
@@ -342,7 +342,7 @@ class TestReasoningContinuity:
             sys.setswitchinterval(original_interval)
 
         assert errors == [], f"concurrent stash raised: {errors}"
-        assert len(provider._reasoning_by_call_id) <= _REASONING_CACHE_MAX
+        assert len(provider._reasoning_cache) <= _REASONING_CACHE_MAX
 
     def test_streaming_completed_event_captures_reasoning(self):
         import asyncio
