@@ -16,12 +16,10 @@ Architecture::
                         |
           providers/openai/   providers/xai/   (sub-packages)
 
-Adding a new provider:
-    1. Create ``providers/<name>.py`` implementing the ``Provider`` protocol
-    2. Declare provider ``capabilities`` for stream and sync response behavior
-    3. Register only implemented providers: ``PROVIDERS["<name>"] = YourProvider``
-    4. Import it in ``__main__.py`` so it auto-registers
-    5. Set ``LLM_BRIDGE_FALLBACK=<name>`` or ``--provider <name>``
+Adding a new provider: create a ``providers/<name>/`` sub-package (see
+``providers/openai/`` for the reference layout) and follow the extension steps in
+``provider.py``. Once registered, select it with ``LLM_BRIDGE_FALLBACK=<name>`` or
+``--provider <name>``.
 """
 
 __version__ = "0.9.0"

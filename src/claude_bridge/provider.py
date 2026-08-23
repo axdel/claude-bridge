@@ -3,14 +3,17 @@
 Every registered LLM provider implements the ``Provider`` protocol defined here.
 The proxy never imports provider-specific code — it only uses this interface.
 
-To add a new provider:
+To add a new provider (see ``providers/openai/`` as the reference layout):
 
-1. Create ``providers/<name>.py`` with a class implementing ``Provider``
+1. Create a ``providers/<name>/`` sub-package split into ``auth.py`` (credentials),
+   ``translate.py`` (format mapping), ``stream.py`` (SSE), and ``provider.py`` (the
+   ``Provider`` class); re-export the public surface from its ``__init__.py``
 2. Declare ``capabilities`` for proxy-visible transport behavior
 3. ``translate_request``: Anthropic Messages -> your API format
 4. ``translate_response``: your API format -> Anthropic Messages
 5. ``translate_stream``: raw response bytes -> Anthropic SSE events
-6. Register: ``PROVIDERS["<name>"] = YourProviderClass``
+6. Register at the bottom of ``provider.py``: ``PROVIDERS["<name>"] = YourProviderClass``
+7. Import the sub-package in ``__main__.py`` so it registers on startup
 """
 
 from __future__ import annotations
