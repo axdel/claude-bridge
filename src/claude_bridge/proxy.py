@@ -43,6 +43,7 @@ from claude_bridge.wire import (
     anthropic_error_body,
     provider_error_log_summary,
     provider_error_message,
+    safe_log_excerpt,
     write_response,
 )
 
@@ -309,12 +310,28 @@ async def _process_request(
     )
 
 
+# A real model id is a short printable token (e.g. "grok-4.6", "gpt-5.6-sol").
+# The extracted value is request-controlled and reaches INFO logs and stats, so it
+# is bounded to keep a forged value from flooding the logs.
+_MODEL_LOG_LIMIT = 100
+
+
 def _extract_model(body: bytes) -> str:
-    """Extract the model name from a request body, or 'unknown'."""
+    """Extract the request model as a bounded, control-stripped token, or 'unknown'.
+
+    The value is request-controlled and reaches INFO logs and stats, so it is
+    sanitized here (CWE-117 log-forging defense): safe_log_excerpt collapses control
+    characters — an embedded newline would otherwise let a caller inject a forged log
+    line — and bounds the length. A non-string or missing model reports 'unknown'.
+    """
     try:
-        return json.loads(body).get("model", "unknown")
+        parsed = json.loads(body)
     except (json.JSONDecodeError, ValueError):
         return "unknown"
+    model = parsed.get("model") if isinstance(parsed, dict) else None
+    if not isinstance(model, str):
+        return "unknown"
+    return safe_log_excerpt(model, limit=_MODEL_LOG_LIMIT) or "unknown"
 
 
 async def _route_request(

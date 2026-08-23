@@ -704,6 +704,79 @@ def test_max_request_body_warns_for_invalid_import_value(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _extract_model log-sanitization tests
+# ---------------------------------------------------------------------------
+
+
+def test_extract_model_strips_control_chars_to_prevent_log_forging():
+    """A request-controlled model reaching INFO logs must not carry control chars.
+
+    The extracted value is interpolated into log lines (CWE-117 log forging), so an
+    embedded newline would let a caller inject a forged log record. safe_log_excerpt
+    collapses every control-char run ([\\x00-\\x1f\\x7f]) to a single space, so the
+    oracle here is derived from that regex, not from running the function.
+    """
+    from claude_bridge.proxy import _extract_model
+
+    body = json.dumps({"model": "legit\nERROR forged log line"}).encode()
+
+    result = _extract_model(body)
+
+    assert "\n" not in result
+    assert "\r" not in result
+    assert result == "legit ERROR forged log line"
+
+
+def test_extract_model_bounds_length():
+    """An over-long model value is truncated so it cannot flood the logs."""
+    from claude_bridge.proxy import _MODEL_LOG_LIMIT, _extract_model
+
+    body = json.dumps({"model": "g" * (_MODEL_LOG_LIMIT + 150)}).encode()
+
+    result = _extract_model(body)
+
+    assert result == "g" * _MODEL_LOG_LIMIT + "..."
+
+
+def test_extract_model_non_string_returns_unknown():
+    """A non-string model (int, null, list) is not a valid id — report 'unknown'."""
+    from claude_bridge.proxy import _extract_model
+
+    assert _extract_model(json.dumps({"model": 123}).encode()) == "unknown"
+    assert _extract_model(json.dumps({"model": None}).encode()) == "unknown"
+    assert _extract_model(json.dumps({"model": ["grok"]}).encode()) == "unknown"
+
+
+def test_extract_model_passes_through_normal_token():
+    """A normal short model id is returned unchanged."""
+    from claude_bridge.proxy import _extract_model
+
+    assert _extract_model(json.dumps({"model": "grok-4.6"}).encode()) == "grok-4.6"
+
+
+def test_extract_model_missing_and_malformed_return_unknown():
+    """Missing key, malformed JSON, and empty body all fall back to 'unknown'."""
+    from claude_bridge.proxy import _extract_model
+
+    assert _extract_model(json.dumps({}).encode()) == "unknown"
+    assert _extract_model(b"not json") == "unknown"
+    assert _extract_model(b"") == "unknown"
+
+
+def test_extract_model_non_dict_json_returns_unknown():
+    """Valid-but-non-dict JSON (array, scalar) has no model — 'unknown', never a crash.
+
+    The body is request-controlled and reaches this helper during request processing,
+    so a valid JSON array or scalar must not raise AttributeError on the .get() call.
+    """
+    from claude_bridge.proxy import _extract_model
+
+    assert _extract_model(b"[1, 2, 3]") == "unknown"
+    assert _extract_model(b'"just a string"') == "unknown"
+    assert _extract_model(b"42") == "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Request body size limit tests
 # ---------------------------------------------------------------------------
 
