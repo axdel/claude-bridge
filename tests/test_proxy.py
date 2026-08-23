@@ -1859,6 +1859,34 @@ async def test_validate_stream_response_passes_real_sse_stream_through():
 
 
 @pytest.mark.asyncio
+async def test_validate_stream_response_accepts_sse_with_absent_content_type():
+    """A 200 SSE stream with NO content-type header is pumped (returns None), not refused 502.
+
+    Captured live 2026-08-23: the Codex backend (chatgpt.com/backend-api/codex/responses,
+    behind Cloudflare) streams valid SSE — ``event: response.created\\ndata: {...}`` — with the
+    content-type header ABSENT. A guard requiring ``text/event-stream`` turns every Codex
+    stream into a 502 while sync (which never checks content-type) succeeds. The guard must
+    reject only a PRESENT non-SSE content-type, never an absent/empty one. Fixture is the real
+    captured wire shape (empty headers + SSE body); the expected accept comes from the SSE
+    contract, not from running the guard.
+    """
+    from claude_bridge.proxy_streaming import validate_stream_response
+
+    response = httpx.Response(
+        200,
+        headers={},  # Codex/Cloudflare omits content-type on the stream
+        content=b'event: response.created\ndata: {"type":"response.created"}\n\n',
+    )
+    writer = _RecordingWriter()
+
+    outcome = await validate_stream_response(response, cast(asyncio.StreamWriter, writer))
+
+    assert outcome is None  # proceed to pump — never a 502
+    assert bytes(writer.buffer) == b""
+    await response.aclose()
+
+
+@pytest.mark.asyncio
 async def test_validate_passthrough_response_non_sse_200_forwards_buffered_body():
     """A non-SSE 200 upstream body is buffered and forwarded as a normal 200, not pumped."""
     from claude_bridge.proxy_streaming import validate_passthrough_response

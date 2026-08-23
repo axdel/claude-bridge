@@ -259,10 +259,14 @@ async def validate_stream_response(
 ) -> StreamOutcome | None:
     """Check a provider stream response BEFORE any SSE headers are written.
 
-    A non-200 status or a non-``text/event-stream`` body means the provider did not
-    open a stream; read the (buffered) error body, translate it, and write a normal
-    error response — never a bare 200 followed by a failed body. Returns a
-    ``StreamOutcome`` in that case, or ``None`` when a real SSE stream may be pumped.
+    The provider did not open a stream when the status is non-200, OR when a PRESENT
+    content-type is not ``text/event-stream``; read the (buffered) error body, translate
+    it, and write a normal error response — never a bare 200 followed by a failed body.
+    An ABSENT/empty content-type on a 200 is accepted as SSE: the Codex backend
+    (chatgpt.com, behind Cloudflare) streams valid SSE with no content-type header
+    (D-STREAM-004), while a genuine non-stream error always carries one (application/json
+    / text/html). Returns a ``StreamOutcome`` for the error case, or ``None`` when a real
+    SSE stream may be pumped.
     """
     content_type = response.headers.get("content-type", "").lower()
     if response.status_code != 200:
@@ -277,7 +281,8 @@ async def validate_stream_response(
             anthropic_error_body(response.status_code, provider_error_message(err_body)),
         )
         return StreamOutcome(response.status_code)
-    if not content_type.startswith("text/event-stream"):
+    # Reject a PRESENT non-SSE content-type; an absent/empty one is accepted SSE (D-STREAM-004).
+    if content_type and not content_type.startswith("text/event-stream"):
         err_body = await response.aread()
         await response.aclose()
         logger.error("Provider returned non-SSE 200 (content-type=%r)", content_type)
