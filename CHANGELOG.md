@@ -2,6 +2,54 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-08-23
+
+### feat: unify grok and codex on the native provider client protocol ([PR #16](https://github.com/axdel/claude-bridge/pull/16))
+claude-grok and claude-codex now speak the native provider client protocol: httpx HTTP/2 data plane with split timeouts and jittered retry, sticky per-instance prompt-cache identity, per-request x-grok-req-id, model-gated reasoning.effort, cross-process OAuth refresh with reactive-401 retry, and decomposition of the provider god-files into openai/ and xai/ sub-packages. Control-plane token refresh stays on SSRF-pinned stdlib urllib.
+
+- [`fea99d0`](https://github.com/axdel/claude-bridge/commit/fea99d0) Canonicalize http_client name + record token-refresh redirect-refusal control
+- [`96658be`](https://github.com/axdel/claude-bridge/commit/96658be) Resolve architecture-primitive gate findings
+- [`af09de9`](https://github.com/axdel/claude-bridge/commit/af09de9) Conform to architecture primitives; promote feature decisions
+- [`bd54c5d`](https://github.com/axdel/claude-bridge/commit/bd54c5d) Record D-TEST-001 (Codex wire grounded by live-probe and shared translation)
+- [`2e21c54`](https://github.com/axdel/claude-bridge/commit/2e21c54) Correct request_view helper-sharing note in docstring and D-STRUCT-003
+- [`f67fa0d`](https://github.com/axdel/claude-bridge/commit/f67fa0d) Correct launcher run-model comment in pyproject
+- [`6b7fbb0`](https://github.com/axdel/claude-bridge/commit/6b7fbb0) Return Anthropic error envelope for bridge-level 400 and 404
+- [`6624547`](https://github.com/axdel/claude-bridge/commit/6624547) Accept provider SSE stream with absent content-type
+- [`5472614`](https://github.com/axdel/claude-bridge/commit/5472614) Bump pip 26.1.2 -> 26.2.1 in the lockfile to clear PYSEC-2026-3721
+- [`b82c12a`](https://github.com/axdel/claude-bridge/commit/b82c12a) Satisfy the vulture dead-code gate with FP config + stub rewrites
+- [`51b7202`](https://github.com/axdel/claude-bridge/commit/51b7202) Property-based bearer validation + enable hypothesis/deptry
+- [`62e1d3f`](https://github.com/axdel/claude-bridge/commit/62e1d3f) Harden start.sh launcher via project-venv interpreter (CWE-427, D-RUNTIME-003)
+- [`e50e13e`](https://github.com/axdel/claude-bridge/commit/e50e13e) Record D-STRUCT-003 — keep request_view.py cohesion (token estimation + tracing)
+- [`b6bf6d3`](https://github.com/axdel/claude-bridge/commit/b6bf6d3) Correct http2_client ownership row to match the real client lifecycle
+- [`20f172b`](https://github.com/axdel/claude-bridge/commit/20f172b) Warn operator when a stream is served with the circuit breaker OPEN
+- [`11568da`](https://github.com/axdel/claude-bridge/commit/11568da) Record D-SEC-002 — inbound request-size ceilings and accepted response-buffering residual
+- [`342f181`](https://github.com/axdel/claude-bridge/commit/342f181) Bound inbound request headers by count and aggregate bytes
+- [`4ffe300`](https://github.com/axdel/claude-bridge/commit/4ffe300) Correct provider-extension guidance to the sub-package layout
+- [`fe133dc`](https://github.com/axdel/claude-bridge/commit/fe133dc) Distinguish provider parse failures from translation failures
+- [`a7d8db2`](https://github.com/axdel/claude-bridge/commit/a7d8db2) Serialize Router.should_use_fallback through the state lock
+- [`681c6dc`](https://github.com/axdel/claude-bridge/commit/681c6dc) Bound provider error text relayed to the client
+- [`3e24a24`](https://github.com/axdel/claude-bridge/commit/3e24a24) Sanitize request model before it reaches logs and stats
+- [`5718837`](https://github.com/axdel/claude-bridge/commit/5718837) Validate the passthrough upstream URL at startup (https-or-loopback, no userinfo)
+- [`3ea0041`](https://github.com/axdel/claude-bridge/commit/3ea0041) Lock-free fast path for a fresh token in both providers' bearer refresh
+- [`1a6a3fb`](https://github.com/axdel/claude-bridge/commit/1a6a3fb) Start the bridge in Python isolated mode (-I), closing CWE-427
+- [`501554e`](https://github.com/axdel/claude-bridge/commit/501554e) Harden token-refresh and bearer handling in both providers
+- [`f0003a8`](https://github.com/axdel/claude-bridge/commit/f0003a8) Return the Anthropic error envelope on transport failure, with jittered retry
+- [`9cda65f`](https://github.com/axdel/claude-bridge/commit/9cda65f) Validate XAI_REASONING_EFFORT and reject non-finite timeout envs
+- [`768d1b0`](https://github.com/axdel/claude-bridge/commit/768d1b0) Run the bridge via the project venv so its httpx dependency loads
+- [`be48032`](https://github.com/axdel/claude-bridge/commit/be48032) Migrate the remaining architecture primitives to the writer format
+- [`33af929`](https://github.com/axdel/claude-bridge/commit/33af929) Migrate CANONICAL_GLOSSARY.md to the writer format and add client-parity concepts
+- [`4c87f3e`](https://github.com/axdel/claude-bridge/commit/4c87f3e) Migrate INVARIANTS.md to the writer table format and update for the httpx runtime
+- [`aad37bc`](https://github.com/axdel/claude-bridge/commit/aad37bc) Migrate DECISIONS.md to the writer table format and record client-parity decisions
+- [`df6b6b8`](https://github.com/axdel/claude-bridge/commit/df6b6b8) Surface bridge failures on the launcher terminal and harden claude-codex
+- [`034fe18`](https://github.com/axdel/claude-bridge/commit/034fe18) Refresh the credential and retry once when a provider returns 401
+- [`b956fb2`](https://github.com/axdel/claude-bridge/commit/b956fb2) Send a per-request x-grok-req-id header on grok requests
+- [`d173101`](https://github.com/axdel/claude-bridge/commit/d173101) Let providers force a credential refresh past the proactive expiry check
+- [`ea4e53a`](https://github.com/axdel/claude-bridge/commit/ea4e53a) Serialize xAI OAuth refresh across processes with flock + double-check
+- [`1b5caad`](https://github.com/axdel/claude-bridge/commit/1b5caad) Send model-gated reasoning.effort and max_output_tokens on xAI requests
+- [`4ab8621`](https://github.com/axdel/claude-bridge/commit/4ab8621) Stamp a sticky per-instance prompt cache key on provider requests
+- [`d84902a`](https://github.com/axdel/claude-bridge/commit/d84902a) Replace urllib data-plane transport with httpx HTTP/2 (split timeouts)
+- [`96bfc71`](https://github.com/axdel/claude-bridge/commit/96bfc71) Split provider god-files into cohesive sub-packages
+
 ## 2026-08-20
 
 ### feat: grok-4.6 default, 300k launcher context, GPT multiplier 1.1 ([PR #15](https://github.com/axdel/claude-bridge/pull/15))
