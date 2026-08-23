@@ -6,6 +6,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import socket
 import urllib.error
 import urllib.request
@@ -19,12 +20,13 @@ import pytest
 
 from claude_bridge.http_client import create_client
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities, StreamRequestMode
-from claude_bridge.proxy import start_proxy
+from claude_bridge.proxy import _route_request, start_proxy
 from claude_bridge.request_view import (
     _approx_decoded_bytes,
     _oversized_media,
     estimate_input_tokens,
 )
+from claude_bridge.router import Router, RouterState
 
 
 def _find_free_port() -> int:
@@ -1710,6 +1712,108 @@ class _RecordingWriter:
 
     def write(self, data: bytes) -> None:
         self.buffer.extend(data)
+
+
+class _WarningCapture(logging.Handler):
+    """Capture WARNING+ records emitted on the ``claude_bridge.proxy`` logger.
+
+    The bridge logger sets ``propagate=False``, so pytest's ``caplog`` fixture never
+    sees its records; a handler attached directly to the named logger is the only way
+    to observe them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+async def _route_streaming_auto(router: Router) -> list[logging.LogRecord]:
+    """Drive ``_route_request`` down the streaming auto-mode branch, returning WARNINGs.
+
+    Auto mode = ``provider is None`` + ``streaming is True``. ``stream_passthrough`` is
+    replaced by an instant no-network stub so the test isolates the routing decision (and
+    its diagnostics) from the passthrough transport. Returns every WARNING record the
+    proxy logger emitted while routing.
+    """
+    from claude_bridge import proxy as proxy_module
+    from claude_bridge.wire import StreamOutcome
+
+    async def _stub_passthrough(*_args: object, **_kwargs: object) -> StreamOutcome:
+        return StreamOutcome(status=200)
+
+    capture = _WarningCapture()
+    bridge_logger = logging.getLogger("claude_bridge.proxy")
+    previous_level = bridge_logger.level
+    bridge_logger.addHandler(capture)
+    bridge_logger.setLevel(logging.WARNING)
+    client = create_client()
+    real_passthrough = proxy_module.stream_passthrough
+    proxy_module.stream_passthrough = _stub_passthrough  # type: ignore[assignment]
+    try:
+        await _route_request(
+            None,  # provider -> auto mode
+            "http://127.0.0.1:9",  # upstream_url (never dialed — passthrough is stubbed)
+            {},  # headers
+            b'{"model":"claude-sonnet-4-6","stream":true,"messages":[]}',
+            cast(asyncio.StreamWriter, _RecordingWriter()),
+            router,
+            None,  # stats
+            True,  # streaming
+            "claude-sonnet-4-6",
+            0.0,  # request_start
+            client,
+        )
+    finally:
+        proxy_module.stream_passthrough = real_passthrough  # type: ignore[assignment]
+        bridge_logger.removeHandler(capture)
+        bridge_logger.setLevel(previous_level)
+        await client.aclose()
+    return capture.records
+
+
+def _failover_bypass_warnings(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    """Filter to the streaming-has-no-failover WARNING (excludes router transition logs)."""
+    return [
+        r for r in records if r.levelno == logging.WARNING and "failover" in r.getMessage().lower()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_auto_mode_warns_when_circuit_open():
+    """When the circuit breaker is OPEN, a streaming auto-mode request warns the operator.
+
+    Contract (D-STREAM-001): streaming auto-mode has no failover — a provider switch
+    mid-stream is impossible — so an OPEN circuit means the stream is served unprotected
+    via Anthropic passthrough. The operator MUST be told. The expected value (a failover
+    WARNING is present) is the design contract, not a value read from the implementation.
+    """
+    router = Router(failure_threshold=1)
+    await router.record_failure()  # CLOSED -> OPEN
+    assert router.state is RouterState.OPEN
+
+    warnings = _failover_bypass_warnings(await _route_streaming_auto(router))
+
+    assert len(warnings) == 1
+    assert "claude-sonnet-4-6" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_streaming_auto_mode_silent_when_circuit_closed():
+    """A healthy (CLOSED) circuit emits no failover-bypass warning for a streaming request.
+
+    The warning is conditional on the OPEN state so the signal stays meaningful; a CLOSED
+    circuit must stay silent. Guards against an unconditional-warning regression (drop the
+    OPEN guard and this test fails).
+    """
+    router = Router(failure_threshold=1)
+    assert router.state is RouterState.CLOSED
+
+    warnings = _failover_bypass_warnings(await _route_streaming_auto(router))
+
+    assert warnings == []
 
 
 @pytest.mark.asyncio

@@ -36,7 +36,7 @@ from claude_bridge.request_view import (
     trace_inbound_request,
     trace_provider_response,
 )
-from claude_bridge.router import Router
+from claude_bridge.router import Router, RouterState
 from claude_bridge.stats import BridgeStats
 from claude_bridge.wire import (
     StreamOutcome,
@@ -390,6 +390,13 @@ async def _route_request(
             write_response(writer, status_code, response_body)
             _record_sync_response(stats, request_start, status_code, response_body)
     elif streaming:
+        # Streaming auto-mode has no failover by design (D-STREAM-003) — warn when OPEN.
+        if router.state is RouterState.OPEN:
+            logger.warning(
+                "Circuit breaker OPEN but streaming auto-mode has no failover; "
+                "serving this stream via Anthropic passthrough (model=%s)",
+                request_model,
+            )
         logger.info("-> passthrough (stream) model=%s", request_model)
         if stats:
             stats.set_provider_info("anthropic", request_model)
