@@ -103,7 +103,7 @@ modules = [
 [[tool.importlinter.contracts]]
 name = "Proxy dispatches via the provider abstraction, never concrete providers"
 type = "forbidden"
-source_modules = ["claude_bridge.proxy"]
+source_modules = ["claude_bridge.proxy", "claude_bridge.proxy_streaming"]
 forbidden_modules = [
     "claude_bridge.providers.openai",
     "claude_bridge.providers.xai",
@@ -122,9 +122,11 @@ source_modules = [
     "claude_bridge.log",
     "claude_bridge.http_client",
     "claude_bridge.request_view",
+    "claude_bridge.wire",
 ]
 forbidden_modules = [
     "claude_bridge.proxy",
+    "claude_bridge.proxy_streaming",
     "claude_bridge.router",
     "claude_bridge.__main__",
     "claude_bridge.providers.openai",

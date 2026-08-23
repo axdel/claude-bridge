@@ -403,9 +403,9 @@ class TestValidatedBearer:
             _validated_bearer("tökén-with-unicode")
 
     def test_message_never_contains_the_token_value(self):
-        secret = "SUPER-SECRET-BEARER\r\ninjected"
+        bearer = "SUPER-SECRET-BEARER\r\ninjected"
         with pytest.raises(ValueError) as excinfo:
-            _validated_bearer(secret)
+            _validated_bearer(bearer)
         assert "SUPER-SECRET-BEARER" not in str(excinfo.value)
 
     @pytest.mark.asyncio

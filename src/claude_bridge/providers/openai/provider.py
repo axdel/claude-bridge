@@ -87,7 +87,7 @@ class OpenAIProvider:
         # Encrypted reasoning blobs keyed by fc_ call id, captured from responses and
         # re-injected before their function_calls on the next request. In-memory only —
         # opaque, never persisted, never logged, never returned to Claude Code.
-        self._reasoning_by_call_id: dict[str, dict] = {}
+        self._reasoning_cache: dict[str, dict] = {}
         self._reasoning_lock = threading.Lock()
 
     async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
@@ -110,8 +110,8 @@ class OpenAIProvider:
             # (CWE-20/CWE-113/CWE-532). The oauth branch is already validated at source
             # by get_bearer_token.
             return {"Authorization": f"Bearer {_validated_bearer(self._api_key)}"}
-        token = await get_bearer_token(self._auth_path, force_refresh=force_refresh)
-        return {"Authorization": f"Bearer {token}"}
+        bearer = await get_bearer_token(self._auth_path, force_refresh=force_refresh)
+        return {"Authorization": f"Bearer {bearer}"}
 
     def _stash_reasoning(self, associations: dict[str, dict]) -> None:
         """Store captured reasoning blobs, refreshing recency and evicting the oldest
@@ -120,11 +120,11 @@ class OpenAIProvider:
             return
         with self._reasoning_lock:
             for call_id, reasoning in associations.items():
-                self._reasoning_by_call_id.pop(call_id, None)
-                self._reasoning_by_call_id[call_id] = reasoning
-            while len(self._reasoning_by_call_id) > _REASONING_CACHE_MAX:
-                oldest = next(iter(self._reasoning_by_call_id))
-                del self._reasoning_by_call_id[oldest]
+                self._reasoning_cache.pop(call_id, None)
+                self._reasoning_cache[call_id] = reasoning
+            while len(self._reasoning_cache) > _REASONING_CACHE_MAX:
+                oldest = next(iter(self._reasoning_cache))
+                del self._reasoning_cache[oldest]
 
     def _inject_reasoning(self, translated: dict) -> None:
         """Insert each cached reasoning item immediately before the function_call it
@@ -135,9 +135,9 @@ class OpenAIProvider:
         if not isinstance(input_items, list):
             return
         with self._reasoning_lock:
-            if not self._reasoning_by_call_id:
+            if not self._reasoning_cache:
                 return
-            cache = dict(self._reasoning_by_call_id)
+            cache = dict(self._reasoning_cache)
         new_input: list[dict] = []
         inserted: set = set()
         for item in input_items:

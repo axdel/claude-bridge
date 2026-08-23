@@ -259,9 +259,12 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
 | `XAI_MODEL` | `grok-4.6` | xAI Grok model id used by the `xai` provider (pinned; set `grok-build` for the rolling latest-coding alias) |
 | `XAI_CLIENT_VERSION` | highest installed grok CLI bundle (floor `0.1.202`) | Override for the `x-grok-client-version` header the cli-chat-proxy gates on; when unset, resolved from the newest `~/.grok/downloads/grok-<ver>-*` bundle |
+| `XAI_REASONING_EFFORT` | `low` | xAI `reasoning.effort` for grok-4.6+ (`low` / `medium` / `high`); sent only to models that accept it, omitted for pre-4.6; an invalid value falls back to the default |
 | `REASONING_MODE` | `passthrough` | Thinking-block handling for OpenAI and xAI: `passthrough` preserves tagged thinking text, `drop` strips it |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `UPSTREAM_TIMEOUT` | caller default (`60` sync / `120` streaming) | Upstream request timeout in seconds; invalid, zero, or negative values fall back to the caller default |
+| `CONNECT_TIMEOUT` | `10.0` | Data-plane TCP connect timeout in seconds (httpx transport) — a dead connect fails fast; invalid, zero, or negative values fall back to the default |
+| `STREAM_IDLE_TIMEOUT` | `300.0` | Data-plane read/write idle timeout in seconds — the gap between streamed chunks, so long grok-4.6 thinking survives as long as chunks keep arriving; invalid, zero, or negative values fall back to the default |
+| `POOL_IDLE` | `90.0` | Data-plane connection-pool idle timeout in seconds for the shared keep-alive `AsyncClient`; invalid, zero, or negative values fall back to the default |
 | `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10 MiB) |
 | `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback preference list; the first registered provider is used |
 | `LLM_BRIDGE_PORT` | `9999` | Shell launcher default proxy port |

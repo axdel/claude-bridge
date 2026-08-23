@@ -2632,15 +2632,15 @@ class TestReasoningCacheBound:
     def test_cache_never_exceeds_the_bound(self):
         provider = XAIProvider()
         self._fill(provider, _REASONING_CACHE_MAX + 50)
-        assert len(provider._reasoning_by_call_id) == _REASONING_CACHE_MAX
+        assert len(provider._reasoning_cache) == _REASONING_CACHE_MAX
 
     def test_oldest_entry_is_evicted_first(self):
         provider = XAIProvider()
         self._fill(provider, _REASONING_CACHE_MAX)
         provider._stash_reasoning({"call-new": self._entry(9999)})
-        assert "call-0" not in provider._reasoning_by_call_id
-        assert "call-new" in provider._reasoning_by_call_id
-        assert "call-1" in provider._reasoning_by_call_id
+        assert "call-0" not in provider._reasoning_cache
+        assert "call-new" in provider._reasoning_cache
+        assert "call-1" in provider._reasoning_cache
 
     def test_restash_refreshes_recency_so_touched_entry_survives(self):
         provider = XAIProvider()
@@ -2648,8 +2648,8 @@ class TestReasoningCacheBound:
         # Touch call-0 → most-recent; the next insert must now evict call-1, not call-0.
         provider._stash_reasoning({"call-0": self._entry(1000)})
         provider._stash_reasoning({"call-new": self._entry(9999)})
-        assert "call-0" in provider._reasoning_by_call_id
-        assert "call-1" not in provider._reasoning_by_call_id
+        assert "call-0" in provider._reasoning_cache
+        assert "call-1" not in provider._reasoning_cache
 
 
 # --- authenticate (subscription OAuth headers) ---
@@ -2859,10 +2859,10 @@ class TestUpstreamRequestIdHeader:
             headers = await provider.authenticate()
         finally:
             upstream_request_id_var.reset(reset)
-        req_id = headers["x-grok-req-id"]
-        assert req_id  # never empty
+        upstream_request_id = headers["x-grok-req-id"]
+        assert upstream_request_id  # never empty
         # A parseable uuid proves the fallback minted a real id, not a placeholder.
-        uuid.UUID(req_id)
+        uuid.UUID(upstream_request_id)
 
 
 # --- provider contract: capabilities, endpoint, registration ---

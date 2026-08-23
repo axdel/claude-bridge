@@ -117,7 +117,7 @@ class XAIProvider:
         # Encrypted reasoning items captured from each tool turn, keyed by the EXACT upstream
         # call_id, so they can be re-injected before their function_calls on the next request.
         # In-memory only — opaque, never persisted, never logged, never returned to Claude Code.
-        self._reasoning_by_call_id: dict[str, dict] = {}
+        self._reasoning_cache: dict[str, dict] = {}
         self._reasoning_lock = threading.Lock()
 
     async def authenticate(self, *, force_refresh: bool = False) -> dict[str, str]:
@@ -148,9 +148,9 @@ class XAIProvider:
             FileNotFoundError / ValueError: Propagated from ``get_xai_bearer_token`` when the
                 grok auth file is absent, malformed, or expired with no refresh token.
         """
-        token = await get_xai_bearer_token(self._auth_path, force_refresh=force_refresh)
+        bearer = await get_xai_bearer_token(self._auth_path, force_refresh=force_refresh)
         return {
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {bearer}",
             "x-grok-client-version": config.xai_client_version(),
             "x-grok-client-identifier": _XAI_CLIENT_IDENTIFIER,
             "x-grok-conv-id": self._prompt_cache_key,
@@ -164,11 +164,11 @@ class XAIProvider:
             return
         with self._reasoning_lock:
             for call_id, reasoning in associations.items():
-                self._reasoning_by_call_id.pop(call_id, None)
-                self._reasoning_by_call_id[call_id] = reasoning
-            while len(self._reasoning_by_call_id) > _REASONING_CACHE_MAX:
-                oldest = next(iter(self._reasoning_by_call_id))
-                del self._reasoning_by_call_id[oldest]
+                self._reasoning_cache.pop(call_id, None)
+                self._reasoning_cache[call_id] = reasoning
+            while len(self._reasoning_cache) > _REASONING_CACHE_MAX:
+                oldest = next(iter(self._reasoning_cache))
+                del self._reasoning_cache[oldest]
 
     def _inject_reasoning(self, translated: dict) -> None:
         """Insert each cached reasoning item immediately before the function_call it belongs to,
@@ -182,9 +182,9 @@ class XAIProvider:
         if not isinstance(input_items, list):
             return
         with self._reasoning_lock:
-            if not self._reasoning_by_call_id:
+            if not self._reasoning_cache:
                 return
-            cache = dict(self._reasoning_by_call_id)
+            cache = dict(self._reasoning_cache)
         new_input: list[dict] = []
         inserted: set = set()
         for item in input_items:
