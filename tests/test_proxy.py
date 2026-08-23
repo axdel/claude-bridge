@@ -577,6 +577,20 @@ async def test_direct_mode_threads_provider_kwargs_to_real_xai_constructor():
         )
 
 
+@pytest.mark.asyncio
+async def test_start_proxy_rejects_cleartext_non_loopback_upstream():
+    """start_proxy validates the passthrough upstream before binding: a non-loopback http
+    URL — which would forward the prompt and x-api-key in cleartext — raises ValueError and
+    no server is bound. Oracle: the require-https-or-loopback rule refuses http to a public
+    host; the message flags https. Kills a mutant that drops the validate_upstream_url call."""
+    with pytest.raises(ValueError, match="https"):
+        await start_proxy(
+            host="127.0.0.1",
+            port=_find_free_port(),
+            upstream_url="http://api.anthropic.com",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Provider cache + configurable fallback tests
 # ---------------------------------------------------------------------------

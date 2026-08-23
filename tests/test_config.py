@@ -263,3 +263,33 @@ def test_xai_client_version_blank_env_falls_through_to_bundle(monkeypatch, tmp_p
     (tmp_path / "grok-0.2.93-macos-aarch64").mkdir()
     monkeypatch.setenv(config.XAI_CLIENT_VERSION_ENV, "   ")
     assert config.xai_client_version(downloads_dir=tmp_path) == "0.2.93"
+
+
+def test_validate_upstream_url_accepts_https_and_loopback_rejects_cleartext_and_userinfo():
+    """The passthrough upstream carries the prompt and x-api-key, so cleartext http to a
+    non-loopback host (CWE-319 exfiltration) and embedded userinfo credentials are refused;
+    https to any host and http to a loopback host (the local-mock path) pass through
+    unchanged. Expected outcomes derive from the require-https-or-loopback rule, not from
+    running the validator."""
+    import claude_bridge.config as config
+
+    for ok in (
+        "https://api.anthropic.com",
+        "https://internal.corp.example:8443/base",
+        "http://127.0.0.1:9999",
+        "http://localhost:8080",
+        "http://[::1]:9999",
+    ):
+        assert config.validate_upstream_url(ok) == ok
+
+    # Cleartext to a non-loopback host would leak the prompt and api key.
+    with pytest.raises(ValueError, match="https"):
+        config.validate_upstream_url("http://api.anthropic.com")
+
+    # Embedded userinfo credentials are rejected without echoing them.
+    with pytest.raises(ValueError, match="userinfo"):
+        config.validate_upstream_url("https://user:pass@api.anthropic.com")
+
+    # Unsupported scheme.
+    with pytest.raises(ValueError, match="scheme"):
+        config.validate_upstream_url("ftp://example.com")

@@ -6,11 +6,13 @@ Shell-launcher environment handling remains owned by the launcher scripts.
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import os
 import re
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 REASONING_MODE_ENV = "REASONING_MODE"
@@ -172,6 +174,48 @@ def fallback_chain() -> list[str]:
 def anthropic_real_url() -> str:
     """Return the passthrough Anthropic upstream URL."""
     return os.environ.get(ANTHROPIC_REAL_URL_ENV, DEFAULT_ANTHROPIC_REAL_URL)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return True if *host* is localhost or a loopback IP literal (127.0.0.0/8, ::1)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_upstream_url(url: str) -> str:
+    """Validate the passthrough upstream URL, returning it unchanged when acceptable.
+
+    The bridge forwards the client's prompt and ``x-api-key`` to this origin, so a
+    cleartext http target would leak both (CWE-319) and embedded userinfo would ship a
+    credential in the URL. Requires https, or http only for a loopback host (the
+    local-mock test path); rejects any other scheme and any userinfo. This is a
+    misconfiguration guard, not a remote-input filter — the URL originates from the
+    operator's environment, so private/internal https targets are intentionally allowed
+    (D-CONFIG-002).
+
+    Raises:
+        ValueError: The scheme is not http/https, an http target is non-loopback, or the
+            URL embeds userinfo. The message never echoes userinfo.
+    """
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        msg = f"ANTHROPIC_REAL_URL must be http or https, got scheme '{parsed.scheme}'"
+        raise ValueError(msg)
+    if parsed.username or parsed.password:
+        msg = "ANTHROPIC_REAL_URL must not embed userinfo credentials"
+        raise ValueError(msg)
+    host = parsed.hostname or ""
+    if parsed.scheme == "http" and not _is_loopback_host(host):
+        msg = (
+            f"ANTHROPIC_REAL_URL must use https for non-loopback host '{host}' "
+            f"(cleartext http would leak the prompt and api key)"
+        )
+        raise ValueError(msg)
+    return url
 
 
 def trace_path() -> str | None:

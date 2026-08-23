@@ -81,7 +81,7 @@ async def start_proxy(
     one is created here. If the server fails to start, a self-created client is closed
     before the error propagates — an injected client stays the caller's to close.
     """
-    upstream = upstream_url or config.anthropic_real_url()
+    upstream = config.validate_upstream_url(upstream_url or config.anthropic_real_url())
 
     provider = None
     if provider_name:
