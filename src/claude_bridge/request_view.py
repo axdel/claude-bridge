@@ -3,10 +3,10 @@
 Two derivations that read only the *shape* of a request/response, never its
 content: token estimation for the ``count_tokens`` endpoint, and redacted
 structural summaries for the compatibility trace. They are kept together because
-both walk the same media blocks — the ``_media_descriptor`` / ``_iter_media_blocks``
-helpers are shared, so splitting them would push that connascence across a module
-boundary. Nothing here copies prompt text, tool arguments, tool results, reasoning
-payloads, or base64 media into its output; redaction is enforced by construction.
+both build media descriptors from the same blocks via the shared ``_media_descriptor``
+helper, so splitting them would push that connascence across a module boundary. Nothing
+here copies prompt text, tool arguments, tool results, reasoning payloads, or base64
+media into its output; redaction is enforced by construction.
 """
 
 from __future__ import annotations
