@@ -272,19 +272,10 @@ async def _process_request(
     try:
         parsed = await _parse_request(reader)
     except _RequestTooLarge as exc:
-        error_body = json.dumps(
-            {
-                "type": "error",
-                "error": {
-                    "type": "request_too_large",
-                    "message": exc.message,
-                },
-            }
-        ).encode()
-        write_response(writer, 413, error_body)
+        write_response(writer, 413, anthropic_error_body(413, exc.message))
         return
     if parsed is None:
-        write_response(writer, 400, b'{"error": "malformed request"}')
+        write_response(writer, 400, anthropic_error_body(400, "malformed request"))
         return
 
     method, path, headers, body = parsed
@@ -313,7 +304,7 @@ async def _process_request(
 
     if method != "POST" or base_path != "/v1/messages":
         logger.info("-> 404 (unsupported path)")
-        write_response(writer, 404, b'{"error": "not found"}')
+        write_response(writer, 404, anthropic_error_body(404, "not found"))
         return
 
     # Track this as a real request

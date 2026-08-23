@@ -117,14 +117,14 @@ def _http_post_stream_raw(url: str, body: dict) -> tuple[int, bytes]:
         return resp.status, resp.read()
 
 
-def _http_get(url: str) -> int:
-    """Stdlib HTTP GET — returns status code only."""
+def _http_get_raw(url: str) -> tuple[int, bytes]:
+    """Stdlib HTTP GET — returns (status_code, raw_body)."""
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status
+            return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code
+        return exc.code, exc.read()
 
 
 @pytest.mark.asyncio
@@ -184,9 +184,15 @@ async def test_stats_endpoint_returns_metrics(proxy_url: str):
 
 @pytest.mark.asyncio
 async def test_wrong_path_returns_404(proxy_url: str):
-    """GET to an unknown path returns 404."""
-    status = await asyncio.to_thread(_http_get, f"{proxy_url}/v1/completions")
+    """GET to an unknown path returns 404 with the Anthropic error envelope."""
+    status, raw_body = await asyncio.to_thread(_http_get_raw, f"{proxy_url}/v1/completions")
     assert status == 404
+    # Oracle: the bridge impersonates the Anthropic API, whose 404 body is the error
+    # envelope with type not_found_error (docs.anthropic.com/en/api/errors) — not a bare
+    # {"error": <str>}. A bare body has no ["error"]["type"], so this bites the regression.
+    body = json.loads(raw_body)
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "not_found_error"
 
 
 @pytest.mark.asyncio
@@ -201,7 +207,12 @@ async def test_malformed_content_length_returns_400(upstream_url: str):
         await writer.drain()
         response = await asyncio.wait_for(reader.read(4096), timeout=2)
         writer.close()
-        assert b"400" in response
+        assert response.startswith(b"HTTP/1.1 400")
+        # Oracle: Anthropic 400 body is the error envelope with type invalid_request_error
+        # (docs.anthropic.com/en/api/errors), not a bare {"error": <str>}.
+        envelope = json.loads(response.split(b"\r\n\r\n", 1)[1])
+        assert envelope["type"] == "error"
+        assert envelope["error"]["type"] == "invalid_request_error"
     finally:
         server.close()
         await server.wait_closed()
