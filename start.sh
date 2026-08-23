@@ -11,6 +11,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${LLM_BRIDGE_PORT:-9999}"
 
+# The bridge's one runtime dependency (httpx[http2], the HTTP/2 data plane) lives in the
+# project venv that `uv sync` provisions at ${SCRIPT_DIR}/.venv — the system python3 does
+# not have it. Run the bridge through that interpreter and fail loud with the fix if it is
+# missing (D-RUNTIME-003). Because claude_bridge then resolves from the venv's editable
+# install and httpx from its site-packages, no PYTHONPATH is needed and the bridge starts
+# in full isolated mode (-I): no cwd, inherited PYTHONPATH, or per-user site dir on
+# sys.path, so a hostile sitecustomize.py / claude_bridge/ / httpx.py in the working
+# directory cannot run ahead of the real bridge (search-path injection, CWE-427).
+BRIDGE_PY="${SCRIPT_DIR}/.venv/bin/python"
+if [[ ! -x "$BRIDGE_PY" ]]; then
+    echo "start.sh: ${SCRIPT_DIR}/.venv not found — run 'uv sync' in ${SCRIPT_DIR} first." >&2
+    exit 1
+fi
+
 # Parse --port from args for the env var message
 prev_arg=""
 for arg in "$@"; do
@@ -39,5 +53,4 @@ echo "    unset ANTHROPIC_API_KEY"
 echo "    claude"
 echo ""
 
-export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -m claude_bridge --port "$PORT" "$@"
+exec "$BRIDGE_PY" -I -m claude_bridge --port "$PORT" "$@"

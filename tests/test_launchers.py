@@ -75,10 +75,14 @@ def test_unsafe_path_python_loads_hostile_module(tmp_path):
 
 
 def test_launchers_use_isolated_python():
-    """Both launchers invoke ``python -I`` and never ``-P`` or an inherited
-    ``PYTHONPATH`` export — the durable guard against regressing the CWE-427 fix."""
+    """All three launchers invoke ``python -I`` and never ``-P`` or an inherited
+    ``PYTHONPATH`` export — the durable guard against regressing the CWE-427 fix.
+    ``start.sh`` runs the bridge through the same project-venv interpreter (D-RUNTIME-003),
+    so it takes full isolated mode too rather than a system-python + PYTHONPATH=src hack —
+    the venv install makes ``claude_bridge`` and ``httpx`` importable without any path
+    entry, so no untrusted path is ever needed on ``sys.path``."""
     repo_root = Path(__file__).resolve().parents[1]
-    for name in ("claude-grok", "claude-codex"):
+    for name in ("claude-grok", "claude-codex", "start.sh"):
         text = (repo_root / name).read_text()
         assert '"$BRIDGE_PY" -I ' in text, f"{name} must invoke python in isolated mode (-I)"
         assert '"$BRIDGE_PY" -P' not in text, f"{name} must not use -P (leaves PYTHONPATH open)"
