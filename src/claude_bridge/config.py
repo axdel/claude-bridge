@@ -6,6 +6,7 @@ Shell-launcher environment handling remains owned by the launcher scripts.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Callable
@@ -41,6 +42,11 @@ DEFAULT_XAI_MODEL = "grok-4.6"
 # models that accept the field (see anthropic_to_xai's version gate). Override with
 # XAI_REASONING_EFFORT.
 DEFAULT_XAI_REASONING_EFFORT = "low"
+
+# The reasoning-effort values grok-4.6 accepts (all verified HTTP 200). Canonical owner of the
+# allowed set: xai_reasoning_effort() validates against it so a typo falls back to the default
+# rather than shipping an unrecognized effort to every upstream request.
+_XAI_REASONING_EFFORTS = ("low", "medium", "high")
 
 # HTTP/2 transport split timeouts (seconds). A single urllib socket timeout fired on
 # every recv and killed long-thinking grok-4.6 streams at ~120s; these separate
@@ -103,7 +109,11 @@ def _positive_env_number[NumT: (int, float)](
         if on_invalid is not None:
             on_invalid(raw)
         return default
-    if value <= 0:
+    # ``float("nan")``/``float("inf")`` parse cleanly but are not usable timeouts, and NaN
+    # slips past ``value <= 0`` (every NaN comparison is False). Require a finite, positive
+    # value so a non-finite override falls back to the default instead of building a
+    # ``Timeout(connect=nan, ...)`` that never fires. ``math.isfinite`` accepts any int.
+    if not math.isfinite(value) or value <= 0:
         if on_invalid is not None:
             on_invalid(raw)
         return default
@@ -174,14 +184,27 @@ def xai_model() -> str:
     return _non_empty_stripped_env(XAI_MODEL_ENV) or DEFAULT_XAI_MODEL
 
 
-def xai_reasoning_effort() -> str:
-    """Return the xAI reasoning effort from XAI_REASONING_EFFORT, defaulting to low.
+def xai_reasoning_effort(*, on_invalid: Callable[[str], None] | None = None) -> str:
+    """Return the validated xAI reasoning effort from XAI_REASONING_EFFORT, defaulting to low.
 
     grok-4.6 accepts low/medium/high; the value is only stamped onto requests for models
     that accept the field (the version gate lives in ``anthropic_to_xai``). ``low`` is the
     latency default, not xAI's native ``high``.
+
+    The override is validated against ``_XAI_REASONING_EFFORTS`` (case-insensitively). An
+    unrecognized value invokes *on_invalid* with the raw string and falls back to the
+    default, so a typo like ``XAI_REASONING_EFFORT=hihg`` never ships ``{'effort': 'hihg'}``
+    to every upstream request; a valid override is normalized to lowercase for the wire.
     """
-    return _non_empty_stripped_env(XAI_REASONING_EFFORT_ENV) or DEFAULT_XAI_REASONING_EFFORT
+    raw = _non_empty_stripped_env(XAI_REASONING_EFFORT_ENV)
+    if raw is None:
+        return DEFAULT_XAI_REASONING_EFFORT
+    normalized = raw.lower()
+    if normalized not in _XAI_REASONING_EFFORTS:
+        if on_invalid is not None:
+            on_invalid(raw)
+        return DEFAULT_XAI_REASONING_EFFORT
+    return normalized
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:

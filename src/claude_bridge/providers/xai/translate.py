@@ -465,9 +465,18 @@ def anthropic_to_xai(
     }
 
     # reasoning.effort tunes grok-4.6+ thinking length (low by default — a latency choice).
-    # Model-gated: pre-4.6 models 400 on the field (field_effort_low.json).
+    # Model-gated: pre-4.6 models 400 on the field (field_effort_low.json). An invalid
+    # XAI_REASONING_EFFORT override falls back to the default and surfaces as a translation
+    # warning rather than shipping an unrecognized effort upstream.
     if _model_accepts_reasoning_effort(model):
-        result["reasoning"] = {"effort": config.xai_reasoning_effort()}
+        result["reasoning"] = {
+            "effort": config.xai_reasoning_effort(
+                on_invalid=lambda raw: warnings.append(
+                    f"Invalid XAI_REASONING_EFFORT={raw!r}; using default "
+                    f"'{config.DEFAULT_XAI_REASONING_EFFORT}'"
+                )
+            )
+        }
 
     # Anthropic max_tokens -> Responses max_output_tokens. grok-4.6 has no fixed text cap, so
     # forwarding Claude's limit keeps slow turns bounded; omitted when absent or non-positive.

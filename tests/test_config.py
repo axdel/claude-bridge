@@ -42,6 +42,21 @@ def test_positive_float_timeout_accessor_default_override_and_invalid_fallback(
     assert accessor(on_invalid=invalid_values.append) == default
     assert invalid_values == ["not-a-number", "0", "-5"]
 
+    # Non-finite floats parse cleanly but are not usable timeouts. NaN in particular slips
+    # past a bare ``value <= 0`` guard (every NaN comparison is False), so without an
+    # isfinite check these would return nan/inf instead of the default.
+    monkeypatch.setenv(env_var, "nan")
+    assert accessor(on_invalid=invalid_values.append) == default
+    assert invalid_values == ["not-a-number", "0", "-5", "nan"]
+
+    monkeypatch.setenv(env_var, "inf")
+    assert accessor(on_invalid=invalid_values.append) == default
+    assert invalid_values == ["not-a-number", "0", "-5", "nan", "inf"]
+
+    monkeypatch.setenv(env_var, "-inf")
+    assert accessor(on_invalid=invalid_values.append) == default
+    assert invalid_values == ["not-a-number", "0", "-5", "nan", "inf", "-inf"]
+
 
 def test_max_request_body_default_and_override(monkeypatch):
     """MAX_REQUEST_BODY owns the import-time proxy body limit default."""
@@ -140,6 +155,17 @@ def test_xai_reasoning_effort_default_and_env_override(monkeypatch):
 
     monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "   ")
     assert config.xai_reasoning_effort() == "low"
+
+    # A case-varied but valid override normalizes to the lowercase wire value.
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "HIGH")
+    assert config.xai_reasoning_effort() == "high"
+
+    # An out-of-set value (e.g. a typo) falls back to the default and reports the raw
+    # string through on_invalid, rather than shipping {'effort': 'hihg'} to every request.
+    invalid_values: list[str] = []
+    monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "hihg")
+    assert config.xai_reasoning_effort(on_invalid=invalid_values.append) == "low"
+    assert invalid_values == ["hihg"]
 
 
 def test_xai_client_version_env_override_wins_verbatim(monkeypatch, tmp_path):
