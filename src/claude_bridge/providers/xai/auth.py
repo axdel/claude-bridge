@@ -49,6 +49,27 @@ _XAI_REFRESH_LOCK_FILENAME = ".xai-refresh.lock"
 _XAI_CLIENT_IDENTIFIER = "grok-cli"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that refuses every redirect from the token endpoint.
+
+    The caller already pins the issuer host for the *initial* request, but default
+    urllib follows a 3xx automatically — so a ``Location: http://127.0.0.1:...`` on
+    the token POST would still drive an arbitrary internal request whose response is
+    parsed as token JSON (SSRF, CWE-918). A token endpoint never legitimately
+    redirects; refusing outright removes the vector. The raised error carries no
+    redirect URL (never echo the attacker's target). Duplicated per D-XAI-002 rather
+    than shared cross-provider.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.URLError("refusing to follow a redirect from the token endpoint")
+
+
+# One opener reused for every refresh: no-redirect, and an empty ProxyHandler so an
+# attacker-set http(s)_proxy cannot interpose on the pinned-host token POST.
+_TOKEN_OPENER = urllib.request.build_opener(_NoRedirectHandler, urllib.request.ProxyHandler({}))
+
+
 def _iso_to_timestamp(value: str) -> float:
     """Parse an ISO-8601 timestamp (optional trailing ``Z``) to epoch seconds.
 
@@ -312,7 +333,7 @@ async def refresh_xai_token(
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310  # nosec B310
+            with _TOKEN_OPENER.open(req, timeout=30) as resp:
                 token_data: dict = json.loads(resp.read())
         except (
             urllib.error.HTTPError,

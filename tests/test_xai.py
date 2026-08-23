@@ -50,6 +50,7 @@ from claude_bridge.providers.xai import (
     translate_xai_sse_event,
     xai_to_anthropic,
 )
+from claude_bridge.providers.xai.auth import _TOKEN_OPENER, _NoRedirectHandler
 
 _CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 _ENTRY_KEY = f"https://auth.x.ai::{_CLIENT_ID}"
@@ -322,7 +323,7 @@ class TestGetXaiBearerToken:
         )
         auth_file = _write_grok_auth(tmp_path, data)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         result = await get_xai_bearer_token(auth_file)
@@ -341,7 +342,7 @@ class TestGetXaiBearerToken:
         data = _grok_auth()  # default entry: far-future exp -> proactively valid
         auth_file = _write_grok_auth(tmp_path, data)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 7200}),
         )
         result = await get_xai_bearer_token(auth_file, force_refresh=True)
@@ -371,7 +372,7 @@ class TestGetXaiBearerToken:
         def _raise_timeout(*args, **kwargs):
             raise TimeoutError("Connection timed out")
 
-        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _raise_timeout)
         with pytest.raises(ValueError, match="Token refresh failed"):
             await get_xai_bearer_token(auth_file)
 
@@ -405,7 +406,7 @@ class TestGetXaiBearerToken:
             captured["url"] = req.full_url
             return _FakeTokenResp({"access_token": new_token, "expires_in": 3600})
 
-        monkeypatch.setattr("urllib.request.urlopen", _capture)
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _capture)
         result = await get_xai_bearer_token(auth_file)
         assert result == new_token
         assert captured["url"] == "https://auth.x.ai/oauth2/token"
@@ -488,7 +489,7 @@ class TestRefreshXaiToken:
         new_token = _make_jwt({"exp": time.time() + 3600})
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         returned = await refresh_xai_token(
@@ -503,7 +504,7 @@ class TestRefreshXaiToken:
         new_token = _make_jwt({"exp": time.time() + 3600})
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp(
                 {"access_token": new_token, "refresh_token": "refresh-rotated", "expires_in": 3600}
             ),
@@ -517,7 +518,7 @@ class TestRefreshXaiToken:
         new_token = _make_jwt({"exp": time.time() + 3600})
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -533,7 +534,7 @@ class TestRefreshXaiToken:
         )
         auth_file = _write_grok_auth(tmp_path, data)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -555,7 +556,7 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)
         auth_file.chmod(0o644)  # start broad — a world-readable secret
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -570,7 +571,7 @@ class TestRefreshXaiToken:
         def _raise_http(*args, **kwargs):
             raise TimeoutError("boom")
 
-        monkeypatch.setattr("urllib.request.urlopen", _raise_http)
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _raise_http)
         with pytest.raises(ValueError, match="Token refresh failed"):
             await refresh_xai_token(
                 _ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file
@@ -585,7 +586,7 @@ class TestRefreshXaiToken:
         new_token = _make_jwt({"exp": new_exp})
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 4321}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -599,7 +600,7 @@ class TestRefreshXaiToken:
     async def test_missing_access_token_raises(self, monkeypatch, tmp_path: Path):
         auth_file = self._expired_file(tmp_path)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"refresh_token": "r", "expires_in": 3600}),
         )
         with pytest.raises(ValueError, match="access_token"):
@@ -616,7 +617,7 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)
         before = time.time()
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp(
                 {"access_token": "opaque-not-a-jwt", "expires_in": 4321}
             ),
@@ -637,7 +638,7 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)  # entry starts WITH an expires_at
         assert "expires_at" in json.loads(auth_file.read_text())[_ENTRY_KEY]
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": "opaque-not-a-jwt"}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -655,7 +656,7 @@ class TestRefreshXaiToken:
             tmp_path, {_ENTRY_KEY: "corrupted-non-dict", "sibling": {"k": 1}}
         )
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         returned = await refresh_xai_token(
@@ -676,7 +677,7 @@ class TestRefreshXaiToken:
         auth_file.parent.mkdir(parents=True, exist_ok=True)  # dir exists, file does not
         assert not auth_file.exists()
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -693,7 +694,9 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)
         before = auth_file.read_bytes()
         calls: list[int] = []
-        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: calls.append(1))
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open", lambda *a, **kw: calls.append(1)
+        )
         with pytest.raises(ValueError, match="untrusted"):
             await refresh_xai_token(
                 _ENTRY_KEY,
@@ -715,7 +718,9 @@ class TestRefreshXaiToken:
         auth_file = self._expired_file(tmp_path)
         before = auth_file.read_bytes()
         calls: list[int] = []
-        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: calls.append(1))
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open", lambda *a, **kw: calls.append(1)
+        )
         with pytest.raises(ValueError, match="untrusted"):
             await refresh_xai_token(
                 _ENTRY_KEY,
@@ -768,7 +773,7 @@ class TestCrossProcessRefreshLock:
         def _boom(*a, **kw):
             raise AssertionError("network refresh must not run when the token is already valid")
 
-        monkeypatch.setattr("urllib.request.urlopen", _boom)
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _boom)
         returned = await refresh_xai_token(
             _ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file
         )
@@ -787,7 +792,7 @@ class TestCrossProcessRefreshLock:
         lock_path = auth_file.parent / ".xai-refresh.lock"
         new_token = _make_jwt({"exp": time.time() + 3600})
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         peer_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -815,7 +820,7 @@ class TestCrossProcessRefreshLock:
         auth_file = self._expired_file(tmp_path)
         new_token = _make_jwt({"exp": time.time() + 3600})
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
         )
         await refresh_xai_token(_ENTRY_KEY, "refresh-original", _CLIENT_ID, auth_path=auth_file)
@@ -845,7 +850,7 @@ class TestCrossProcessRefreshLock:
             tmp_path, _grok_auth({"key": rejected, "expires_at": _iso(time.time() + 3600)})
         )
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
             lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 7200}),
         )
         returned = await refresh_xai_token(
@@ -876,7 +881,7 @@ class TestCrossProcessRefreshLock:
         def _boom(*a, **kw):
             raise AssertionError("refresh POST fired though a peer already rotated the token")
 
-        monkeypatch.setattr("urllib.request.urlopen", _boom)
+        monkeypatch.setattr("claude_bridge.providers.xai.auth._TOKEN_OPENER.open", _boom)
         returned = await refresh_xai_token(
             _ENTRY_KEY,
             "refresh-original",
@@ -885,6 +890,39 @@ class TestCrossProcessRefreshLock:
             stale_token=rejected,
         )
         assert returned == peer_token
+
+
+class TestNoRedirectOpener:
+    """The refresh opener refuses every 3xx from the xAI token endpoint.
+
+    Oracle: a token endpoint never legitimately redirects; following a
+    provider-controlled ``Location`` would drive an arbitrary internal request whose
+    response is then parsed as token JSON (SSRF, CWE-918). The refusal must carry no
+    redirect URL (never echo the attacker's target).
+    """
+
+    def test_handler_is_wired_into_the_refresh_opener(self):
+        # Kills a mutant that drops _NoRedirectHandler from build_opener (redirects
+        # would then be followed automatically). OpenerDirector.handlers is a real
+        # documented CPython attribute the typeshed stub omits, hence the ignore.
+        handlers = _TOKEN_OPENER.handlers  # type: ignore[attr-defined]
+        assert any(isinstance(h, _NoRedirectHandler) for h in handlers)
+
+    def test_redirect_refused_without_echoing_target(self):
+        import http.client
+        import io
+        import urllib.error
+        import urllib.request
+
+        handler = _NoRedirectHandler()
+        target = "http://169.254.169.254/latest/meta-data/"
+        req = urllib.request.Request("https://auth.x.ai/oauth2/token")
+        with pytest.raises(urllib.error.URLError) as excinfo:
+            handler.redirect_request(
+                req, io.BytesIO(), 302, "Found", http.client.HTTPMessage(), target
+            )
+        assert target not in str(excinfo.value)
+        assert "169.254.169.254" not in str(excinfo.value)
 
 
 # --- import decode_jwt_exp used to keep the oracle honest (no unused import) ---

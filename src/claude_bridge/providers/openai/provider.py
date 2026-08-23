@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
-from claude_bridge.providers.openai.auth import get_bearer_token
+from claude_bridge.providers.openai.auth import _validated_bearer, get_bearer_token
 from claude_bridge.providers.openai.stream import (
     _remap_block_index,
     _sse_synthetic_termination,
@@ -105,7 +105,11 @@ class OpenAIProvider:
                     "api_key auth mode but was not set or is empty."
                 )
                 raise ValueError(msg)
-            return {"Authorization": f"Bearer {self._api_key}"}
+            # Validate before header construction: a control-char-bearing key must not
+            # reach an http.client "Invalid header value" error that echoes the secret
+            # (CWE-20/CWE-113/CWE-532). The oauth branch is already validated at source
+            # by get_bearer_token.
+            return {"Authorization": f"Bearer {_validated_bearer(self._api_key)}"}
         token = await get_bearer_token(self._auth_path, force_refresh=force_refresh)
         return {"Authorization": f"Bearer {token}"}
 
