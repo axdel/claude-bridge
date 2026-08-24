@@ -205,7 +205,11 @@ async def test_malformed_content_length_returns_400(upstream_url: str):
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"POST /v1/messages HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n")
         await writer.drain()
-        response = await asyncio.wait_for(reader.read(4096), timeout=2)
+        # read(-1) drains to EOF (the server closes after the 400), so the full response —
+        # headers AND body — is always present. A single bounded read(4096) could return the
+        # headers before the body segment arrived under load, making the split below raise
+        # IndexError; the other raw-socket tests here all use read(-1) for this reason.
+        response = await asyncio.wait_for(reader.read(-1), timeout=2)
         writer.close()
         assert response.startswith(b"HTTP/1.1 400")
         # Oracle: Anthropic 400 body is the error envelope with type invalid_request_error
@@ -1224,31 +1228,13 @@ class TestMediaAwareTokenEstimation:
         )
         assert under == []
 
-    def test_oversized_media_emits_a_warning(self):
+    def test_oversized_media_emits_a_warning(self, capture_logger):
         # Behavior (not call-shape): estimating a request with oversized media emits
-        # an operator-visible WARNING naming the modality. Capture via a handler on
-        # the bridge logger directly — it sets propagate=False, so pytest's caplog
-        # (rooted) never sees it; this also makes the test order-independent.
-        import logging
-
-        records: list[logging.LogRecord] = []
-
-        class _Capture(logging.Handler):
-            def emit(self, record: logging.LogRecord) -> None:
-                records.append(record)
-
-        bridge_logger = logging.getLogger("claude_bridge.request_view")
-        handler = _Capture(level=logging.WARNING)
-        previous_level = bridge_logger.level
-        bridge_logger.addHandler(handler)
-        bridge_logger.setLevel(logging.WARNING)
-        try:
-            estimate_input_tokens(
-                {"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]}
-            )
-        finally:
-            bridge_logger.removeHandler(handler)
-            bridge_logger.setLevel(previous_level)
+        # an operator-visible WARNING naming the modality. The bridge logger sets
+        # propagate=False, so caplog never sees it; capture_logger attaches a handler
+        # directly to the named logger (shared fixture — see conftest.py).
+        records = capture_logger("claude_bridge.request_view", level=logging.WARNING)
+        estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]})
         assert any(r.levelno == logging.WARNING and "image" in r.getMessage() for r in records)
 
     def test_approx_decoded_bytes_recovers_payload_size(self):

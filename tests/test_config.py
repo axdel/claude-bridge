@@ -140,31 +140,34 @@ def test_xai_model_default_and_env_override(monkeypatch):
     assert config.xai_model() == "grok-4.6"
 
 
-def test_xai_reasoning_effort_default_and_env_override(monkeypatch):
-    """XAI_REASONING_EFFORT defaults to low and trims/normalizes blank overrides."""
+def test_xai_reasoning_effort_override_unset_and_env(monkeypatch):
+    """XAI_REASONING_EFFORT override returns None when unset (so the caller mapping takes
+    over) and the trimmed/normalized value when set."""
     import claude_bridge.config as config
 
+    # Unset -> None: the env is a pin, not a floor; absence yields to the caller's effort.
     monkeypatch.delenv(config.XAI_REASONING_EFFORT_ENV, raising=False)
-    assert config.xai_reasoning_effort() == "low"
+    assert config.xai_reasoning_effort_override() is None
 
     monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "medium")
-    assert config.xai_reasoning_effort() == "medium"
+    assert config.xai_reasoning_effort_override() == "medium"
 
     monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "  high  ")
-    assert config.xai_reasoning_effort() == "high"
+    assert config.xai_reasoning_effort_override() == "high"
 
+    # A blank/whitespace override is treated as unset -> None.
     monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "   ")
-    assert config.xai_reasoning_effort() == "low"
+    assert config.xai_reasoning_effort_override() is None
 
     # A case-varied but valid override normalizes to the lowercase wire value.
     monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "HIGH")
-    assert config.xai_reasoning_effort() == "high"
+    assert config.xai_reasoning_effort_override() == "high"
 
-    # An out-of-set value (e.g. a typo) falls back to the default and reports the raw
-    # string through on_invalid, rather than shipping {'effort': 'hihg'} to every request.
+    # An out-of-set value (e.g. a typo) returns None and reports the raw string through
+    # on_invalid, rather than shipping {'effort': 'hihg'} to every request.
     invalid_values: list[str] = []
     monkeypatch.setenv(config.XAI_REASONING_EFFORT_ENV, "hihg")
-    assert config.xai_reasoning_effort(on_invalid=invalid_values.append) == "low"
+    assert config.xai_reasoning_effort_override(on_invalid=invalid_values.append) is None
     assert invalid_values == ["hihg"]
 
 

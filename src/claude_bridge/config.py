@@ -46,7 +46,7 @@ DEFAULT_XAI_MODEL = "grok-4.6"
 DEFAULT_XAI_REASONING_EFFORT = "low"
 
 # The reasoning-effort values grok-4.6 accepts (all verified HTTP 200). Canonical owner of the
-# allowed set: xai_reasoning_effort() validates against it so a typo falls back to the default
+# allowed set: xai_reasoning_effort_override() validates against it so a typo is ignored
 # rather than shipping an unrecognized effort to every upstream request.
 _XAI_REASONING_EFFORTS = ("low", "medium", "high")
 
@@ -228,26 +228,31 @@ def xai_model() -> str:
     return _non_empty_stripped_env(XAI_MODEL_ENV) or DEFAULT_XAI_MODEL
 
 
-def xai_reasoning_effort(*, on_invalid: Callable[[str], None] | None = None) -> str:
-    """Return the validated xAI reasoning effort from XAI_REASONING_EFFORT, defaulting to low.
+def xai_reasoning_effort_override(
+    *, on_invalid: Callable[[str], None] | None = None
+) -> str | None:
+    """Return the validated XAI_REASONING_EFFORT override, or None when unset/invalid.
 
-    grok-4.6 accepts low/medium/high; the value is only stamped onto requests for models
-    that accept the field (the version gate lives in ``anthropic_to_xai``). ``low`` is the
-    latency default, not xAI's native ``high``.
+    The env var is an explicit operator pin that takes precedence over the caller's
+    per-request ``output_config.effort``; ``anthropic_to_xai`` applies that precedence.
+    When the env is unset this returns None so the caller mapping (and finally the
+    ``low`` latency default) applies — rather than the env silently forcing ``low`` on
+    every request, which downgraded a caller's ``max``.
 
-    The override is validated against ``_XAI_REASONING_EFFORTS`` (case-insensitively). An
-    unrecognized value invokes *on_invalid* with the raw string and falls back to the
-    default, so a typo like ``XAI_REASONING_EFFORT=hihg`` never ships ``{'effort': 'hihg'}``
-    to every upstream request; a valid override is normalized to lowercase for the wire.
+    grok-4.6 accepts low/medium/high; the value is validated against
+    ``_XAI_REASONING_EFFORTS`` (case-insensitively). An unrecognized value invokes
+    *on_invalid* with the raw string and returns None (fall through to the caller/default),
+    so a typo like ``XAI_REASONING_EFFORT=hihg`` never ships ``{'effort': 'hihg'}`` upstream;
+    a valid override is normalized to lowercase for the wire.
     """
     raw = _non_empty_stripped_env(XAI_REASONING_EFFORT_ENV)
     if raw is None:
-        return DEFAULT_XAI_REASONING_EFFORT
+        return None
     normalized = raw.lower()
     if normalized not in _XAI_REASONING_EFFORTS:
         if on_invalid is not None:
             on_invalid(raw)
-        return DEFAULT_XAI_REASONING_EFFORT
+        return None
     return normalized
 
 

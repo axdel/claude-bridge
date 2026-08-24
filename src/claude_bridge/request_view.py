@@ -344,15 +344,47 @@ def _trace_provider_request(translated: dict, warnings: list[str]) -> None:
         logger.debug("provider request trace failed", exc_info=True)
 
 
+# Routine, expected-every-request translation notices. Thinking is present on essentially
+# every Claude Code request and grok clamps the caller's max on every request, so logging
+# these at WARNING floods the TUI that shares the bridge's stderr. They log at DEBUG instead.
+#
+# Matched by ANCHORED PREFIX, not substring: the lossy notices interpolate client-controlled
+# text (an unrecognized effort value, an unsupported subkey name) that a substring match would
+# let embed a routine marker and smuggle a genuinely-lossy warning down to DEBUG. Every lossy
+# notice instead begins with a distinct fixed word the client cannot control — "Unrecognized",
+# "Dropped", "Unsupported", "Invalid" — none of which is a routine prefix below, so a crafted
+# value cannot forge a routine classification.
+#
+# This is an ALLOWLIST: a notice matching no prefix logs at WARNING, so a genuinely-lossy or
+# unforeseen notice stays loud by default. A translator rewording one of these prefixes without
+# updating this tuple is caught by the request_view coupling tests, not silently re-flooded.
+_ROUTINE_TRANSLATION_PREFIXES = (
+    "Thinking config passed through",  # thinking passed through — every request
+    "Stripped 'thinking' config",  # thinking dropped — every request in drop mode
+    "output_config.effort '",  # grok effort clamp (max/xhigh -> high) — every request
+)
+
+
+def _is_routine_translation(message: str) -> bool:
+    """True if a translation notice is routine/expected — logged at DEBUG, not WARNING."""
+    return any(message.startswith(prefix) for prefix in _ROUTINE_TRANSLATION_PREFIXES)
+
+
 def emit_translation_warnings(warnings: list[str], translated: dict) -> None:
     """Surface translation warnings to every observer — the human log and the
     structural trace — from a single place.
 
-    Both the streaming and non-streaming request paths route their warnings here so
-    the logged warnings and the traced warnings can never drift out of lockstep.
+    Both the streaming and non-streaming request paths route their warnings here so the
+    logged warnings and the traced warnings can never drift out of lockstep. Routine notices
+    (thinking passthrough/drop, the grok effort clamp) log at DEBUG to keep the shared TUI
+    quiet; genuinely-lossy notices log at WARNING. The trace always records the full list,
+    so diagnosability is unchanged regardless of log level.
     """
     for warning in warnings:
-        logger.warning("Translation: %s", warning)
+        if _is_routine_translation(warning):
+            logger.debug("Translation: %s", warning)
+        else:
+            logger.warning("Translation: %s", warning)
     _trace_provider_request(translated, warnings)
 
 

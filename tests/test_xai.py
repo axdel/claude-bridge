@@ -1025,6 +1025,108 @@ class TestRequestTranslation:
         assert result["reasoning"] == {"effort": "low"}
         assert any("thinking" in w.lower() for w in warnings)
 
+    # -- output_config.effort mapping (grok clamps max/xhigh -> high) ---------
+    # Oracle: grok-4.6 accepts only low/medium/high (U-EFFORT, all HTTP 200); the
+    # caller's max/xhigh have no grok equivalent, so the closest supported effort is
+    # high. Expected values derive from that spec + the clamp table, never from the code.
+
+    def test_output_config_effort_max_clamps_to_high(self, monkeypatch):
+        """The real Claude Code case: output_config.effort=max on grok clamps to high —
+        NOT the old static low. This is the core downgrade regression."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, _ = anthropic_to_xai({"messages": [], "output_config": {"effort": "max"}})
+        assert result["reasoning"] == {"effort": "high"}
+
+    def test_output_config_effort_xhigh_clamps_to_high(self, monkeypatch):
+        """Opus 4.7's xhigh also has no grok equivalent → clamps to high."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, _ = anthropic_to_xai({"messages": [], "output_config": {"effort": "xhigh"}})
+        assert result["reasoning"] == {"effort": "high"}
+
+    def test_output_config_effort_medium_maps_through(self, monkeypatch):
+        """A caller effort grok supports natively (medium) passes through unclamped —
+        not the old static low."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, _ = anthropic_to_xai({"messages": [], "output_config": {"effort": "medium"}})
+        assert result["reasoning"] == {"effort": "medium"}
+
+    def test_env_override_wins_over_output_config_effort(self, monkeypatch):
+        """XAI_REASONING_EFFORT is an explicit operator pin — it wins over the caller's
+        per-request effort."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.setenv("XAI_REASONING_EFFORT", "low")
+        result, _ = anthropic_to_xai({"messages": [], "output_config": {"effort": "max"}})
+        assert result["reasoning"] == {"effort": "low"}
+
+    def test_output_config_unrecognized_effort_falls_back_to_default_low(self, monkeypatch):
+        """A garbage/future effort value falls back to the grok default and surfaces a
+        (lossy) warning naming it — never ships an unrecognized effort upstream."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, warnings = anthropic_to_xai({"messages": [], "output_config": {"effort": "turbo"}})
+        assert result["reasoning"] == {"effort": "low"}
+        assert any("turbo" in w for w in warnings)
+
+    def test_env_override_still_warns_on_dropped_subkey(self, monkeypatch):
+        """An env override short-circuits effort SELECTION, but an unsupported output_config
+        subkey is a loss independent of which effort ships. The drop warning must still fire
+        so the operator learns ``format`` was discarded — the diagnostic and the effort
+        decision are separate concerns."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.setenv("XAI_REASONING_EFFORT", "low")
+        result, warnings = anthropic_to_xai(
+            {"messages": [], "output_config": {"effort": "max", "format": {"type": "json"}}}
+        )
+        assert result["reasoning"] == {"effort": "low"}
+        assert any(w.startswith("Dropped unsupported output_config.format") for w in warnings)
+
+    def test_gated_model_still_warns_on_dropped_subkey(self, monkeypatch):
+        """A pre-4.6 model omits reasoning.effort entirely (the gate), but an unsupported
+        output_config subkey is still a loss — the drop warning must fire regardless of the
+        effort gate short-circuit."""
+        monkeypatch.setenv("XAI_MODEL", "grok-4.20")
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, warnings = anthropic_to_xai(
+            {"messages": [], "output_config": {"effort": "max", "format": {"type": "json"}}}
+        )
+        assert "reasoning" not in result
+        assert any(w.startswith("Dropped unsupported output_config.format") for w in warnings)
+
+    def test_nonstring_effort_logged_as_type_not_contents(self, monkeypatch):
+        """A malformed non-string effort is represented by TYPE, never by its contents.
+
+        _safe_token stringifying a dict would copy up to 64 chars of it — e.g. a secret the
+        caller wrongly nested under effort — into the warning and the structural trace. The
+        oracle: the notice names the type '<dict>' and never contains the nested value.
+        """
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, warnings = anthropic_to_xai(
+            {"messages": [], "output_config": {"effort": {"api_key": "sk-leak"}}}
+        )
+        assert result["reasoning"] == {"effort": "low"}
+        assert any("<dict>" in w for w in warnings)
+        assert not any("sk-leak" in w for w in warnings)
+
+    def test_scalar_effort_coerced_literally_not_type_tagged(self, monkeypatch):
+        """A malformed SCALAR effort renders as its own value, not a bare type tag.
+
+        The container guard exists only to stop a dict/list copying its nested contents
+        into the log; a scalar (int/None/bool) has no contents to hide, and a missing or
+        mistyped key is far more diagnosable as its literal value. The oracle: an int effort
+        surfaces as '9' in the notice, never as '<int>' — pinning the scalar arm of the
+        container-vs-scalar fork that the '<dict>' test pins on the other side.
+        """
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, warnings = anthropic_to_xai({"messages": [], "output_config": {"effort": 9}})
+        assert result["reasoning"] == {"effort": "low"}
+        assert any("'9'" in w for w in warnings)
+        assert not any("<int>" in w for w in warnings)
+
     # -- max output tokens ----------------------------------------------------
 
     def test_max_tokens_maps_to_max_output_tokens(self):
@@ -1420,9 +1522,12 @@ class TestRequestTranslation:
 
     # -- stripped keys / cache_control ---------------------------------------
 
-    def test_output_config_stripped_with_warning(self):
-        _, warnings = anthropic_to_xai({"messages": [], "output_config": {"x": 1}})
-        assert any("output_config" in w for w in warnings)
+    def test_output_config_noneffort_subkey_is_lossy_warning(self):
+        """A non-effort output_config subkey has no Responses equivalent -> a lossy warning
+        naming it; output_config is never forwarded into the result."""
+        result, warnings = anthropic_to_xai({"messages": [], "output_config": {"x": 1}})
+        assert "output_config" not in result
+        assert any("output_config.x" in w for w in warnings)
 
     def test_thinking_config_drop_mode_warns_stripped(self, monkeypatch):
         """In drop mode a top-level thinking config is reported as stripped."""
