@@ -2,6 +2,19 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-08-24
+
+### fix: honor output_config.effort and quiet routine translation notices ([PR #17](https://github.com/axdel/claude-bridge/pull/17))
+The bridge now honors the per-request output_config.effort that Claude Code sends, mapping it to each provider reasoning.effort (OpenAI 1:1 default max; xAI clamps max and xhigh to high, precedence env-override then caller then low, model-gated to grok-4.6+) instead of discarding it for a static value that silently pinned grok to low. Separately, routine translation notices are demoted to DEBUG while genuinely-lossy ones stay WARNING, so the shared bridge stderr no longer floods the Claude Code TUI on every request.
+
+- [`581aab4`](https://github.com/axdel/claude-bridge/commit/581aab4) Record D-ROUTER-002 — retain blanket output_config failover block
+- [`8f53026`](https://github.com/axdel/claude-bridge/commit/8f53026) Type-tag only container tokens in _safe_token, coerce scalars literally
+- [`b8becc4`](https://github.com/axdel/claude-bridge/commit/b8becc4) Always diagnose dropped output_config subkeys on xAI, independent of effort
+- [`1dbc4f2`](https://github.com/axdel/claude-bridge/commit/1dbc4f2) Classify translation notices by anchored prefix, not substring
+- [`379a00e`](https://github.com/axdel/claude-bridge/commit/379a00e) Correct cache_control note — caching rides prompt_cache_key, not dropped
+- [`5772e98`](https://github.com/axdel/claude-bridge/commit/5772e98) Correct README effort/output_config claims + record D-EFFORT-001
+- [`2d7c923`](https://github.com/axdel/claude-bridge/commit/2d7c923) Honor output_config.effort and quiet routine translation notices
+
 ## 2026-08-23
 
 ### feat: unify grok and codex on the native provider client protocol ([PR #16](https://github.com/axdel/claude-bridge/pull/16))
