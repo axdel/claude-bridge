@@ -248,16 +248,83 @@ class TestAnthropicToOpenaiStripping:
         _, warnings = anthropic_to_openai(request)
         assert any("drop" in w.lower() and "thinking" in w.lower() for w in warnings)
 
-    def test_output_config_stripped(self):
+    def test_output_config_never_leaks_into_result(self):
+        """output_config is consumed (effort mapped), never forwarded to the Responses
+        request — it has no top-level Responses equivalent. Its effort still maps through."""
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
-            "output_config": {"format": "json"},
+            "output_config": {"effort": "high", "format": {"type": "json_schema"}},
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, warnings = anthropic_to_openai(request)
         assert "output_config" not in result
-        assert any("output_config" in w for w in warnings)
+        assert result["reasoning"] == {"effort": "high"}
+        assert any("format" in w for w in warnings)
+
+    # -- output_config.effort mapping (GPT-5.6 shares Anthropic's vocabulary) --
+    # Oracle: GPT-5.6 accepts low/medium/high/xhigh/max — the same set Anthropic's
+    # output_config.effort uses — so a recognized caller effort maps 1:1. Expected
+    # values derive from that shared vocabulary, never from running the translator.
+
+    def test_output_config_effort_low_maps_1to1(self):
+        """A caller effort below max maps straight through — proving the effort is the
+        caller's, not the old hardcoded 'max'."""
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "output_config": {"effort": "low"},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, _ = anthropic_to_openai(request)
+        assert result["reasoning"] == {"effort": "low"}
+
+    def test_output_config_effort_max_maps_1to1(self):
+        """The real Claude Code case: effort=max maps 1:1 to reasoning.effort=max."""
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, _ = anthropic_to_openai(request)
+        assert result["reasoning"] == {"effort": "max"}
+
+    def test_no_output_config_defaults_to_max(self):
+        """With no output_config the effort defaults to max (prior behavior preserved)."""
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, warnings = anthropic_to_openai(request)
+        assert result["reasoning"] == {"effort": "max"}
+        assert not any("output_config" in w for w in warnings)
+
+    def test_output_config_format_subkey_is_lossy_warning(self):
+        """A non-effort subkey (structured-output format) has no Responses equivalent →
+        surfaces a warning naming it; effort still defaults to max."""
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "output_config": {"format": {"type": "json_schema"}},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, warnings = anthropic_to_openai(request)
+        assert result["reasoning"] == {"effort": "max"}
+        assert any("format" in w for w in warnings)
+
+    def test_output_config_unrecognized_effort_defaults_max_with_warning(self):
+        """A garbage/future effort value defaults to max and surfaces a warning naming it."""
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "output_config": {"effort": "turbo"},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, warnings = anthropic_to_openai(request)
+        assert result["reasoning"] == {"effort": "max"}
+        assert any("turbo" in w for w in warnings)
 
     def test_cache_control_stripped_from_content_block(self):
         request = {

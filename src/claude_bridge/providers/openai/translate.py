@@ -22,7 +22,13 @@ MODEL_MAP: dict[str, str] = {}
 DEFAULT_MODEL = "gpt-5.6-sol"
 GPT_TOKEN_COUNT_MULTIPLIER = 1.1
 
-_STRIPPED_KEYS = ("output_config",)
+# Anthropic output_config.effort vocabulary (Opus 4.6: low/medium/high/max; 4.7 adds xhigh).
+# GPT-5.6's reasoning.effort accepts the SAME set, so a recognized caller effort maps 1:1.
+_ANTHROPIC_EFFORT_VALUES = frozenset({"low", "medium", "high", "xhigh", "max"})
+# Default when the caller sends no effort — max preserves the prior always-max behavior and
+# matches "max everywhere". Claude Code always sends output_config.effort, so this is the
+# non-Claude-Code caller path only.
+_DEFAULT_OPENAI_EFFORT = "max"
 
 # Reasoning mode: "passthrough" preserves thinking blocks, "drop" strips them.
 _REASONING_MODE = config.reasoning_mode()
@@ -453,6 +459,33 @@ def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
     return fields, warnings
 
 
+def _resolve_openai_effort(request: dict, warnings: list[str]) -> str:
+    """Resolve ``reasoning.effort`` from the caller's ``output_config``, defaulting to max.
+
+    GPT-5.6 shares Anthropic's effort vocabulary, so a recognized ``output_config.effort``
+    maps 1:1. Any other ``output_config`` subkey (e.g. structured-output ``format``) has no
+    Responses equivalent and surfaces a warning; an unrecognized effort value defaults to
+    max with a warning naming it. A safe-token wrapper neutralizes the client-controlled
+    value before it reaches a log line or trace (CWE-117).
+    """
+    output_config = request.get("output_config")
+    if not isinstance(output_config, dict):
+        return _DEFAULT_OPENAI_EFFORT
+    for key in sorted(output_config):
+        if key != "effort":
+            warnings.append(f"Dropped unsupported output_config.{_safe_token(key)}")
+    effort = output_config.get("effort")
+    if effort is None:
+        return _DEFAULT_OPENAI_EFFORT
+    if isinstance(effort, str) and effort in _ANTHROPIC_EFFORT_VALUES:
+        return effort
+    warnings.append(
+        f"Unrecognized output_config.effort '{_safe_token(effort)}', "
+        f"using default '{_DEFAULT_OPENAI_EFFORT}'"
+    )
+    return _DEFAULT_OPENAI_EFFORT
+
+
 def anthropic_to_openai(
     request: dict, capabilities: ProviderCapabilities = _TEXT_ONLY_CAPABILITIES
 ) -> tuple[dict, list[str]]:
@@ -468,10 +501,10 @@ def anthropic_to_openai(
     """
     warnings: list[str] = []
 
-    # Strip unsupported top-level keys
-    for key in _STRIPPED_KEYS:
-        if key in request:
-            warnings.append(f"Stripped unsupported key '{key}' from request")
+    # reasoning.effort — honor the caller's output_config.effort (1:1 with GPT-5.6's
+    # vocabulary), defaulting to max. Replaces the old blanket strip of output_config: the
+    # caller's per-request effort is a real instruction, not an unsupported key to discard.
+    effort = _resolve_openai_effort(request, warnings)
 
     # Handle thinking config based on reasoning mode
     if "thinking" in request:
@@ -493,7 +526,7 @@ def anthropic_to_openai(
     # its required reasoning item".
     result: dict = {
         "model": translated_model,
-        "reasoning": {"effort": "max"},
+        "reasoning": {"effort": effort},
         "store": False,
         "stream": True,
         "include": ["reasoning.encrypted_content"],

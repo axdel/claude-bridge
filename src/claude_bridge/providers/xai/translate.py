@@ -21,8 +21,18 @@ from claude_bridge.provider import ProviderCapabilities
 # replayed by the provider — not this text path. Read once at import, like openai.py.
 _XAI_REASONING_MODE = config.reasoning_mode()
 
-# Top-level Anthropic request keys with no xAI Responses equivalent.
-_XAI_STRIPPED_KEYS = ("output_config",)
+# Clamp Anthropic's output_config.effort (low/medium/high/xhigh/max) to grok-4.6's supported
+# set (low/medium/high). grok has no max/xhigh, so both map to high — the closest supported
+# effort ("the alternative to max"). A value outside this table is unrecognized and falls
+# back to the default. Duplicated (not shared) from the OpenAI clamp intent per D-XAI-002
+# provider independence — grok's clamp differs from OpenAI's 1:1 map, so there is nothing to share.
+_XAI_EFFORT_CLAMP = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
 
 # Content-block types that carry media inside a tool_result. When the provider declares
 # ``supports_tool_output_content_parts`` the media is forwarded as real Responses content
@@ -421,6 +431,61 @@ def _model_accepts_reasoning_effort(model: str) -> bool:
     return version is None or version >= _XAI_EFFORT_MIN_VERSION
 
 
+def _map_caller_effort(request: dict, warnings: list[str]) -> str | None:
+    """Clamp the caller's ``output_config.effort`` to grok's set, or None if absent/unrecognized.
+
+    A non-effort ``output_config`` subkey (e.g. structured-output ``format``) has no Responses
+    equivalent and surfaces a lossy warning. ``max``/``xhigh`` clamp to ``high`` with a routine
+    notice — it fires on every Claude Code request, so a WARNING here would re-create the flood
+    the emitter classification exists to kill. An unrecognized effort returns None (fall through
+    to the default) with a warning naming the raw value (safe-token, CWE-117).
+    """
+    output_config = request.get("output_config")
+    if not isinstance(output_config, dict):
+        return None
+    for key in sorted(output_config):
+        if key != "effort":
+            warnings.append(f"Dropped unsupported output_config.{_safe_token(key)}")
+    raw = output_config.get("effort")
+    if raw is None:
+        return None
+    clamped = _XAI_EFFORT_CLAMP.get(raw) if isinstance(raw, str) else None
+    if clamped is None:
+        warnings.append(
+            f"Unrecognized output_config.effort '{_safe_token(raw)}', "
+            f"using default '{config.DEFAULT_XAI_REASONING_EFFORT}'"
+        )
+        return None
+    if clamped != raw:
+        warnings.append(f"output_config.effort '{raw}' clamped to '{clamped}' (grok max effort)")
+    return clamped
+
+
+def _resolve_xai_effort(request: dict, model: str, warnings: list[str]) -> str | None:
+    """Resolve grok ``reasoning.effort``: env override > caller's clamped effort > default.
+
+    Returns None for models that 400 on the field (the pre-4.6 gate), so the caller omits it
+    entirely. ``XAI_REASONING_EFFORT`` is an explicit operator pin that wins over the caller's
+    per-request effort. Otherwise the caller's ``output_config.effort`` is clamped to grok's
+    set; absent that, the ``low`` latency default applies — never the old behavior where the
+    env default silently forced ``low`` and downgraded a caller's ``max``.
+    """
+    if not _model_accepts_reasoning_effort(model):
+        return None
+    override = config.xai_reasoning_effort_override(
+        on_invalid=lambda raw: warnings.append(
+            f"Invalid XAI_REASONING_EFFORT={raw!r}; using request effort or default "
+            f"'{config.DEFAULT_XAI_REASONING_EFFORT}'"
+        )
+    )
+    if override is not None:
+        return override
+    caller = _map_caller_effort(request, warnings)
+    if caller is not None:
+        return caller
+    return config.DEFAULT_XAI_REASONING_EFFORT
+
+
 def anthropic_to_xai(
     request: dict, capabilities: ProviderCapabilities = _XAI_TEXT_ONLY_CAPABILITIES
 ) -> tuple[dict, list[str]]:
@@ -442,10 +507,6 @@ def anthropic_to_xai(
     """
     warnings: list[str] = []
 
-    for key in _XAI_STRIPPED_KEYS:
-        if key in request:
-            warnings.append(f"Stripped unsupported key '{key}' from request")
-
     if "thinking" in request:
         if _XAI_REASONING_MODE == "drop":
             warnings.append("Stripped 'thinking' config (reasoning_mode=drop)")
@@ -464,19 +525,14 @@ def anthropic_to_xai(
         "include": ["reasoning.encrypted_content"],
     }
 
-    # reasoning.effort tunes grok-4.6+ thinking length (low by default — a latency choice).
-    # Model-gated: pre-4.6 models 400 on the field (field_effort_low.json). An invalid
-    # XAI_REASONING_EFFORT override falls back to the default and surfaces as a translation
-    # warning rather than shipping an unrecognized effort upstream.
-    if _model_accepts_reasoning_effort(model):
-        result["reasoning"] = {
-            "effort": config.xai_reasoning_effort(
-                on_invalid=lambda raw: warnings.append(
-                    f"Invalid XAI_REASONING_EFFORT={raw!r}; using default "
-                    f"'{config.DEFAULT_XAI_REASONING_EFFORT}'"
-                )
-            )
-        }
+    # reasoning.effort tunes grok-4.6+ thinking length. Honors the caller's
+    # output_config.effort (clamped max/xhigh -> high), with XAI_REASONING_EFFORT as an
+    # operator override and low as the absent-caller default. Model-gated: pre-4.6 models
+    # 400 on the field (field_effort_low.json), so _resolve_xai_effort returns None and the
+    # key is omitted entirely.
+    effort = _resolve_xai_effort(request, model, warnings)
+    if effort is not None:
+        result["reasoning"] = {"effort": effort}
 
     # Anthropic max_tokens -> Responses max_output_tokens. grok-4.6 has no fixed text cap, so
     # forwarding Claude's limit keeps slow turns bounded; omitted when absent or non-positive.
