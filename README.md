@@ -259,7 +259,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
 | `XAI_MODEL` | `grok-4.6` | xAI Grok model id used by the `xai` provider (pinned; set `grok-build` for the rolling latest-coding alias) |
 | `XAI_CLIENT_VERSION` | highest installed grok CLI bundle (floor `0.1.202`) | Override for the `x-grok-client-version` header the cli-chat-proxy gates on; when unset, resolved from the newest `~/.grok/downloads/grok-<ver>-*` bundle |
-| `XAI_REASONING_EFFORT` | `low` | xAI `reasoning.effort` for grok-4.6+ (`low` / `medium` / `high`); sent only to models that accept it, omitted for pre-4.6; an invalid value falls back to the default |
+| `XAI_REASONING_EFFORT` | _(caller effort; else `low`)_ | Operator override for xAI `reasoning.effort` on grok-4.6+ (`low` / `medium` / `high`). When set it wins over the caller's per-request effort; when unset or invalid the caller's `output_config.effort` is honored (clamped `max`/`xhigh` → `high`), falling back to `low` only if the caller sends none. Omitted for pre-4.6 models that 400 on it |
 | `REASONING_MODE` | `passthrough` | Thinking-block handling for OpenAI and xAI: `passthrough` preserves tagged thinking text, `drop` strips it |
 | `LOG_LEVEL` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. The `claude-grok` / `claude-codex` launchers default to `WARNING` — upstream timeouts, transport errors, and failovers reach the terminal without `--debug`; raw `python -m claude_bridge` defaults to `INFO`. |
 | `CONNECT_TIMEOUT` | `10.0` | Data-plane TCP connect timeout in seconds (httpx transport) — a dead connect fails fast; invalid, zero, or negative values fall back to the default |
@@ -340,7 +340,7 @@ translation rather than importing OpenAI's, because cross-provider imports are f
 | Auth | `~/.grok/auth.json` OIDC bearer + refresh (`grok login`); no API key |
 | Client gate | `x-grok-client-version` (auto-resolved from the installed grok CLI, floor `0.1.202`) + `grok-cli` client identifier |
 | Reasoning continuity | encrypted reasoning cached in memory, keyed by `call_id`, echoed across tool turns (never persisted or logged) |
-| Reasoning effort | `reasoning.effort` (default `low`, a latency choice) sent to grok-4.6+; omitted for pre-4.6 models that 400 on it |
+| Reasoning effort | `reasoning.effort` derived from the caller's `output_config.effort`, clamped `max`/`xhigh` → `high` (grok's max), sent to grok-4.6+; `XAI_REASONING_EFFORT` overrides it, `low` when the caller sends none; omitted for pre-4.6 models that 400 on it |
 | Tool linkage | `call_id` alone — cli-chat-proxy has no separate `id` |
 | Token multiplier | `1.0` — subscription-metered, so no OpenAI-compat scaling |
 | Media | image + document (PDF) input and array-form tool output forwarded as `input_image` / `input_file` |
@@ -360,7 +360,7 @@ tracked registry instead of duplicating decision rows.
 
 - Claude Code's startup banner always shows "Sonnet 4.6" regardless of actual model
 - OpenAI and xAI `thinking` blocks are passed through as tagged text by default — set `REASONING_MODE=drop` to strip them
-- `output_config` and `cache_control` hints are stripped with a warning
+- `output_config.effort` is honored — mapped to the provider's `reasoning.effort` (OpenAI 1:1; Grok clamps `max`/`xhigh` → `high`); other `output_config` subkeys (e.g. structured-output `format`) are dropped with a warning, while `cache_control` prompt-caching hints are silently ignored (no Responses equivalent)
 - Token estimation is approximate (~bytes/3.5), not exact tokenization
 - Streaming stats don't include token counts (only latency)
 - Failover is blocked during active tool-use turns (by design — prevents broken tool state)
