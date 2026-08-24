@@ -4,6 +4,9 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-08-24
 
+### v0.10.0 — HTTP/2 Client Parity
+Release v0.10.0.
+
 ### fix: demote only the output_config.format drop to DEBUG, keep other subkey drops loud ([PR #18](https://github.com/axdel/claude-bridge/pull/18))
 Stops the per-request output_config.format WARNING from flooding the Claude Code TUI (demoted to DEBUG by exact match), while keeping meaningful subkey drops like task_budget loud at WARNING.
 
