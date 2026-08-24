@@ -1,9 +1,12 @@
 """Tests for translation-warning log-level classification (``request_view``).
 
 The bug these guard: routine, per-request translation notices (thinking passthrough,
-effort clamp) were logged at WARNING and — because the launchers share bridge stderr
-with the Claude Code TUI at LOG_LEVEL=WARNING — flooded the terminal. The emitter now
-routes routine notices to DEBUG and keeps genuinely-lossy ones at WARNING.
+effort clamp, and dropping an unsupported output_config subkey such as ``format``) were
+logged at WARNING and — because the launchers share bridge stderr with the Claude Code
+TUI at LOG_LEVEL=WARNING — flooded the terminal. The emitter now routes routine notices
+to DEBUG and keeps genuinely-lossy ones (content/tool drops, unrecognized values) at
+WARNING. Dropping an unsupported ``output_config`` hint is expected, non-actionable
+bridge behavior — the trace still records it — so the whole subkey-drop class is routine.
 
 Oracle: the expected log level for each message class comes from the classification
 spec (routine -> DEBUG=10, lossy/unknown -> WARNING=30), never from running the emitter.
@@ -52,9 +55,20 @@ class TestTranslationWarningLevels:
         )
         assert [r.levelno for r in records] == [logging.WARNING]
 
-    def test_lossy_format_subkey_notice_logged_at_warning(self, capture_logger):
+    def test_dropped_output_config_subkey_logged_at_debug(self, capture_logger):
+        """Dropping an unsupported output_config subkey fires every request on normal
+        Claude Code traffic (it sends output_config.format) and is non-actionable, so it
+        is routine -> DEBUG. The trace still records it. This is the exact TUI-flood case."""
         records = capture_logger(_LOGGER_NAME)
         emit_translation_warnings(["Dropped unsupported output_config.format"], {})
+        assert [r.levelno for r in records] == [logging.DEBUG]
+
+    def test_non_output_config_dropped_notice_stays_warning(self, capture_logger):
+        """Specificity guard: the routine prefix is ``Dropped unsupported output_config.``,
+        NOT every ``Dropped`` notice. A genuine content/media drop is real capability loss
+        the operator must see, so it stays WARNING — proving the demotion did not overreach."""
+        records = capture_logger(_LOGGER_NAME)
+        emit_translation_warnings(["Dropped image content block (provider rejects media)"], {})
         assert [r.levelno for r in records] == [logging.WARNING]
 
     def test_unknown_notice_defaults_to_warning(self, capture_logger):
@@ -80,19 +94,20 @@ class TestTranslationWarningLevels:
         )
         assert [r.levelno for r in records] == [logging.WARNING]
 
-    def test_lossy_subkey_carrying_routine_marker_stays_warning(self, capture_logger):
-        """A crafted ``output_config`` subkey name must not smuggle its drop-notice to DEBUG.
+    def test_dropped_subkey_with_crafted_name_stays_debug(self, capture_logger):
+        """A crafted subkey name cannot escape the routine classification back to WARNING.
 
-        The subkey name is client-controlled and ends the 'Dropped unsupported' notice. A
-        caller adding a subkey named ``x (reasoning_mode=drop)`` embeds a routine marker in
-        a lossy warning. The oracle: the notice starts with ``Dropped`` — a lossy prefix —
-        so it stays WARNING regardless of the embedded key text.
+        The whole ``output_config`` subkey-drop class is routine. The subkey name is
+        client-controlled and interpolated AFTER the fixed prefix ``Dropped unsupported
+        output_config.``, so ``startswith`` matches on the fixed text alone — an embedded
+        marker cannot change the class either way, and ``_safe_token`` sanitizes the name
+        against log injection (CWE-117). Oracle: routine subkey drop -> DEBUG.
         """
         records = capture_logger(_LOGGER_NAME)
         emit_translation_warnings(
             ["Dropped unsupported output_config.x (reasoning_mode=drop)"], {}
         )
-        assert [r.levelno for r in records] == [logging.WARNING]
+        assert [r.levelno for r in records] == [logging.DEBUG]
 
     def test_mixed_batch_splits_levels(self, capture_logger):
         records = capture_logger(_LOGGER_NAME)
@@ -108,7 +123,7 @@ class TestTranslationWarningLevels:
             levels["Translation: Thinking config passed through (reasoning_mode=passthrough)"]
             == logging.DEBUG
         )
-        assert levels["Translation: Dropped unsupported output_config.format"] == logging.WARNING
+        assert levels["Translation: Dropped unsupported output_config.format"] == logging.DEBUG
 
 
 class TestRealTranslatorNoFlood:
@@ -119,13 +134,18 @@ class TestRealTranslatorNoFlood:
     """
 
     def _claude_code_request(self) -> dict:
-        # The shape empirically captured from claude-opus-4-8 (captured_request.json):
-        # output_config.effort=max + adaptive thinking. The two per-request notices this
-        # produces (thinking passthrough, effort handling) must not reach WARNING.
+        # A normal Claude Code request as seen on the wire: output_config carries BOTH
+        # effort=max AND format (a structured-output request) alongside adaptive thinking.
+        # `format` is proven from live TUI traffic — the "Dropped unsupported
+        # output_config.format" WARNING flood this branch fixes; its value shape matches
+        # the suite's other format fixtures (test_translate.py). Every per-request notice
+        # this produces — thinking passthrough, effort handling, AND the format subkey drop
+        # — must stay below WARNING so the shared TUI is not flooded. Omitting `format`
+        # here is what let the flood slip past this very coupling test before.
         return {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
-            "output_config": {"effort": "max"},
+            "output_config": {"effort": "max", "format": {"type": "json_schema"}},
             "thinking": {"type": "adaptive"},
             "messages": [{"role": "user", "content": "Hi"}],
         }
