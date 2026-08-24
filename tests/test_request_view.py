@@ -138,17 +138,25 @@ class TestRealTranslatorNoFlood:
 
     def _claude_code_request(self) -> dict:
         # A normal Claude Code request as seen on the wire: output_config carries BOTH
-        # effort=max AND format (a structured-output request) alongside adaptive thinking.
-        # `format` is proven from live TUI traffic — the "Dropped unsupported
-        # output_config.format" WARNING flood this branch fixes; its value shape matches
-        # the suite's other format fixtures (test_translate.py). Every per-request notice
-        # this produces — thinking passthrough, effort handling, AND the format subkey drop
-        # — must stay below WARNING so the shared TUI is not flooded. Omitting `format`
-        # here is what let the flood slip past this very coupling test before.
+        # effort=max AND format (a structured-output request, full {type, schema} shape)
+        # alongside adaptive thinking. `format` is proven from live TUI traffic — the
+        # "Dropped unsupported output_config.format" WARNING flood this branch fixes. The
+        # combined effort+format+thinking shape is a deliberate superset: the emitter
+        # classifies each notice independently, so one request exercising all three routine
+        # notices is a stronger coupling probe than three separate ones. Every notice it
+        # produces — thinking passthrough, effort handling, AND the format subkey drop —
+        # must stay below WARNING so the shared TUI is not flooded. Omitting `format` here
+        # is what let the flood slip past this very coupling test before.
         return {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
-            "output_config": {"effort": "max", "format": {"type": "json_schema"}},
+            "output_config": {
+                "effort": "max",
+                "format": {
+                    "type": "json_schema",
+                    "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+                },
+            },
             "thinking": {"type": "adaptive"},
             "messages": [{"role": "user", "content": "Hi"}],
         }

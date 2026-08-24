@@ -344,6 +344,31 @@ class TestAnthropicToOpenaiStripping:
         assert any("<dict>" in w for w in warnings)
         assert not any("sk-leak" in w for w in warnings)
 
+    def test_control_char_subkey_name_sanitized_in_warning(self):
+        """A control-character output_config subkey NAME is neutralized before it reaches the
+        log/trace — the CWE-117 log-injection defense on the subkey-name path, end to end.
+
+        A JSON object key may legitimately carry an embedded newline or ANSI escape
+        (``json.loads`` accepts ``"format\\ninjected"``), so the subkey name is client-controlled
+        and reaches a warning via ``_safe_token(key)``. Oracle (CWE-117 spec, not the code):
+        non-printable characters are stripped, so the emitted notice is a single line with no
+        newline or ESC — a forged second log record is impossible. Drives the REAL translator so
+        the defense is exercised end to end, not asserted against a hand-built notice.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "output_config": {"format\nInjected: evil\x1b[31m": {"type": "json_schema"}},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        _, warnings = anthropic_to_openai(request)
+        subkey_notices = [w for w in warnings if w.startswith("Dropped unsupported output_config.")]
+        assert subkey_notices
+        for notice in subkey_notices:
+            assert "\n" not in notice
+            assert "\x1b" not in notice
+            assert notice.splitlines() == [notice]
+
     def test_cache_control_stripped_from_content_block(self):
         request = {
             "model": "claude-opus-4-6",
