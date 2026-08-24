@@ -431,21 +431,34 @@ def _model_accepts_reasoning_effort(model: str) -> bool:
     return version is None or version >= _XAI_EFFORT_MIN_VERSION
 
 
-def _map_caller_effort(request: dict, warnings: list[str]) -> str | None:
+def _warn_unsupported_output_config_subkeys(request: dict, warnings: list[str]) -> None:
+    """Append a lossy warning for every ``output_config`` subkey other than ``effort``.
+
+    A non-effort subkey (e.g. structured-output ``format``) has no Responses equivalent and is
+    dropped. This diagnostic is INDEPENDENT of effort selection: it must fire even when the
+    model gate or an env override short-circuits effort resolution before any effort mapping,
+    so an operator always learns what was discarded. Each key is safe-token'd (CWE-117).
+    """
+    output_config = request.get("output_config")
+    if not isinstance(output_config, dict):
+        return
+    for key in sorted(output_config):
+        if key != "effort":
+            warnings.append(f"Dropped unsupported output_config.{_safe_token(key)}")
+
+
+def _clamp_caller_effort(request: dict, warnings: list[str]) -> str | None:
     """Clamp the caller's ``output_config.effort`` to grok's set, or None if absent/unrecognized.
 
-    A non-effort ``output_config`` subkey (e.g. structured-output ``format``) has no Responses
-    equivalent and surfaces a lossy warning. ``max``/``xhigh`` clamp to ``high`` with a routine
-    notice — it fires on every Claude Code request, so a WARNING here would re-create the flood
-    the emitter classification exists to kill. An unrecognized effort returns None (fall through
-    to the default) with a warning naming the raw value (safe-token, CWE-117).
+    ``max``/``xhigh`` clamp to ``high`` with a routine notice — it fires on every Claude Code
+    request, so a WARNING here would re-create the flood the emitter classification exists to
+    kill. An unrecognized effort returns None (fall through to the default) with a warning
+    naming the raw value (safe-token, CWE-117). Resolves the effort value only — unsupported
+    non-effort subkeys are diagnosed separately by ``_warn_unsupported_output_config_subkeys``.
     """
     output_config = request.get("output_config")
     if not isinstance(output_config, dict):
         return None
-    for key in sorted(output_config):
-        if key != "effort":
-            warnings.append(f"Dropped unsupported output_config.{_safe_token(key)}")
     raw = output_config.get("effort")
     if raw is None:
         return None
@@ -464,12 +477,16 @@ def _map_caller_effort(request: dict, warnings: list[str]) -> str | None:
 def _resolve_xai_effort(request: dict, model: str, warnings: list[str]) -> str | None:
     """Resolve grok ``reasoning.effort``: env override > caller's clamped effort > default.
 
-    Returns None for models that 400 on the field (the pre-4.6 gate), so the caller omits it
+    Unsupported non-effort ``output_config`` subkeys are diagnosed FIRST and unconditionally —
+    a dropped ``format`` is a loss whether or not the effort field is subsequently gated or
+    overridden, so its warning must not ride on the effort path's early returns. Effort itself:
+    returns None for models that 400 on the field (the pre-4.6 gate), so the caller omits it
     entirely. ``XAI_REASONING_EFFORT`` is an explicit operator pin that wins over the caller's
     per-request effort. Otherwise the caller's ``output_config.effort`` is clamped to grok's
     set; absent that, the ``low`` latency default applies — never the old behavior where the
     env default silently forced ``low`` and downgraded a caller's ``max``.
     """
+    _warn_unsupported_output_config_subkeys(request, warnings)
     if not _model_accepts_reasoning_effort(model):
         return None
     override = config.xai_reasoning_effort_override(
@@ -480,7 +497,7 @@ def _resolve_xai_effort(request: dict, model: str, warnings: list[str]) -> str |
     )
     if override is not None:
         return override
-    caller = _map_caller_effort(request, warnings)
+    caller = _clamp_caller_effort(request, warnings)
     if caller is not None:
         return caller
     return config.DEFAULT_XAI_REASONING_EFFORT

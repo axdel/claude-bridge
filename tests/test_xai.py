@@ -1070,6 +1070,31 @@ class TestRequestTranslation:
         assert result["reasoning"] == {"effort": "low"}
         assert any("turbo" in w for w in warnings)
 
+    def test_env_override_still_warns_on_dropped_subkey(self, monkeypatch):
+        """An env override short-circuits effort SELECTION, but an unsupported output_config
+        subkey is a loss independent of which effort ships. The drop warning must still fire
+        so the operator learns ``format`` was discarded — the diagnostic and the effort
+        decision are separate concerns."""
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.setenv("XAI_REASONING_EFFORT", "low")
+        result, warnings = anthropic_to_xai(
+            {"messages": [], "output_config": {"effort": "max", "format": {"type": "json"}}}
+        )
+        assert result["reasoning"] == {"effort": "low"}
+        assert any(w.startswith("Dropped unsupported output_config.format") for w in warnings)
+
+    def test_gated_model_still_warns_on_dropped_subkey(self, monkeypatch):
+        """A pre-4.6 model omits reasoning.effort entirely (the gate), but an unsupported
+        output_config subkey is still a loss — the drop warning must fire regardless of the
+        effort gate short-circuit."""
+        monkeypatch.setenv("XAI_MODEL", "grok-4.20")
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, warnings = anthropic_to_xai(
+            {"messages": [], "output_config": {"effort": "max", "format": {"type": "json"}}}
+        )
+        assert "reasoning" not in result
+        assert any(w.startswith("Dropped unsupported output_config.format") for w in warnings)
+
     # -- max output tokens ----------------------------------------------------
 
     def test_max_tokens_maps_to_max_output_tokens(self):
