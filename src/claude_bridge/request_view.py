@@ -344,29 +344,43 @@ def _trace_provider_request(translated: dict, warnings: list[str]) -> None:
         logger.debug("provider request trace failed", exc_info=True)
 
 
-# Routine, expected-every-request translation notices. Thinking is present on essentially
-# every Claude Code request and grok clamps the caller's max on every request, so logging
-# these at WARNING floods the TUI that shares the bridge's stderr. They log at DEBUG instead.
-#
-# Matched by ANCHORED PREFIX, not substring: the lossy notices interpolate client-controlled
-# text (an unrecognized effort value, an unsupported subkey name) that a substring match would
-# let embed a routine marker and smuggle a genuinely-lossy warning down to DEBUG. Every lossy
-# notice instead begins with a distinct fixed word the client cannot control — "Unrecognized",
-# "Dropped", "Unsupported", "Invalid" — none of which is a routine prefix below, so a crafted
-# value cannot forge a routine classification.
-#
-# This is an ALLOWLIST: a notice matching no prefix logs at WARNING, so a genuinely-lossy or
-# unforeseen notice stays loud by default. A translator rewording one of these prefixes without
-# updating this tuple is caught by the request_view coupling tests, not silently re-flooded.
+# Routine, expected-every-request translation notices — logged at DEBUG, not WARNING, because
+# the launchers share the bridge's stderr with the Claude Code TUI and these fire on normal
+# traffic: thinking is on essentially every request, and grok clamps the caller's max on every
+# request. These have a variable tail (a reasoning_mode suffix, an effort value), so they are
+# matched by ANCHORED PREFIX: each prefix is FIXED text and the client-controlled tail appears
+# only AFTER it, so startswith tests the fixed part alone and a crafted value cannot forge or
+# escape a classification.
 _ROUTINE_TRANSLATION_PREFIXES = (
     "Thinking config passed through",  # thinking passed through — every request
     "Stripped 'thinking' config",  # thinking dropped — every request in drop mode
     "output_config.effort '",  # grok effort clamp (max/xhigh -> high) — every request
 )
 
+# Routine notices matched in FULL, not by prefix — the notice text is fixed end-to-end, so we
+# demote EXACTLY it and nothing else. Claude Code sends output_config.format (a structured-output
+# hint the Responses path cannot honor) on every request; its drop is expected, non-actionable,
+# and was the TUI flood this fix targets (amends D-EFFORT-001, which first kept it a WARNING).
+#
+# Exact match is load-bearing, NOT a prefix "Dropped unsupported output_config.": every OTHER
+# subkey drop — e.g. output_config.task_budget, a real token/cost control — is deliberately
+# absent here, so it stays WARNING (loud by default). A class-wide prefix would demote every
+# present and future subkey sight-unseen, which is exactly what this emitter's allowlist contract
+# forbids: an unforeseen lossy notice MUST stay loud. The trace still records every dropped
+# subkey regardless of level, so diagnosability is preserved.
+_ROUTINE_TRANSLATION_MESSAGES = frozenset({"Dropped unsupported output_config.format"})
+
 
 def _is_routine_translation(message: str) -> bool:
-    """True if a translation notice is routine/expected — logged at DEBUG, not WARNING."""
+    """True if a translation notice is routine/expected — logged at DEBUG, not WARNING.
+
+    An ALLOWLIST: a notice matching neither a full routine message nor a routine prefix logs at
+    WARNING, so a genuinely-lossy or unforeseen notice stays loud by default. A translator
+    rewording a routine notice without updating these constants is caught by the request_view
+    coupling tests, not silently re-flooded.
+    """
+    if message in _ROUTINE_TRANSLATION_MESSAGES:
+        return True
     return any(message.startswith(prefix) for prefix in _ROUTINE_TRANSLATION_PREFIXES)
 
 
@@ -376,9 +390,10 @@ def emit_translation_warnings(warnings: list[str], translated: dict) -> None:
 
     Both the streaming and non-streaming request paths route their warnings here so the
     logged warnings and the traced warnings can never drift out of lockstep. Routine notices
-    (thinking passthrough/drop, the grok effort clamp) log at DEBUG to keep the shared TUI
-    quiet; genuinely-lossy notices log at WARNING. The trace always records the full list,
-    so diagnosability is unchanged regardless of log level.
+    (thinking passthrough/drop, the grok effort clamp, the dropped output_config.format hint)
+    log at DEBUG to keep the shared TUI quiet; genuinely-lossy notices (content/tool drops,
+    other dropped output_config subkeys, unrecognized values) log at WARNING. The trace always
+    records the full list, so diagnosability is unchanged regardless of log level.
     """
     for warning in warnings:
         if _is_routine_translation(warning):

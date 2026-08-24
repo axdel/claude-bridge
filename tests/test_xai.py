@@ -1529,6 +1529,29 @@ class TestRequestTranslation:
         assert "output_config" not in result
         assert any("output_config.x" in w for w in warnings)
 
+    def test_control_char_subkey_name_sanitized_in_warning(self):
+        """A control-character output_config subkey NAME is neutralized before it reaches the
+        log/trace — the CWE-117 log-injection defense on the subkey-name path, end to end.
+
+        xAI carries its own ``_safe_token`` (D-XAI-002 provider independence), so the defense
+        is verified independently of OpenAI's. A JSON object key may legitimately carry an
+        embedded newline or ANSI escape (``json.loads`` accepts ``"format\\ninjected"``), so the
+        subkey name is client-controlled and reaches a warning via ``_safe_token(key)``. Oracle
+        (CWE-117 spec, not the code): non-printable characters are stripped, so the emitted
+        notice is a single line with no newline or ESC. Drives the REAL translator.
+        """
+        _, warnings = anthropic_to_xai(
+            {"messages": [], "output_config": {"format\nInjected: evil\x1b[31m": {"type": "json"}}}
+        )
+        subkey_notices = [
+            w for w in warnings if w.startswith("Dropped unsupported output_config.")
+        ]
+        assert subkey_notices
+        for notice in subkey_notices:
+            assert "\n" not in notice
+            assert "\x1b" not in notice
+            assert notice.splitlines() == [notice]
+
     def test_thinking_config_drop_mode_warns_stripped(self, monkeypatch):
         """In drop mode a top-level thinking config is reported as stripped."""
         import claude_bridge.providers.xai.translate as xai_translate

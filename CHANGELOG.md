@@ -4,6 +4,16 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-08-24
 
+### fix: demote only the output_config.format drop to DEBUG, keep other subkey drops loud ([PR #18](https://github.com/axdel/claude-bridge/pull/18))
+Stops the per-request output_config.format WARNING from flooding the Claude Code TUI (demoted to DEBUG by exact match), while keeping meaningful subkey drops like task_budget loud at WARNING.
+
+- [`12c492a`](https://github.com/axdel/claude-bridge/commit/12c492a) Apply ruff format to output_config test files
+- [`21a5321`](https://github.com/axdel/claude-bridge/commit/21a5321) Correct output_config subkey drop log level in Known Limitations
+- [`5181f9e`](https://github.com/axdel/claude-bridge/commit/5181f9e) Drive output_config subkey guards through the real translators for wire fidelity
+- [`0ebf25f`](https://github.com/axdel/claude-bridge/commit/0ebf25f) Demote only the proven output_config.format drop, keep other subkey drops loud
+- [`bdac8ad`](https://github.com/axdel/claude-bridge/commit/bdac8ad) Record decision to log output_config subkey drops at DEBUG
+- [`7ec5c94`](https://github.com/axdel/claude-bridge/commit/7ec5c94) Log dropped output_config subkeys at DEBUG, not WARNING
+
 ### fix: honor output_config.effort and quiet routine translation notices ([PR #17](https://github.com/axdel/claude-bridge/pull/17))
 The bridge now honors the per-request output_config.effort that Claude Code sends, mapping it to each provider reasoning.effort (OpenAI 1:1 default max; xAI clamps max and xhigh to high, precedence env-override then caller then low, model-gated to grok-4.6+) instead of discarding it for a static value that silently pinned grok to low. Separately, routine translation notices are demoted to DEBUG while genuinely-lossy ones stay WARNING, so the shared bridge stderr no longer floods the Claude Code TUI on every request.
 

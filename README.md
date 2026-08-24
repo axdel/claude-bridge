@@ -360,7 +360,7 @@ tracked registry instead of duplicating decision rows.
 
 - Claude Code's startup banner always shows "Sonnet 4.6" regardless of actual model
 - OpenAI and xAI `thinking` blocks are passed through as tagged text by default — set `REASONING_MODE=drop` to strip them
-- `output_config.effort` is honored — mapped to the provider's `reasoning.effort` (OpenAI 1:1; Grok clamps `max`/`xhigh` → `high`); other `output_config` subkeys (e.g. structured-output `format`) are dropped with a warning
+- `output_config.effort` is honored — mapped to the provider's `reasoning.effort` (OpenAI 1:1; Grok clamps `max`/`xhigh` → `high`). Other `output_config` subkeys are dropped: `format` (structured output — Claude Code sends it on every request and the Responses path has no equivalent) is dropped quietly at `DEBUG` so it does not flood the shared TUI, while any other subkey is dropped with a `WARNING`. Every drop is recorded in the structural trace when `CLAUDE_BRIDGE_TRACE_PATH` is set
 - Anthropic per-block `cache_control` markers are dropped, but prompt caching is preserved via a stable per-conversation `prompt_cache_key` (xAI also sends it as the `x-grok-conv-id` header)
 - Token estimation is approximate (~bytes/3.5), not exact tokenization
 - Streaming stats don't include token counts (only latency)
