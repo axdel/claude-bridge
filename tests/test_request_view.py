@@ -107,9 +107,7 @@ class TestTranslationWarningLevels:
         notice is routine -> DEBUG; a prefix-only match is not.
         """
         records = capture_logger(_LOGGER_NAME)
-        emit_translation_warnings(
-            ["Dropped unsupported output_config.format_version"], {}
-        )
+        emit_translation_warnings(["Dropped unsupported output_config.format_version"], {})
         assert [r.levelno for r in records] == [logging.WARNING]
 
     def test_mixed_batch_splits_levels(self, capture_logger):

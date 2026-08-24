@@ -1543,7 +1543,9 @@ class TestRequestTranslation:
         _, warnings = anthropic_to_xai(
             {"messages": [], "output_config": {"format\nInjected: evil\x1b[31m": {"type": "json"}}}
         )
-        subkey_notices = [w for w in warnings if w.startswith("Dropped unsupported output_config.")]
+        subkey_notices = [
+            w for w in warnings if w.startswith("Dropped unsupported output_config.")
+        ]
         assert subkey_notices
         for notice in subkey_notices:
             assert "\n" not in notice

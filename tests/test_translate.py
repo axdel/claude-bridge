@@ -362,7 +362,9 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         _, warnings = anthropic_to_openai(request)
-        subkey_notices = [w for w in warnings if w.startswith("Dropped unsupported output_config.")]
+        subkey_notices = [
+            w for w in warnings if w.startswith("Dropped unsupported output_config.")
+        ]
         assert subkey_notices
         for notice in subkey_notices:
             assert "\n" not in notice
