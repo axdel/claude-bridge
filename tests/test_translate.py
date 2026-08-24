@@ -326,6 +326,24 @@ class TestAnthropicToOpenaiStripping:
         assert result["reasoning"] == {"effort": "max"}
         assert any("turbo" in w for w in warnings)
 
+    def test_nonstring_effort_logged_as_type_not_contents(self):
+        """A malformed non-string effort is represented by TYPE, never by its contents.
+
+        _safe_token stringifying a dict would copy up to 64 chars of it — e.g. a secret the
+        caller wrongly nested under effort — into the warning and the structural trace. The
+        oracle: the notice names the type '<dict>' and never contains the nested value.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "output_config": {"effort": {"api_key": "sk-leak"}},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, warnings = anthropic_to_openai(request)
+        assert result["reasoning"] == {"effort": "max"}
+        assert any("<dict>" in w for w in warnings)
+        assert not any("sk-leak" in w for w in warnings)
+
     def test_cache_control_stripped_from_content_block(self):
         request = {
             "model": "claude-opus-4-6",

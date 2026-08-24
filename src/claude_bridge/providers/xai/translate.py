@@ -81,7 +81,15 @@ def _safe_token(value: object) -> str:
     interpolated into a translation warning that reaches the human log and the
     structural trace. Strips non-printable characters (CWE-117 log injection) and caps
     the length so a hostile type cannot forge log records or flood the trace.
+
+    A container value (a malformed dict/list effort) is reduced to a bare ``<type>``
+    tag: ``str()`` on a container would copy its contents — which may nest a client
+    secret — into the log and trace, so only its type is surfaced, never its value.
+    Scalars coerce to their short, bounded ``str()``: a missing ``type`` key
+    legitimately arrives as ``None`` and must render as ``None`` for diagnosis.
     """
+    if isinstance(value, (dict, list, tuple, set)):
+        return f"<{type(value).__name__}>"
     cleaned = "".join(ch for ch in str(value) if ch.isprintable())
     if len(cleaned) > _SAFE_TOKEN_MAX:
         return cleaned[:_SAFE_TOKEN_MAX] + "..."

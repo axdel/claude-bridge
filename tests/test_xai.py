@@ -1095,6 +1095,38 @@ class TestRequestTranslation:
         assert "reasoning" not in result
         assert any(w.startswith("Dropped unsupported output_config.format") for w in warnings)
 
+    def test_nonstring_effort_logged_as_type_not_contents(self, monkeypatch):
+        """A malformed non-string effort is represented by TYPE, never by its contents.
+
+        _safe_token stringifying a dict would copy up to 64 chars of it — e.g. a secret the
+        caller wrongly nested under effort — into the warning and the structural trace. The
+        oracle: the notice names the type '<dict>' and never contains the nested value.
+        """
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, warnings = anthropic_to_xai(
+            {"messages": [], "output_config": {"effort": {"api_key": "sk-leak"}}}
+        )
+        assert result["reasoning"] == {"effort": "low"}
+        assert any("<dict>" in w for w in warnings)
+        assert not any("sk-leak" in w for w in warnings)
+
+    def test_scalar_effort_coerced_literally_not_type_tagged(self, monkeypatch):
+        """A malformed SCALAR effort renders as its own value, not a bare type tag.
+
+        The container guard exists only to stop a dict/list copying its nested contents
+        into the log; a scalar (int/None/bool) has no contents to hide, and a missing or
+        mistyped key is far more diagnosable as its literal value. The oracle: an int effort
+        surfaces as '9' in the notice, never as '<int>' — pinning the scalar arm of the
+        container-vs-scalar fork that the '<dict>' test pins on the other side.
+        """
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        result, warnings = anthropic_to_xai({"messages": [], "output_config": {"effort": 9}})
+        assert result["reasoning"] == {"effort": "low"}
+        assert any("'9'" in w for w in warnings)
+        assert not any("<int>" in w for w in warnings)
+
     # -- max output tokens ----------------------------------------------------
 
     def test_max_tokens_maps_to_max_output_tokens(self):
