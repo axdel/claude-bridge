@@ -63,6 +63,37 @@ class TestTranslationWarningLevels:
         emit_translation_warnings(["Some brand-new degradation nobody allowlisted"], {})
         assert [r.levelno for r in records] == [logging.WARNING]
 
+    def test_lossy_effort_carrying_routine_marker_stays_warning(self, capture_logger):
+        """A crafted effort value must not smuggle a lossy notice down to DEBUG.
+
+        ``output_config.effort`` is client-controlled and is interpolated verbatim into
+        the lossy 'Unrecognized' notice. A caller sending ``"turbo clamped to high"``
+        embeds the routine marker ``clamped to`` inside a genuinely-lossy warning. The
+        oracle: the notice starts with ``Unrecognized`` — a lossy prefix — so it is loud
+        by default no matter what client text follows. Substring matching classified it
+        DEBUG (the suppression bug); prefix-anchored matching keeps it WARNING.
+        """
+        records = capture_logger(_LOGGER_NAME)
+        emit_translation_warnings(
+            ["Unrecognized output_config.effort 'turbo clamped to high', using default 'max'"],
+            {},
+        )
+        assert [r.levelno for r in records] == [logging.WARNING]
+
+    def test_lossy_subkey_carrying_routine_marker_stays_warning(self, capture_logger):
+        """A crafted ``output_config`` subkey name must not smuggle its drop-notice to DEBUG.
+
+        The subkey name is client-controlled and ends the 'Dropped unsupported' notice. A
+        caller adding a subkey named ``x (reasoning_mode=drop)`` embeds a routine marker in
+        a lossy warning. The oracle: the notice starts with ``Dropped`` — a lossy prefix —
+        so it stays WARNING regardless of the embedded key text.
+        """
+        records = capture_logger(_LOGGER_NAME)
+        emit_translation_warnings(
+            ["Dropped unsupported output_config.x (reasoning_mode=drop)"], {}
+        )
+        assert [r.levelno for r in records] == [logging.WARNING]
+
     def test_mixed_batch_splits_levels(self, capture_logger):
         records = capture_logger(_LOGGER_NAME)
         emit_translation_warnings(

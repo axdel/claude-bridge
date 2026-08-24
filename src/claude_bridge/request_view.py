@@ -347,19 +347,27 @@ def _trace_provider_request(translated: dict, warnings: list[str]) -> None:
 # Routine, expected-every-request translation notices. Thinking is present on essentially
 # every Claude Code request and grok clamps the caller's max on every request, so logging
 # these at WARNING floods the TUI that shares the bridge's stderr. They log at DEBUG instead.
-# This is an ALLOWLIST: any notice NOT matched here logs at WARNING, so a genuinely-lossy or
-# unforeseen notice stays loud by default. A translator rewording one of these strings without
+#
+# Matched by ANCHORED PREFIX, not substring: the lossy notices interpolate client-controlled
+# text (an unrecognized effort value, an unsupported subkey name) that a substring match would
+# let embed a routine marker and smuggle a genuinely-lossy warning down to DEBUG. Every lossy
+# notice instead begins with a distinct fixed word the client cannot control — "Unrecognized",
+# "Dropped", "Unsupported", "Invalid" — none of which is a routine prefix below, so a crafted
+# value cannot forge a routine classification.
+#
+# This is an ALLOWLIST: a notice matching no prefix logs at WARNING, so a genuinely-lossy or
+# unforeseen notice stays loud by default. A translator rewording one of these prefixes without
 # updating this tuple is caught by the request_view coupling tests, not silently re-flooded.
-_ROUTINE_TRANSLATION_MARKERS = (
-    "(reasoning_mode=passthrough)",  # thinking passed through — every request
-    "(reasoning_mode=drop)",  # thinking dropped — every request in drop mode
-    "clamped to",  # grok effort clamp (max/xhigh -> high) — every request
+_ROUTINE_TRANSLATION_PREFIXES = (
+    "Thinking config passed through",  # thinking passed through — every request
+    "Stripped 'thinking' config",  # thinking dropped — every request in drop mode
+    "output_config.effort '",  # grok effort clamp (max/xhigh -> high) — every request
 )
 
 
 def _is_routine_translation(message: str) -> bool:
     """True if a translation notice is routine/expected — logged at DEBUG, not WARNING."""
-    return any(marker in message for marker in _ROUTINE_TRANSLATION_MARKERS)
+    return any(message.startswith(prefix) for prefix in _ROUTINE_TRANSLATION_PREFIXES)
 
 
 def emit_translation_warnings(warnings: list[str], translated: dict) -> None:
