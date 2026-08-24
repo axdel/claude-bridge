@@ -22,4 +22,4 @@ Adding a new provider: create a ``providers/<name>/`` sub-package (see
 ``--provider <name>``.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
