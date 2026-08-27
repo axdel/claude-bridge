@@ -174,11 +174,13 @@ async def _pump_passthrough_stream(
 ) -> StreamOutcome:
     """Forward validated upstream SSE bytes to the client unchanged until exhausted.
 
-    A mid-stream transport error (e.g. the idle timeout firing on a stalled upstream,
-    INV-SSE-01) leaves the client on a committed 200, so it is flagged ``error=True``
-    rather than restated as a status.
+    SSE headers are written inside this ``try`` so a raise still ``aclose``s the
+    response. A mid-stream transport error (e.g. the idle timeout firing on a stalled
+    upstream, INV-SSE-01) leaves the client on a committed 200, so it is flagged
+    ``error=True`` rather than restated as a status.
     """
     try:
+        write_sse_headers(writer)
         async for chunk in response.aiter_bytes():
             await safe_write(writer, chunk)
     except ClientDisconnected:
@@ -213,7 +215,6 @@ async def stream_passthrough(
     if guard is not None:
         return guard
 
-    write_sse_headers(writer)
     return await _pump_passthrough_stream(response, writer)
 
 
@@ -335,11 +336,13 @@ async def _pump_provider_stream(
     """Translate a validated provider SSE stream to Anthropic events and write them.
 
     SSE headers are written here — only after ``validate_stream_response`` confirmed a
-    real stream, so no downstream byte precedes a failed body. Tracks token usage and
-    whether a terminal ``message_stop`` was seen; a stream ending without one is a
-    semantic failure (``error=True``) even though the client already received a 200.
+    real stream, so no downstream byte precedes a failed body. The header write sits
+    inside the outer ``try`` (so ``aclose`` always runs) but outside the body-exception
+    handlers: a raise there has not committed an SSE body and must propagate, not become
+    a mid-stream error event. Tracks token usage and whether a terminal ``message_stop``
+    was seen; a stream ending without one is a semantic failure (``error=True``) even
+    though the client already received a 200.
     """
-    write_sse_headers(writer)
 
     async def _raw_chunks() -> AsyncIterator[bytes]:
         async for chunk in response.aiter_bytes():
@@ -349,26 +352,28 @@ async def _pump_provider_stream(
     tokens_out = 0
     saw_terminal = False
     try:
-        async for anthropic_event in provider.translate_stream(_raw_chunks()):
-            event_name = anthropic_event["event"]
-            data = anthropic_event["data"]
-            tokens_in, tokens_out = _accumulate_usage(event_name, data, tokens_in, tokens_out)
-            if event_name == "message_stop":
-                saw_terminal = True
-            trace_stream_event(anthropic_event)
-            sse_bytes = format_anthropic_sse(event_name, data)
-            if event_name not in _QUIET_SSE_EVENTS:
-                logger.debug("SSE -> %s", event_name)
-            await safe_write(writer, sse_bytes)
-    except ClientDisconnected:
-        logger.debug("Client disconnected during provider stream")
-        return StreamOutcome(499, tokens_in, tokens_out)
-    except httpx.TransportError as exc:
-        logger.error("Provider stream transport error: %s", exc)
-        return await _emit_stream_error(writer, tokens_in, tokens_out)
-    except Exception:
-        logger.exception("Unexpected error during provider stream")
-        return await _emit_stream_error(writer, tokens_in, tokens_out)
+        write_sse_headers(writer)
+        try:
+            async for anthropic_event in provider.translate_stream(_raw_chunks()):
+                event_name = anthropic_event["event"]
+                data = anthropic_event["data"]
+                tokens_in, tokens_out = _accumulate_usage(event_name, data, tokens_in, tokens_out)
+                if event_name == "message_stop":
+                    saw_terminal = True
+                trace_stream_event(anthropic_event)
+                sse_bytes = format_anthropic_sse(event_name, data)
+                if event_name not in _QUIET_SSE_EVENTS:
+                    logger.debug("SSE -> %s", event_name)
+                await safe_write(writer, sse_bytes)
+        except ClientDisconnected:
+            logger.debug("Client disconnected during provider stream")
+            return StreamOutcome(499, tokens_in, tokens_out)
+        except httpx.TransportError as exc:
+            logger.error("Provider stream transport error: %s", exc)
+            return await _emit_stream_error(writer, tokens_in, tokens_out)
+        except Exception:
+            logger.exception("Unexpected error during provider stream")
+            return await _emit_stream_error(writer, tokens_in, tokens_out)
     finally:
         await response.aclose()
     return StreamOutcome(200, tokens_in, tokens_out, error=not saw_terminal)

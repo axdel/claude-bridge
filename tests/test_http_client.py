@@ -9,7 +9,10 @@ error, or count its own invocations to prove retry behaviour.
 
 from __future__ import annotations
 
+import errno
 import json
+import logging
+import socket
 
 import httpx
 import pytest
@@ -19,6 +22,47 @@ from claude_bridge.config import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_STREAM_IDLE_TIMEOUT,
 )
+
+
+def _resolver_connect_error() -> httpx.ConnectError:
+    """httpx-wrapped Darwin/POSIX getaddrinfo failure (operator errno 8).
+
+    Oracle: ``socket.EAI_NONAME`` is the portable constant; Darwin renders it as
+    errno 8 with the exact log string the operator pasted. httpx wraps the
+    ``gaierror`` in ``ConnectError``, so the cause chain is the production shape.
+    """
+    cause = socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+    exc = httpx.ConnectError(str(cause))
+    exc.__cause__ = cause
+    return exc
+
+
+def _refused_connect_error() -> httpx.ConnectError:
+    """A connect failure that is NOT a DNS resolver problem."""
+    cause = OSError(errno.ECONNREFUSED, "Connection refused")
+    exc = httpx.ConnectError("refused")
+    exc.__cause__ = cause
+    return exc
+
+
+class _LogCapture(logging.Handler):
+    """Capture WARNING+ records on ``claude_bridge.http_client``.
+
+    The bridge logger sets ``propagate=False`` once configured, so pytest's
+    ``caplog`` never sees these records; a handler on the named logger is the
+    oracle path (same pattern as ``test_proxy._WarningCapture``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    @property
+    def messages(self) -> list[str]:
+        return [record.getMessage() for record in self.records]
 
 
 def _client_with(handler) -> httpx.AsyncClient:
@@ -274,6 +318,142 @@ async def test_post_provider_returns_502_after_retry_exhausted() -> None:
         "error": {"type": "api_error", "message": "upstream unavailable"},
     }
     assert calls["n"] == 2
+
+
+# --- resolver-error classification (EAI_NONAME wedge) -------------------------------
+
+
+def test_is_resolver_error_matches_eai_noname_cause() -> None:
+    """A ConnectError wrapping socket.EAI_NONAME is a resolver failure.
+
+    Oracle is the POSIX constant, not Darwin's errno 8: Linux uses -2 for the
+    same name. The classifier must walk ``__cause__`` because httpx wraps the
+    gaierror (the production log is ``ConnectError: [Errno 8] nodename...``).
+    """
+    assert http_client._is_resolver_error(_resolver_connect_error()) is True
+
+
+def test_is_resolver_error_matches_message_without_cause() -> None:
+    """The Darwin log string is classified even when httpx drops the gaierror cause."""
+    exc = httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known")
+    assert http_client._is_resolver_error(exc) is True
+
+
+def test_is_resolver_error_matches_eai_errno_without_message_marker() -> None:
+    """Portable ``EAI_NONAME`` is classified even when the message is opaque.
+
+    The production Darwin string also matches the message fallback, which would
+    let an errno-check deletion survive. An opaque gaierror message forces the
+    ``socket.EAI_*`` membership path — the Linux/portable half of the classifier.
+    """
+    cause = socket.gaierror(socket.EAI_NONAME, "unrelated opaque resolver failure")
+    exc = httpx.ConnectError("connect failed")
+    exc.__cause__ = cause
+    assert http_client._is_resolver_error(exc) is True
+
+
+def test_is_resolver_error_rejects_connection_refused() -> None:
+    """ECONNREFUSED is a transport failure, not a resolver wedge."""
+    assert http_client._is_resolver_error(_refused_connect_error()) is False
+
+
+async def test_post_provider_resolver_error_uses_long_backoff_and_restart_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EAI_NONAME spends the retry at ~2s and tells the operator to restart the bridge.
+
+    Frozen ``random.random() = 0.5`` makes jitter a 1.0 multiplier, so the
+    resolver base (2.0s) yields a 2.0s sleep — distinct from the ordinary 0.5s
+    transient backoff. The ERROR line is the recovery instruction: a wedged
+    libinfo/mDNSResponder client is process-local and only a restart clears it.
+    """
+    monkeypatch.setattr(http_client.random, "random", lambda: 0.5)
+    slept: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise _resolver_connect_error()
+
+    cap = _LogCapture()
+    logger = logging.getLogger("claude_bridge.http_client")
+    logger.addHandler(cap)
+    logger.setLevel(logging.WARNING)
+    client = _client_with(handler)
+    try:
+        status, body = await http_client.post_provider(client, "https://p", {}, {})
+    finally:
+        logger.removeHandler(cap)
+        await client.aclose()
+
+    assert status == 502
+    assert json.loads(body)["error"]["message"] == "upstream unavailable"
+    assert slept == [2.0]
+    assert any("restart the bridge" in message for message in cap.messages)
+
+
+async def test_post_provider_ordinary_connect_error_keeps_short_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection-refused stays on the 0.5s transient path and does not mention restart."""
+    monkeypatch.setattr(http_client.random, "random", lambda: 0.5)
+    slept: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise _refused_connect_error()
+
+    cap = _LogCapture()
+    logger = logging.getLogger("claude_bridge.http_client")
+    logger.addHandler(cap)
+    logger.setLevel(logging.WARNING)
+    client = _client_with(handler)
+    try:
+        status, _body = await http_client.post_provider(client, "https://p", {}, {})
+    finally:
+        logger.removeHandler(cap)
+        await client.aclose()
+
+    assert status == 502
+    assert slept == [0.5]
+    assert any("unavailable after retry" in message for message in cap.messages)
+    assert not any("restart the bridge" in message for message in cap.messages)
+
+
+async def test_open_stream_resolver_error_logs_restart_after_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stream connect EAI_NONAME also names the restart recovery after the retry is spent."""
+    monkeypatch.setattr(http_client.random, "random", lambda: 0.5)
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise _resolver_connect_error()
+
+    cap = _LogCapture()
+    logger = logging.getLogger("claude_bridge.http_client")
+    logger.addHandler(cap)
+    logger.setLevel(logging.WARNING)
+    client = _client_with(handler)
+    try:
+        with pytest.raises(httpx.ConnectError):
+            await http_client.open_stream(client, "https://up", content=b"{}", headers={})
+    finally:
+        logger.removeHandler(cap)
+        await client.aclose()
+
+    assert any("restart the bridge" in message for message in cap.messages)
 
 
 # --- open_stream --------------------------------------------------------------------

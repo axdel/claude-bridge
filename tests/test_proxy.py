@@ -3233,3 +3233,93 @@ async def test_open_stream_with_reauth_transport_error_after_refresh_returns_502
     assert provider.force_refresh_calls == 1
     assert calls["n"] == 2
     assert bytes(writer.buffer).startswith(b"HTTP/1.1 502 Bad Gateway")
+
+
+# ---------------------------------------------------------------------------
+# Stream aclose: write_sse_headers lives inside the pump try/finally so a raise
+# there still releases the httpx Response (HTTP/2 stream) back to the pool.
+# ---------------------------------------------------------------------------
+
+
+class _UnusedStreamProvider:
+    """Provider whose translate_stream must not run — headers fail first."""
+
+    name = "unused"
+
+    async def translate_stream(self, _raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        raise AssertionError("translate_stream must not run when SSE headers fail")
+        yield {}  # pragma: no cover — makes this an async generator
+
+
+class _HeldResponse:
+    """Open streaming response whose aclose is observable.
+
+    ``httpx.Response(content=...)`` closes itself in the constructor, which would
+    make ``is_closed is False`` fail in setup rather than on the leak. This stand-in
+    starts open and flips ``is_closed`` only in ``aclose``.
+    """
+
+    def __init__(self) -> None:
+        self.status_code = 200
+        self.headers = httpx.Headers({"content-type": "text/event-stream"})
+        self.is_closed = False
+
+    async def aclose(self) -> None:
+        self.is_closed = True
+
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        if False:
+            yield b""
+
+
+@pytest.mark.asyncio
+async def test_pump_provider_stream_acloses_when_sse_headers_fail(monkeypatch):
+    """A raise in write_sse_headers still acloses the provider stream response."""
+    import claude_bridge.proxy_streaming as ps
+
+    response = _HeldResponse()
+
+    def _boom(_writer: object) -> None:
+        raise RuntimeError("header write failed")
+
+    monkeypatch.setattr(ps, "write_sse_headers", _boom)
+
+    with pytest.raises(RuntimeError, match="header write failed"):
+        await ps._pump_provider_stream(
+            _UnusedStreamProvider(),  # type: ignore[arg-type]
+            response,  # type: ignore[arg-type]
+            cast(asyncio.StreamWriter, _RecordingWriter()),
+        )
+
+    assert response.is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_stream_passthrough_acloses_when_sse_headers_fail(monkeypatch):
+    """A raise in write_sse_headers still acloses the passthrough stream response."""
+    import claude_bridge.proxy_streaming as ps
+
+    response = _HeldResponse()
+
+    async def _fake_open_stream(*_args: object, **_kwargs: object) -> _HeldResponse:
+        return response
+
+    def _boom(_writer: object) -> None:
+        raise RuntimeError("header write failed")
+
+    monkeypatch.setattr(ps, "open_stream", _fake_open_stream)
+    monkeypatch.setattr(ps, "write_sse_headers", _boom)
+
+    client = create_client()
+    try:
+        with pytest.raises(RuntimeError, match="header write failed"):
+            await ps.stream_passthrough(
+                "https://up",
+                b"{}",
+                {},
+                cast(asyncio.StreamWriter, _RecordingWriter()),
+                client,
+            )
+        assert response.is_closed is True
+    finally:
+        await client.aclose()
