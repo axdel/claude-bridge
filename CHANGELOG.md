@@ -2,6 +2,13 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-08-27
+
+### fix: recover from Darwin EAI_NONAME DNS wedge and aclose leaked streams ([PR #19](https://github.com/axdel/claude-bridge/pull/19))
+Classify Darwin EAI_NONAME (errno 8) as a DNS-resolver failure, retry with a 2s backoff, log that restarting the bridge recovers it, and aclose streamed httpx responses even if SSE-header write fails.
+
+- [`afc71ce`](https://github.com/axdel/claude-bridge/commit/afc71ce) Recover from Darwin EAI_NONAME DNS wedge and aclose leaked streams
+
 ## 2026-08-24
 
 ### v0.10.0 — HTTP/2 Client Parity
