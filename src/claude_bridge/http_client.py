@@ -83,6 +83,40 @@ def _is_resolver_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_remote_protocol_error(exc: BaseException) -> bool:
+    """Return True when *exc* is a server HTTP/2 protocol failure.
+
+    httpx maps httpcore ``RemoteProtocolError`` (raised on ``h2`` ``StreamReset``
+    / GOAWAY) to ``httpx.RemoteProtocolError``. That exception does **not** mark
+    the multiplexed session unusable in httpcore, so a retry would reuse it.
+    """
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.RemoteProtocolError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def retire_pooled_connections(client: httpx.AsyncClient) -> None:
+    """Close pooled connections so the next request opens a fresh HTTP/2 session.
+
+    Does not ``aclose`` the client (D-STRUCT-005 — the caller owns that object).
+    A ``MockTransport`` has no pool; this is then a no-op.
+    """
+    transport = getattr(client, "_transport", None)
+    pool = getattr(transport, "_pool", None)
+    aclose = getattr(pool, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:
+        logger.debug("HTTP connection pool retirement failed", exc_info=True)
+
+
 def _jittered_backoff(attempt: int = 1, *, base: float = _RETRY_BACKOFF_SECONDS) -> float:
     """Return the retry delay (seconds) for *attempt* (1-based) with decorrelating jitter.
 
@@ -115,21 +149,33 @@ async def _buffered_post_with_retry(
     Returns the response for any HTTP status — the server answered, so an error status is
     the caller's to interpret and is never retried. Returns None when the transport fails
     on both the attempt and its one retry; the retry is safe because no downstream byte was
-    ever written. *kind* labels the log lines (``"Upstream"`` / ``"Provider"``). Shared by
-    the two buffered POST paths so retry, jittered backoff, and failure logging live once.
+    ever written. A ``RemoteProtocolError`` (HTTP/2 StreamReset) retires pooled connections
+    before the retry so it cannot reuse the poisoned session. *kind* labels the log lines
+    (``"Upstream"`` / ``"Provider"``). Shared by the two buffered POST paths so retry,
+    jittered backoff, and failure logging live once.
     """
     for attempt in range(2):
         try:
             return await client.post(url, content=content, headers=headers)
         except _TRANSIENT_ERRORS as exc:
             if attempt == 0:
-                if _is_resolver_error(exc):
+                if _is_remote_protocol_error(exc):
+                    logger.warning(
+                        "%s HTTP/2 stream reset, retiring connection and retrying: %s",
+                        kind,
+                        exc,
+                    )
+                    await retire_pooled_connections(client)
+                elif _is_resolver_error(exc):
                     logger.warning("%s DNS resolver error, retrying: %s", kind, exc)
                 else:
                     logger.warning("%s transient error, retrying: %s", kind, exc)
                 await asyncio.sleep(_backoff_for(exc))
                 continue
-            if _is_resolver_error(exc):
+            if _is_remote_protocol_error(exc):
+                await retire_pooled_connections(client)
+                logger.error("%s unavailable after retry: %s", kind, exc)
+            elif _is_resolver_error(exc):
                 logger.error(
                     "%s DNS resolver failed after retry: %s; restart the bridge to recover",
                     kind,
@@ -259,7 +305,9 @@ async def open_stream(
             return await client.send(request, stream=True)
         except _TRANSIENT_ERRORS as exc:
             if attempt >= retries:
-                if _is_resolver_error(exc):
+                if _is_remote_protocol_error(exc):
+                    await retire_pooled_connections(client)
+                elif _is_resolver_error(exc):
                     logger.error(
                         "Stream connect DNS resolver failed after retry: %s; "
                         "restart the bridge to recover",
@@ -267,7 +315,15 @@ async def open_stream(
                     )
                 raise
             attempt += 1
-            if _is_resolver_error(exc):
+            if _is_remote_protocol_error(exc):
+                logger.warning(
+                    "Stream connect HTTP/2 stream reset, retiring connection, retry %d/%d: %s",
+                    attempt,
+                    retries,
+                    exc,
+                )
+                await retire_pooled_connections(client)
+            elif _is_resolver_error(exc):
                 logger.warning(
                     "Stream connect DNS resolver error, retry %d/%d: %s",
                     attempt,

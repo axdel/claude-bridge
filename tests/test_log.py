@@ -19,7 +19,8 @@ from claude_bridge.log import (
 class TestConfigureLogging:
     """configure_logging() sets up the root bridge logger with correct level and format."""
 
-    def test_default_level_is_info(self):
+    def test_default_level_is_info(self, monkeypatch):
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
         configure_logging()
         logger = get_logger("test_default")
         assert logger.getEffectiveLevel() == logging.INFO

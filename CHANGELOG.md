@@ -2,6 +2,13 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-08-28
+
+### fix: retire pooled HTTP/2 connections on StreamReset PROTOCOL_ERROR ([PR #20](https://github.com/axdel/claude-bridge/pull/20))
+Classify Cloudflare RST_STREAM PROTOCOL_ERROR as a RemoteProtocolError, aclose the httpcore pool (not the AsyncClient), and retry once on a fresh HTTP/2 handshake so the poisoned multiplexed session is not reused.
+
+- [`3f80eaf`](https://github.com/axdel/claude-bridge/commit/3f80eaf) Retire pooled HTTP/2 connections on StreamReset PROTOCOL_ERROR
+
 ## 2026-08-27
 
 ### fix: recover from Darwin EAI_NONAME DNS wedge and aclose leaked streams ([PR #19](https://github.com/axdel/claude-bridge/pull/19))
