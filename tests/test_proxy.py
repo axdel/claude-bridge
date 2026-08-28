@@ -3284,14 +3284,74 @@ async def test_pump_provider_stream_acloses_when_sse_headers_fail(monkeypatch):
 
     monkeypatch.setattr(ps, "write_sse_headers", _boom)
 
-    with pytest.raises(RuntimeError, match="header write failed"):
-        await ps._pump_provider_stream(
-            _UnusedStreamProvider(),  # type: ignore[arg-type]
-            response,  # type: ignore[arg-type]
-            cast(asyncio.StreamWriter, _RecordingWriter()),
-        )
+    client = create_client()
+    try:
+        with pytest.raises(RuntimeError, match="header write failed"):
+            await ps._pump_provider_stream(
+                _UnusedStreamProvider(),  # type: ignore[arg-type]
+                response,  # type: ignore[arg-type]
+                cast(asyncio.StreamWriter, _RecordingWriter()),
+                client,
+            )
+    finally:
+        await client.aclose()
 
     assert response.is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_pump_provider_stream_retires_pool_on_stream_reset(monkeypatch):
+    """A mid-stream StreamReset retires the pooled HTTP/2 session (request is not replayed)."""
+    import claude_bridge.proxy_streaming as ps
+
+    retired = {"n": 0}
+
+    async def _fake_retire(_client: httpx.AsyncClient) -> None:
+        retired["n"] += 1
+
+    monkeypatch.setattr(ps, "retire_pooled_connections", _fake_retire)
+
+    class _ResettingResponse:
+        status_code = 200
+        headers = httpx.Headers({"content-type": "text/event-stream"})
+        is_closed = False
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+        async def aiter_bytes(self) -> AsyncIterator[bytes]:
+            raise httpx.RemoteProtocolError(
+                "<StreamReset stream_id:1, error_code:1, remote_reset:True>"
+            )
+            yield b""  # pragma: no cover
+
+    class _PassThroughProvider:
+        name = "reset"
+
+        async def translate_stream(self, raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+            async for _chunk in raw_chunks:
+                yield {"event": "ping", "data": {}}
+
+    class _DrainingWriter(_RecordingWriter):
+        async def drain(self) -> None:
+            return None
+
+    response = _ResettingResponse()
+    client = create_client()
+    try:
+        outcome = await ps._pump_provider_stream(
+            _PassThroughProvider(),  # type: ignore[arg-type]
+            response,  # type: ignore[arg-type]
+            cast(asyncio.StreamWriter, _DrainingWriter()),
+            client,
+        )
+    finally:
+        await client.aclose()
+
+    assert retired["n"] == 1
+    assert response.is_closed is True
+    assert outcome.error is True
+    assert outcome.status == 502
 
 
 @pytest.mark.asyncio

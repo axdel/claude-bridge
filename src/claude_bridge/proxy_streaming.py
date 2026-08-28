@@ -15,7 +15,12 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from claude_bridge.http_client import open_stream, select_forward_headers
+from claude_bridge.http_client import (
+    _is_remote_protocol_error,
+    open_stream,
+    retire_pooled_connections,
+    select_forward_headers,
+)
 from claude_bridge.log import get_logger
 from claude_bridge.provider import Provider, provider_capabilities
 from claude_bridge.request_view import emit_translation_warnings, trace_stream_event
@@ -170,14 +175,17 @@ async def validate_passthrough_response(
 
 
 async def _pump_passthrough_stream(
-    response: httpx.Response, writer: asyncio.StreamWriter
+    response: httpx.Response,
+    writer: asyncio.StreamWriter,
+    client: httpx.AsyncClient,
 ) -> StreamOutcome:
     """Forward validated upstream SSE bytes to the client unchanged until exhausted.
 
     SSE headers are written inside this ``try`` so a raise still ``aclose``s the
     response. A mid-stream transport error (e.g. the idle timeout firing on a stalled
     upstream, INV-SSE-01) leaves the client on a committed 200, so it is flagged
-    ``error=True`` rather than restated as a status.
+    ``error=True`` rather than restated as a status. A StreamReset also retires the
+    pooled HTTP/2 session so the next request does not reuse it.
     """
     try:
         write_sse_headers(writer)
@@ -187,6 +195,8 @@ async def _pump_passthrough_stream(
         logger.debug("Client disconnected during passthrough stream")
         return StreamOutcome(499)
     except httpx.TransportError as exc:
+        if _is_remote_protocol_error(exc):
+            await retire_pooled_connections(client)
         logger.error("Passthrough stream transport error: %s", exc)
         return StreamOutcome(200, error=True)
     finally:
@@ -215,7 +225,7 @@ async def stream_passthrough(
     if guard is not None:
         return guard
 
-    return await _pump_passthrough_stream(response, writer)
+    return await _pump_passthrough_stream(response, writer, client)
 
 
 async def _prepare_provider_stream(
@@ -331,7 +341,10 @@ async def _emit_stream_error(
 
 
 async def _pump_provider_stream(
-    provider: Provider, response: httpx.Response, writer: asyncio.StreamWriter
+    provider: Provider,
+    response: httpx.Response,
+    writer: asyncio.StreamWriter,
+    client: httpx.AsyncClient,
 ) -> StreamOutcome:
     """Translate a validated provider SSE stream to Anthropic events and write them.
 
@@ -341,7 +354,8 @@ async def _pump_provider_stream(
     handlers: a raise there has not committed an SSE body and must propagate, not become
     a mid-stream error event. Tracks token usage and whether a terminal ``message_stop``
     was seen; a stream ending without one is a semantic failure (``error=True``) even
-    though the client already received a 200.
+    though the client already received a 200. A mid-stream StreamReset retires pooled
+    HTTP/2 connections on *client* so the next request does not reuse the session.
     """
 
     async def _raw_chunks() -> AsyncIterator[bytes]:
@@ -369,6 +383,8 @@ async def _pump_provider_stream(
             logger.debug("Client disconnected during provider stream")
             return StreamOutcome(499, tokens_in, tokens_out)
         except httpx.TransportError as exc:
+            if _is_remote_protocol_error(exc):
+                await retire_pooled_connections(client)
             logger.error("Provider stream transport error: %s", exc)
             return await _emit_stream_error(writer, tokens_in, tokens_out)
         except Exception:
@@ -456,4 +472,4 @@ async def stream_via_provider(
     guard = await validate_stream_response(response, writer)
     if guard is not None:
         return guard
-    return await _pump_provider_stream(provider, response, writer)
+    return await _pump_provider_stream(provider, response, writer, client)

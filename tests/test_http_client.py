@@ -9,13 +9,22 @@ error, or count its own invocations to prove retry behaviour.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import logging
+import shutil
 import socket
+import ssl
+import subprocess
+from pathlib import Path
 
 import httpx
 import pytest
+from h2.config import H2Configuration
+from h2.connection import H2Connection
+from h2.errors import ErrorCodes
+from h2.events import RequestReceived
 
 from claude_bridge import http_client
 from claude_bridge.config import (
@@ -43,6 +52,19 @@ def _refused_connect_error() -> httpx.ConnectError:
     exc = httpx.ConnectError("refused")
     exc.__cause__ = cause
     return exc
+
+
+def _stream_reset_error(*, stream_id: int = 861) -> httpx.RemoteProtocolError:
+    """httpx-mapped production StreamReset (Cloudflare RST_STREAM PROTOCOL_ERROR).
+
+    Oracle: ``h2.events.StreamReset(stream_id, error_code=1, remote_reset=True)``
+    renders as the operator log string; httpx maps httpcore's RemoteProtocolError
+    to ``httpx.RemoteProtocolError`` keeping that string (diagnose 2026-08-28).
+    """
+    from h2.events import StreamReset
+
+    event = StreamReset(stream_id=stream_id, error_code=1, remote_reset=True)
+    return httpx.RemoteProtocolError(str(event))
 
 
 class _LogCapture(logging.Handler):
@@ -456,6 +478,31 @@ async def test_open_stream_resolver_error_logs_restart_after_retry(
     assert any("restart the bridge" in message for message in cap.messages)
 
 
+# --- remote-protocol / StreamReset classification -----------------------------------
+
+
+def test_is_remote_protocol_error_matches_stream_reset() -> None:
+    """The operator StreamReset string is a server HTTP/2 protocol failure."""
+    assert http_client._is_remote_protocol_error(_stream_reset_error()) is True
+
+
+def test_is_remote_protocol_error_rejects_connect_refused() -> None:
+    """ECONNREFUSED is a transport failure, not a poisoned HTTP/2 session."""
+    assert http_client._is_remote_protocol_error(_refused_connect_error()) is False
+
+
+def test_is_remote_protocol_error_rejects_resolver_error() -> None:
+    """EAI_NONAME stays on the DNS-wedge path, not the StreamReset path."""
+    assert http_client._is_remote_protocol_error(_resolver_connect_error()) is False
+
+
+def test_stream_reset_error_repr_matches_operator_log() -> None:
+    """The fixture renders the exact log fragment the operator pasted."""
+    assert str(_stream_reset_error()) == (
+        "<StreamReset stream_id:861, error_code:1, remote_reset:True>"
+    )
+
+
 # --- open_stream --------------------------------------------------------------------
 
 
@@ -539,3 +586,278 @@ async def test_open_stream_does_not_retry_error_status() -> None:
         await response.aclose()
     finally:
         await client.aclose()
+
+
+# --- HTTP/2 StreamReset retires the pooled connection (live h2) ---------------------
+
+
+def _tls_cert_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """Self-signed localhost cert+key via openssl (stdlib-only test helper)."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl not on PATH")
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    result = subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"openssl failed: {result.stderr.decode(errors='replace')}")
+    return cert, key
+
+
+async def _start_reset_then_ok_server(
+    cert: Path, key: Path
+) -> tuple[asyncio.AbstractServer, int, list[list[int]]]:
+    """TLS+ALPN h2 server: connection 1 RST_STREAMs; later connections return 200.
+
+    Returns the server, bound port, and per-connection stream-id lists so the
+    test can see whether the retry reused the poisoned session (stream 1 then 3
+    on one connection) or opened a new handshake.
+    """
+    connections: list[list[int]] = []
+    ok_body = b'{"ok":true}'
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        stream_ids: list[int] = []
+        connections.append(stream_ids)
+        conn = H2Connection(config=H2Configuration(client_side=False, header_encoding="utf-8"))
+        conn.initiate_connection()
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        try:
+            while True:
+                data = await reader.read(65535)
+                if not data:
+                    break
+                events = conn.receive_data(data)
+                for event in events:
+                    if not isinstance(event, RequestReceived):
+                        continue
+                    stream_ids.append(event.stream_id)
+                    if len(connections) == 1:
+                        conn.reset_stream(event.stream_id, error_code=ErrorCodes.PROTOCOL_ERROR)
+                    else:
+                        conn.send_headers(
+                            event.stream_id,
+                            (
+                                (":status", "200"),
+                                ("content-type", "application/json"),
+                                ("content-length", str(len(ok_body))),
+                            ),
+                        )
+                        conn.send_data(event.stream_id, ok_body, end_stream=True)
+                outgoing = conn.data_to_send()
+                if outgoing:
+                    writer.write(outgoing)
+                    await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    ctx.set_alpn_protocols(["h2"])
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+    port = server.sockets[0].getsockname()[1]
+    return server, port, connections
+
+
+async def test_post_provider_stream_reset_retries_on_fresh_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PROTOCOL_ERROR RST on connection 1 must retry on a new HTTP/2 session.
+
+    Oracle: a server that RST_STREAMs every stream on the first TLS connection
+    and returns 200 on the second. Reusing the poisoned session (httpcore leaves
+    it ``is_available``) yields two stream IDs on one connection and a 502.
+    Retiring the pool forces a second handshake, which this server serves.
+    """
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+    cert, key = _tls_cert_pair(tmp_path)
+    server, port, connections = await _start_reset_then_ok_server(cert, key)
+    tls = ssl.create_default_context()
+    tls.check_hostname = False
+    tls.load_verify_locations(str(cert))
+    client = httpx.AsyncClient(
+        http2=True,
+        verify=tls,
+        timeout=httpx.Timeout(5.0),
+        follow_redirects=False,
+    )
+    try:
+        status, body = await http_client.post_provider(
+            client, f"https://127.0.0.1:{port}/v1", {"hello": "world"}, {}
+        )
+    finally:
+        await client.aclose()
+        server.close()
+        await server.wait_closed()
+
+    assert status == 200
+    assert body == b'{"ok":true}'
+    assert len(connections) == 2
+    assert connections[0]  # at least one RST stream on the poisoned session
+    assert connections[1]  # retry landed on a new connection
+
+
+async def test_post_provider_stream_reset_logs_retire_not_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """StreamReset recovery retires the pool; it must not tell the operator to restart.
+
+    Restart is the EAI_NONAME instruction (process-local libinfo). A PROTOCOL_ERROR
+    RST is connection-local and is recovered by dropping the pooled session.
+    """
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _stream_reset_error()
+        return httpx.Response(200, content=b'{"ok":true}')
+
+    cap = _LogCapture()
+    logger = logging.getLogger("claude_bridge.http_client")
+    logger.addHandler(cap)
+    logger.setLevel(logging.WARNING)
+    client = _client_with(handler)
+    try:
+        status, body = await http_client.post_provider(client, "https://p", {}, {})
+    finally:
+        logger.removeHandler(cap)
+        await client.aclose()
+
+    assert status == 200
+    assert body == b'{"ok":true}'
+    assert any("retiring connection" in message for message in cap.messages)
+    assert not any("restart the bridge" in message for message in cap.messages)
+
+
+async def test_post_provider_stream_reset_exhausted_still_retires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both attempts RST, the pool is still retired for the next request."""
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+    retired = {"n": 0}
+
+    async def _spy_retire(client: httpx.AsyncClient) -> None:
+        retired["n"] += 1
+        await original_retire(client)
+
+    original_retire = http_client.retire_pooled_connections
+    monkeypatch.setattr(http_client, "retire_pooled_connections", _spy_retire)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise _stream_reset_error()
+
+    client = _client_with(handler)
+    try:
+        status, body = await http_client.post_provider(client, "https://p", {}, {})
+    finally:
+        await client.aclose()
+
+    assert status == 502
+    assert json.loads(body)["error"]["message"] == "upstream unavailable"
+    assert retired["n"] >= 1
+
+
+async def test_open_stream_stream_reset_retries_then_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_stream retires the poisoned session and opens on the retry."""
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _stream_reset_error()
+        return httpx.Response(200, content=b"data: {}\n\n")
+
+    cap = _LogCapture()
+    logger = logging.getLogger("claude_bridge.http_client")
+    logger.addHandler(cap)
+    logger.setLevel(logging.WARNING)
+    client = _client_with(handler)
+    try:
+        response = await http_client.open_stream(client, "https://up", content=b"{}", headers={})
+        assert response.status_code == 200
+        await response.aclose()
+    finally:
+        logger.removeHandler(cap)
+        await client.aclose()
+
+    assert calls["n"] == 2
+    assert any("retiring connection" in message for message in cap.messages)
+    assert not any("restart the bridge" in message for message in cap.messages)
+
+
+async def test_open_stream_stream_reset_exhausted_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_stream retires the pool then re-raises when the retry also RST's."""
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+    retired = {"n": 0}
+
+    async def _spy_retire(client: httpx.AsyncClient) -> None:
+        retired["n"] += 1
+        await original_retire(client)
+
+    original_retire = http_client.retire_pooled_connections
+    monkeypatch.setattr(http_client, "retire_pooled_connections", _spy_retire)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise _stream_reset_error()
+
+    client = _client_with(handler)
+    try:
+        with pytest.raises(httpx.RemoteProtocolError):
+            await http_client.open_stream(client, "https://up", content=b"{}", headers={})
+    finally:
+        await client.aclose()
+
+    assert retired["n"] >= 1
