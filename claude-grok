@@ -28,7 +28,7 @@ CLAUDE_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --debug) LOG_LEVEL="DEBUG"; shift ;;
-        --)      shift; CLAUDE_ARGS=("$@"); break ;;
+        --)      shift; CLAUDE_ARGS+=("$@"); break ;;
         *)       CLAUDE_ARGS+=("$1"); shift ;;
     esac
 done

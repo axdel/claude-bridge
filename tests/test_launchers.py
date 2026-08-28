@@ -11,6 +11,7 @@ dir) can execute ahead of the real bridge with access to the provider ``auth.jso
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -87,3 +88,112 @@ def test_launchers_use_isolated_python():
         assert '"$BRIDGE_PY" -I ' in text, f"{name} must invoke python in isolated mode (-I)"
         assert '"$BRIDGE_PY" -P' not in text, f"{name} must not use -P (leaves PYTHONPATH open)"
         assert "export PYTHONPATH" not in text, f"{name} must not re-export inherited PYTHONPATH"
+
+
+# Skill-recipe argv that /plan and /review actually dispatch (flags, then wrapper --, then prompt).
+_SKILL_RECIPE = (
+    "-p",
+    "--effort",
+    "max",
+    "--output-format",
+    "json",
+    "--permission-mode",
+    "plan",
+    "--",
+    "You are QualityReviewer.",
+)
+# Wrapper consumes the first `--`. Skill recipe therefore forwards flags + prompt
+# without that `--`. Frontmatter prompts need a *second* `--` (protocol recipe:
+# `<cli> -- -p … -- PROMPT`).
+_SKILL_RECIPE_FORWARDED = (
+    "-p",
+    "--effort",
+    "max",
+    "--output-format",
+    "json",
+    "--permission-mode",
+    "plan",
+    "You are QualityReviewer.",
+)
+
+
+def _extract_claude_args_parse(text: str) -> str:
+    """Slice the launcher's CLAUDE_ARGS while-loop, nothing else (no bridge spawn)."""
+    start = text.index("CLAUDE_ARGS=()")
+    end = text.index("\ndone\n", start) + len("\ndone\n")
+    return text[start:end]
+
+
+def _run_claude_args_parse(loop: str, argv: tuple[str, ...]) -> list[str]:
+    """Evaluate the extracted loop under bash; return the resulting CLAUDE_ARGS."""
+    script = loop + 'printf "%s\\0" "${CLAUDE_ARGS[@]}"\n'
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(
+        [bash, "-c", script, "_", *argv],
+        capture_output=True,
+        timeout=5,
+        check=True,
+    )
+    if not result.stdout:
+        return []
+    return [part.decode() for part in result.stdout.split(b"\0") if part]
+
+
+def test_launcher_parse_skill_recipe_keeps_print_and_plan_flags():
+    """Skill recipe ``<cli> -p --flags -- PROMPT`` must forward -p/json/plan.
+
+    Live A-vs-B (2026-08-28): replace-on-``--`` dropped every flag accumulated by
+    ``*)``, so inner argv was ``claude <prompt>`` (plain text, no json, not plan
+    mode). Flags after wrapper ``--`` kept ``-p`` and returned JSON
+    ``{"result":"OK"}``. Oracle is that forwarded argv, not the running wrapper.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    for name in ("claude-codex", "claude-grok"):
+        loop = _extract_claude_args_parse((repo_root / name).read_text())
+        forwarded = _run_claude_args_parse(loop, _SKILL_RECIPE)
+        assert forwarded == list(_SKILL_RECIPE_FORWARDED), (
+            f"{name} parse dropped print/plan flags: {forwarded!r}"
+        )
+
+
+def test_launcher_parse_flags_after_double_dash_still_forwards():
+    """``<cli> -- -p --flags -- PROMPT`` (wrapper-doc form) keeps the same argv."""
+    repo_root = Path(__file__).resolve().parents[1]
+    argv = ("--", *_SKILL_RECIPE)
+    for name in ("claude-codex", "claude-grok"):
+        loop = _extract_claude_args_parse((repo_root / name).read_text())
+        forwarded = _run_claude_args_parse(loop, argv)
+        assert forwarded == list(_SKILL_RECIPE), (
+            f"{name} flags-after-`--` parse drifted: {forwarded!r}"
+        )
+
+
+def test_launcher_parse_preflight_without_double_dash_keeps_print():
+    """Pre-flight has no wrapper ``--``; ``*)`` accumulation must still keep ``-p``."""
+    repo_root = Path(__file__).resolve().parents[1]
+    argv = (
+        "-p",
+        "Status check — respond with OK and your model name.",
+        "--effort",
+        "max",
+        "--output-format",
+        "text",
+        "--permission-mode",
+        "plan",
+    )
+    for name in ("claude-codex", "claude-grok"):
+        loop = _extract_claude_args_parse((repo_root / name).read_text())
+        forwarded = _run_claude_args_parse(loop, argv)
+        assert forwarded == list(argv), f"{name} pre-flight parse drifted: {forwarded!r}"
+
+
+def test_launcher_parse_debug_is_consumed_not_forwarded():
+    """``--debug`` is a wrapper flag; it must not appear in CLAUDE_ARGS."""
+    repo_root = Path(__file__).resolve().parents[1]
+    argv = ("--debug", "-p", "--", "hello")
+    for name in ("claude-codex", "claude-grok"):
+        loop = _extract_claude_args_parse((repo_root / name).read_text())
+        forwarded = _run_claude_args_parse(loop, argv)
+        assert "--debug" not in forwarded
+        assert forwarded == ["-p", "hello"], f"{name}: {forwarded!r}"
