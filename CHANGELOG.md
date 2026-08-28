@@ -4,6 +4,11 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-08-28
 
+### fix: append Claude flags after launcher -- instead of replacing them ([PR #21](https://github.com/axdel/claude-bridge/pull/21))
+Launcher --) now appends remaining Claude args so skill-recipe flags before -- are kept; inner claude receives -p/json/plan.
+
+- [`a3c728e`](https://github.com/axdel/claude-bridge/commit/a3c728e) Append Claude flags after launcher -- instead of replacing them
+
 ### fix: retire pooled HTTP/2 connections on StreamReset PROTOCOL_ERROR ([PR #20](https://github.com/axdel/claude-bridge/pull/20))
 Classify Cloudflare RST_STREAM PROTOCOL_ERROR as a RemoteProtocolError, aclose the httpcore pool (not the AsyncClient), and retry once on a fresh HTTP/2 handshake so the poisoned multiplexed session is not reused.
 
