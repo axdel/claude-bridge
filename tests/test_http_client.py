@@ -92,6 +92,14 @@ def _client_with(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
+# Independent oracle for the resolver retry budget. The fix grants a getaddrinfo-classified
+# connect failure this many retries in BOTH connect paths. Pinned here, NOT imported from
+# the implementation: importing the production constant would let a mutant that lowers the
+# budget move the test's goalposts with it and survive. Derived from the fix spec — 3 retries
+# means 4 total connect attempts, spacing the extra tries at the escalating resolver backoff.
+_EXPECTED_RESOLVER_RETRIES = 3
+
+
 # --- _build_timeout / create_client -------------------------------------------------
 
 
@@ -382,12 +390,14 @@ def test_is_resolver_error_rejects_connection_refused() -> None:
 async def test_post_provider_resolver_error_uses_long_backoff_and_restart_log(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """EAI_NONAME spends the retry at ~2s and tells the operator to restart the bridge.
+    """EAI_NONAME spends the whole resolver budget then tells the operator to restart.
 
-    Frozen ``random.random() = 0.5`` makes jitter a 1.0 multiplier, so the
-    resolver base (2.0s) yields a 2.0s sleep — distinct from the ordinary 0.5s
-    transient backoff. The ERROR line is the recovery instruction: a wedged
-    libinfo/mDNSResponder client is process-local and only a restart clears it.
+    Frozen ``random.random() = 0.5`` makes jitter a 1.0 multiplier, so the resolver base
+    (2.0s) scaled by attempt yields the escalating sequence [2.0, 4.0, 6.0] — one sleep
+    per resolver retry, distinct from the single ordinary 0.5s transient backoff. The
+    value-oracle: three sleeps pins the resolver retry count at 3. The ERROR line is the
+    recovery instruction: a wedged libinfo/mDNSResponder client is process-local and only
+    a restart clears it.
     """
     monkeypatch.setattr(http_client.random, "random", lambda: 0.5)
     slept: list[float] = []
@@ -413,7 +423,7 @@ async def test_post_provider_resolver_error_uses_long_backoff_and_restart_log(
 
     assert status == 502
     assert json.loads(body)["error"]["message"] == "upstream unavailable"
-    assert slept == [2.0]
+    assert slept == [2.0, 4.0, 6.0]
     assert any("restart the bridge" in message for message in cap.messages)
 
 
@@ -449,6 +459,40 @@ async def test_post_provider_ordinary_connect_error_keeps_short_backoff(
     assert not any("restart the bridge" in message for message in cap.messages)
 
 
+async def test_post_provider_rides_out_resolver_blips_within_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The buffered connect path rides out the same resolver budget as the stream path.
+
+    Oracle: a getaddrinfo blip hits every cold connect, so the buffered POST must grant
+    resolver failures the same ``_RESOLVER_MAX_RETRIES`` budget as ``open_stream`` — one
+    policy, both connect paths. ``_RESOLVER_MAX_RETRIES`` blips followed by a success must
+    return 200, not a synthetic 502. Buffered POST is safe to retry (no downstream byte).
+    """
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] <= _EXPECTED_RESOLVER_RETRIES:
+            raise _resolver_connect_error()
+        return httpx.Response(200, content=b'{"ok": true}')
+
+    client = _client_with(handler)
+    try:
+        status, body = await http_client.post_provider(client, "https://p", {}, {})
+    finally:
+        await client.aclose()
+
+    assert status == 200
+    assert json.loads(body) == {"ok": True}
+    assert calls["n"] == _EXPECTED_RESOLVER_RETRIES + 1
+
+
 async def test_open_stream_resolver_error_logs_restart_after_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -476,6 +520,69 @@ async def test_open_stream_resolver_error_logs_restart_after_retry(
         await client.aclose()
 
     assert any("restart the bridge" in message for message in cap.messages)
+
+
+async def test_open_stream_rides_out_resolver_blips_within_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient getaddrinfo blip on stream connect is retried up to the resolver budget,
+    then the connect opens.
+
+    Oracle: the fix grants resolver failures ``_RESOLVER_MAX_RETRIES`` retries, so that many
+    consecutive blips followed by a success must yield the stream — the whole point of the
+    fix. A cold DNS blip (mDNSResponder negative cache) must not fail the consult. Connect
+    is idempotent (no body byte read before it opens), so the retries are safe.
+    """
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] <= _EXPECTED_RESOLVER_RETRIES:
+            raise _resolver_connect_error()
+        return httpx.Response(200, content=b"data: {}\n\n")
+
+    client = _client_with(handler)
+    try:
+        response = await http_client.open_stream(client, "https://up", content=b"{}", headers={})
+        assert response.status_code == 200
+        assert calls["n"] == _EXPECTED_RESOLVER_RETRIES + 1
+        await response.aclose()
+    finally:
+        await client.aclose()
+
+
+async def test_open_stream_raises_after_resolver_budget_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One blip past the budget still gives up — the resolver retry is bounded, not infinite.
+
+    Oracle: ``_RESOLVER_MAX_RETRIES`` retries means exactly the initial attempt plus that
+    many retries (``_RESOLVER_MAX_RETRIES + 1`` connects) before the resolver error
+    propagates. Pins the upper bound so a genuine outage cannot hang the connect forever.
+    """
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(http_client.asyncio, "sleep", _fake_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise _resolver_connect_error()
+
+    client = _client_with(handler)
+    try:
+        with pytest.raises(httpx.ConnectError):
+            await http_client.open_stream(client, "https://up", content=b"{}", headers={})
+        assert calls["n"] == _EXPECTED_RESOLVER_RETRIES + 1
+    finally:
+        await client.aclose()
 
 
 # --- remote-protocol / StreamReset classification -----------------------------------
