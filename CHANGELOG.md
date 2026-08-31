@@ -2,6 +2,13 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-08-31
+
+### fix: ride out transient DNS resolver blips with a larger retry budget ([PR #22](https://github.com/axdel/claude-bridge/pull/22))
+Resolver (getaddrinfo) failures on a cold upstream connect now get a 3-retry budget with escalating backoff instead of a single 2s retry, so a transient macOS DNS blip is ridden out rather than failing the whole request; other transients keep their single retry.
+
+- [`6b96886`](https://github.com/axdel/claude-bridge/commit/6b96886) Ride out transient DNS resolver blips with a larger retry budget
+
 ## 2026-08-28
 
 ### fix: append Claude flags after launcher -- instead of replacing them ([PR #21](https://github.com/axdel/claude-bridge/pull/21))
