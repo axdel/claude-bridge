@@ -2,9 +2,10 @@
 
 The proxy's orchestration (routing, streaming to the client, translation) lives in
 ``proxy.py``; this leaf owns the mechanics of *making the upstream call* over a shared,
-event-loop-owned ``httpx.AsyncClient``: split connect/stream-idle timeouts, one
-pre-body retry on transient transport errors, buffered POSTs, and streaming opens whose
-status and headers are available before the body is read.
+event-loop-owned ``httpx.AsyncClient``: split connect/stream-idle timeouts, pre-body
+retries on transient transport errors (one for ordinary transients, a larger budget for a
+getaddrinfo blip), buffered POSTs, and streaming opens whose status and headers are
+available before the body is read.
 
 Only the DATA plane (Anthropic passthrough + provider messages/responses) runs on httpx
 here. Token/OIDC refresh stays on stdlib urllib inside each provider's auth module — a
@@ -43,6 +44,12 @@ _RETRY_BACKOFF_SECONDS = 0.5
 # Resolver (getaddrinfo) failures get a longer pause: a short negative cache or
 # mDNSResponder blip can clear in a couple of seconds; 0.5s always loses.
 _RESOLVER_BACKOFF_SECONDS = 2.0
+# ...and a larger retry budget than other transients. A macOS mDNSResponder / libinfo
+# negative-cache blip persists for several seconds — longer than a single 2s retry — and
+# hits cold concurrent connects hardest (a real /plan or /review starts several peer
+# bridges at once). Riding out the common blip beats failing the whole consult; a genuine
+# outage still gives up after ~2+4+6s, far under any caller timeout.
+_RESOLVER_MAX_RETRIES = 3
 
 # Portable getaddrinfo failure codes — Darwin EAI_NONAME is 8, glibc is -2.
 _RESOLVER_ERRNOS = frozenset(
@@ -136,6 +143,20 @@ def _backoff_for(exc: BaseException, attempt: int = 1) -> float:
     return _jittered_backoff(attempt, base=base)
 
 
+def _max_retries_for(exc: BaseException, default: int) -> int:
+    """Retry budget for *exc*: the larger resolver budget for getaddrinfo, else *default*.
+
+    One policy consulted by both connect paths (streaming ``open_stream`` and buffered
+    ``_buffered_post_with_retry``) so the resolver budget lives in a single place rather
+    than being duplicated per site. ``max`` never *reduces* a caller's configured retries:
+    a resolver-classified error only ever raises the ceiling to ride out a self-clearing
+    blip; every other transient keeps *default*.
+    """
+    if _is_resolver_error(exc):
+        return max(default, _RESOLVER_MAX_RETRIES)
+    return default
+
+
 async def _buffered_post_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -144,46 +165,53 @@ async def _buffered_post_with_retry(
     headers: dict[str, str],
     kind: str,
 ) -> httpx.Response | None:
-    """POST *content* buffered, retrying once on a transient transport error.
+    """POST *content* buffered, retrying on a transient transport error until its budget.
 
     Returns the response for any HTTP status — the server answered, so an error status is
-    the caller's to interpret and is never retried. Returns None when the transport fails
-    on both the attempt and its one retry; the retry is safe because no downstream byte was
-    ever written. A ``RemoteProtocolError`` (HTTP/2 StreamReset) retires pooled connections
-    before the retry so it cannot reuse the poisoned session. *kind* labels the log lines
-    (``"Upstream"`` / ``"Provider"``). Shared by the two buffered POST paths so retry,
-    jittered backoff, and failure logging live once.
+    the caller's to interpret and is never retried. Returns None once the transport keeps
+    failing past the retry budget (``_max_retries_for``: one retry for ordinary transients,
+    ``_RESOLVER_MAX_RETRIES`` for a getaddrinfo blip); every retry is safe because no
+    downstream byte was ever written. A ``RemoteProtocolError`` (HTTP/2 StreamReset) retires
+    pooled connections before the retry so it cannot reuse the poisoned session. *kind*
+    labels the log lines (``"Upstream"`` / ``"Provider"``). Shared by the two buffered POST
+    paths so retry, jittered backoff, and failure logging live once.
     """
-    for attempt in range(2):
+    attempt = 0
+    while True:
         try:
             return await client.post(url, content=content, headers=headers)
         except _TRANSIENT_ERRORS as exc:
-            if attempt == 0:
+            budget = _max_retries_for(exc, 1)
+            if attempt >= budget:
                 if _is_remote_protocol_error(exc):
-                    logger.warning(
-                        "%s HTTP/2 stream reset, retiring connection and retrying: %s",
+                    await retire_pooled_connections(client)
+                    logger.error("%s unavailable after retry: %s", kind, exc)
+                elif _is_resolver_error(exc):
+                    logger.error(
+                        "%s DNS resolver failed after retry: %s; restart the bridge to recover",
                         kind,
                         exc,
                     )
-                    await retire_pooled_connections(client)
-                elif _is_resolver_error(exc):
-                    logger.warning("%s DNS resolver error, retrying: %s", kind, exc)
                 else:
-                    logger.warning("%s transient error, retrying: %s", kind, exc)
-                await asyncio.sleep(_backoff_for(exc))
-                continue
+                    logger.error("%s unavailable after retry: %s", kind, exc)
+                return None
+            attempt += 1
             if _is_remote_protocol_error(exc):
-                await retire_pooled_connections(client)
-                logger.error("%s unavailable after retry: %s", kind, exc)
-            elif _is_resolver_error(exc):
-                logger.error(
-                    "%s DNS resolver failed after retry: %s; restart the bridge to recover",
+                logger.warning(
+                    "%s HTTP/2 stream reset, retiring connection, retry %d/%d: %s",
                     kind,
+                    attempt,
+                    budget,
                     exc,
                 )
+                await retire_pooled_connections(client)
+            elif _is_resolver_error(exc):
+                logger.warning(
+                    "%s DNS resolver error, retry %d/%d: %s", kind, attempt, budget, exc
+                )
             else:
-                logger.error("%s unavailable after retry: %s", kind, exc)
-    return None
+                logger.warning("%s transient error, retry %d/%d: %s", kind, attempt, budget, exc)
+            await asyncio.sleep(_backoff_for(exc, attempt))
 
 
 def _build_timeout() -> httpx.Timeout:
@@ -239,9 +267,9 @@ async def forward_request(
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """POST the raw Anthropic request to the passthrough upstream (buffered).
 
-    Retries once on a transient transport error — safe because no downstream bytes have
-    been written yet. An HTTP error *status* is returned as-is (never retried): the
-    server responded, just unfavourably.
+    Retries transient transport errors — safe because no downstream bytes have been written
+    yet; see ``_buffered_post_with_retry`` for the per-error retry budget. An HTTP error
+    *status* is returned as-is (never retried): the server responded, just unfavourably.
     """
     url = f"{upstream_url}/v1/messages"
     headers = select_forward_headers(client_headers)
@@ -265,8 +293,9 @@ async def post_provider(
 ) -> tuple[int, bytes]:
     """POST a translated provider request and buffer the full response.
 
-    Retries once on a transient transport error (no downstream bytes yet). An HTTP error
-    status is returned as-is for the caller to translate.
+    Retries transient transport errors (no downstream bytes yet); see
+    ``_buffered_post_with_retry`` for the per-error retry budget. An HTTP error status is
+    returned as-is for the caller to translate.
     """
     headers = {"Content-Type": "application/json", **auth_headers}
     body = json.dumps(translated).encode()
@@ -291,9 +320,11 @@ async def open_stream(
     ``client.send(request, stream=True)`` establishes the connection and reads the
     response headers (so ``status_code`` / ``headers`` are usable) WITHOUT consuming the
     body — the caller inspects the status and Content-Type, then either reads the error
-    body or iterates ``aiter_bytes()``. The connect/header phase is retried once on a
-    transient error because no downstream byte has been written; a partially read body is
-    never retried (that would duplicate tool calls).
+    body or iterates ``aiter_bytes()``. The connect/header phase is retried on a transient
+    error because no downstream byte has been written; a partially read body is never
+    retried (that would duplicate tool calls). *retries* is the budget for ordinary
+    transients; a getaddrinfo blip is granted the larger ``_RESOLVER_MAX_RETRIES`` instead
+    (``_max_retries_for``) to ride out a self-clearing resolver blip.
 
     The caller MUST ``await response.aclose()``.
     """
@@ -304,7 +335,8 @@ async def open_stream(
             request = client.build_request("POST", url, content=content, headers=send_headers)
             return await client.send(request, stream=True)
         except _TRANSIENT_ERRORS as exc:
-            if attempt >= retries:
+            budget = _max_retries_for(exc, retries)
+            if attempt >= budget:
                 if _is_remote_protocol_error(exc):
                     await retire_pooled_connections(client)
                 elif _is_resolver_error(exc):
@@ -319,7 +351,7 @@ async def open_stream(
                 logger.warning(
                     "Stream connect HTTP/2 stream reset, retiring connection, retry %d/%d: %s",
                     attempt,
-                    retries,
+                    budget,
                     exc,
                 )
                 await retire_pooled_connections(client)
@@ -327,11 +359,11 @@ async def open_stream(
                 logger.warning(
                     "Stream connect DNS resolver error, retry %d/%d: %s",
                     attempt,
-                    retries,
+                    budget,
                     exc,
                 )
             else:
                 logger.warning(
-                    "Stream connect transient error, retry %d/%d: %s", attempt, retries, exc
+                    "Stream connect transient error, retry %d/%d: %s", attempt, budget, exc
                 )
             await asyncio.sleep(_backoff_for(exc, attempt))
