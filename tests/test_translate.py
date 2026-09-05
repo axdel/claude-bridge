@@ -38,7 +38,7 @@ class TestAnthropicToOpenaiTextOnly:
         }
         result, warnings = anthropic_to_openai(request)
 
-        assert result["model"] == "gpt-5.6-sol"
+        assert result["model"] == "gpt-6-astra"
         assert result["store"] is False
         assert "max_output_tokens" not in result  # Codex endpoint doesn't support it
         assert len(result["input"]) == 1
@@ -262,10 +262,10 @@ class TestAnthropicToOpenaiStripping:
         assert result["reasoning"] == {"effort": "high"}
         assert any("format" in w for w in warnings)
 
-    # -- output_config.effort mapping (GPT-5.6 shares Anthropic's vocabulary) --
-    # Oracle: GPT-5.6 accepts low/medium/high/xhigh/max — the same set Anthropic's
-    # output_config.effort uses — so a recognized caller effort maps 1:1. Expected
-    # values derive from that shared vocabulary, never from running the translator.
+    # -- output_config.effort mapping (gpt-6-astra covers Anthropic's vocabulary) --
+    # Oracle: gpt-6-astra accepts low/medium/high/xhigh/max — a superset of the set
+    # Anthropic's output_config.effort uses — so a recognized caller effort maps 1:1.
+    # Expected values derive from that published set, never from running the translator.
 
     def test_output_config_effort_low_maps_1to1(self):
         """A caller effort below max maps straight through — proving the effort is the
@@ -578,6 +578,13 @@ class TestOpenaiToAnthropicTextOnly:
     """Text-only response translation."""
 
     def test_basic_text_response(self):
+        """The upstream model is echoed verbatim, never replaced by our own default.
+
+        The fixture model is deliberately NOT ``DEFAULT_MODEL``: a response carries
+        whatever model upstream actually served, and asserting the echoed value against
+        a *different* id is what distinguishes real pass-through from silently
+        substituting our pin. Keep them different if the pin ever moves again.
+        """
         response = {
             "id": "resp_abc123",
             "model": "gpt-5.6-sol",

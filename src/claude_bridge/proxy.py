@@ -329,7 +329,7 @@ async def _process_request(
     )
 
 
-# A real model id is a short printable token (e.g. "grok-4.6", "gpt-5.6-sol").
+# A real model id is a short printable token (e.g. "grok-4.6", "gpt-6-astra").
 # The extracted value is request-controlled and reaches INFO logs and stats, so it
 # is bounded to keep a forged value from flooding the logs.
 _MODEL_LOG_LIMIT = 100

@@ -19,11 +19,13 @@ from claude_bridge.provider import ProviderCapabilities
 # so new Claude releases need no change here. (Add an entry only to override a
 # specific model to a different upstream target.)
 MODEL_MAP: dict[str, str] = {}
-DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_MODEL = "gpt-6-astra"
 GPT_TOKEN_COUNT_MULTIPLIER = 1.1
 
 # Anthropic output_config.effort vocabulary (Opus 4.6: low/medium/high/max; 4.7 adds xhigh).
-# GPT-5.6's reasoning.effort accepts the SAME set, so a recognized caller effort maps 1:1.
+# gpt-6-astra's reasoning.effort accepts every one of them, so a recognized caller effort
+# maps 1:1. Astra also accepts `ultra`; it is deliberately absent because Claude Code's
+# --effort tops out at max, so no caller can reach it through this bridge.
 _ANTHROPIC_EFFORT_VALUES = frozenset({"low", "medium", "high", "xhigh", "max"})
 # Default when the caller sends no effort — max preserves the prior always-max behavior and
 # matches "max everywhere". Claude Code always sends output_config.effort, so this is the
@@ -470,7 +472,7 @@ def _translate_tool_choice(tool_choice: dict) -> tuple[dict, list[str]]:
 def _resolve_openai_effort(request: dict, warnings: list[str]) -> str:
     """Resolve ``reasoning.effort`` from the caller's ``output_config``, defaulting to max.
 
-    GPT-5.6 shares Anthropic's effort vocabulary, so a recognized ``output_config.effort``
+    gpt-6-astra covers Anthropic's effort vocabulary, so a recognized ``output_config.effort``
     maps 1:1. Any other ``output_config`` subkey (e.g. structured-output ``format``) has no
     Responses equivalent and surfaces a warning; an unrecognized effort value defaults to
     max with a warning naming it. A safe-token wrapper neutralizes the client-controlled
@@ -509,7 +511,7 @@ def anthropic_to_openai(
     """
     warnings: list[str] = []
 
-    # reasoning.effort — honor the caller's output_config.effort (1:1 with GPT-5.6's
+    # reasoning.effort — honor the caller's output_config.effort (1:1 with gpt-6-astra's
     # vocabulary), defaulting to max. Replaces the old blanket strip of output_config: the
     # caller's per-request effort is a real instruction, not an unsupported key to discard.
     effort = _resolve_openai_effort(request, warnings)
@@ -530,8 +532,9 @@ def anthropic_to_openai(
     # so it returns each reasoning item's encrypted continuation blob. The provider
     # echoes these back before their function_calls on the next turn (see
     # _associate_reasoning_with_calls / OpenAIProvider._inject_reasoning); without it
-    # gpt-5-class models reject the follow-up with "function_call was provided without
-    # its required reasoning item".
+    # the model rejects the follow-up with "function_call was provided without its
+    # required reasoning item". Stateless mode is what triggers this, not the model
+    # generation, so it holds for gpt-6-astra exactly as it did for gpt-5-class.
     result: dict = {
         "model": translated_model,
         "reasoning": {"effort": effort},

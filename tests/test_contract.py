@@ -235,7 +235,7 @@ class TestSystemContextContract:
 
 
 class TestMediaContentContract:
-    """A pasted image/PDF must reach gpt-5.6-sol as a real Responses content part when the
+    """A pasted image/PDF must reach gpt-6-astra as a real Responses content part when the
     provider declares the modality, and degrade to a redacted placeholder (never
     echoing base64) otherwise. Expected shapes are the OpenAI Responses spec:
     ``input_image.image_url`` is a STRING data URL; ``input_file`` carries
@@ -587,7 +587,7 @@ class TestRequestInvariants:
         # Privacy posture (store=False) and streaming are contract invariants.
         assert result["store"] is False
         assert result["stream"] is True
-        assert result["model"] == "gpt-5.6-sol"
+        assert result["model"] == "gpt-6-astra"
 
     def test_tools_use_flat_function_shape_with_strict_false(self):
         result, _ = anthropic_to_openai(CLAUDE_CODE_TOOL_LOOP)

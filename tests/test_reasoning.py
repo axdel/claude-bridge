@@ -1,8 +1,10 @@
 """Reasoning-continuity contract (T-005 / D-REASON-001) — the bridge's one
 stateful surface, split out of test_contract.py (QAL3).
 
-gpt-5.6-sol with ``store: false`` rejects a function_call whose required reasoning
-item is absent. The provider captures encrypted reasoning from each response
+A Responses model in stateless mode (``store: false``) rejects a function_call whose
+required reasoning item is absent — the trigger is stateless mode, not the model
+generation, so this holds for gpt-6-astra as it did for gpt-5-class before it.
+The provider captures encrypted reasoning from each response
 keyed by call_id and re-injects it immediately before the matching function_call
 on the next request — opaque, in-memory, bounded, never leaked. These tests
 exercise provider STATE across calls; the pure-function translation contract
@@ -155,10 +157,10 @@ def _reasoning_before(items: list[dict], call_id: str) -> dict | None:
 
 
 class TestReasoningContinuity:
-    """T-005: gpt-5.6-sol with ``store: false`` rejects a function_call whose required
-    reasoning item is absent from the input. The provider asks for encrypted reasoning,
-    captures it from each response keyed by call_id, and re-injects it immediately before
-    the matching function_call on the next request — opaque, in-memory, never leaked."""
+    """T-005: a Responses model in stateless mode (``store: false``) rejects a function_call
+    whose required reasoning item is absent from the input. The provider asks for encrypted
+    reasoning, captures it from each response keyed by call_id, and re-injects it immediately
+    before the matching function_call on the next request — opaque, in-memory, never leaked."""
 
     def test_request_asks_for_encrypted_reasoning(self):
         # Oracle: stateless (store:false) continuity requires the Responses opt-in
