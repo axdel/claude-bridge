@@ -227,10 +227,12 @@ def test_launcher_parse_debug_is_consumed_not_forwarded():
 def test_launchers_do_not_set_the_claude_code_context_window():
     """The harness installer is the single writer for CLAUDE_CODE_MAX_CONTEXT_TOKENS.
 
-    It is a Claude Code env var the bridge never reads. Exporting it here made the
-    launcher a second writer, and because Claude Code takes min(assumed window,
-    auto-compact window), the lower value silently won — peers compacted at the
-    launcher's 300000 while the harness cap was 350000. See D-CONTEXT-002.
+    It is a Claude Code env var the bridge never reads, and it is inert for these
+    sessions besides: Claude Code resolves a recognized model id to its own window
+    before consulting the var, and it sends claude-opus-5 through this bridge. A
+    launcher-local export therefore states a window that nothing acts on, in a
+    second place, inviting drift against the harness value that does matter.
+    See D-CONTEXT-002.
     """
     repo_root = Path(__file__).resolve().parents[1]
     for name in ("claude-codex", "claude-grok"):

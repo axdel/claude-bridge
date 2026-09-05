@@ -102,10 +102,10 @@ echo ""
     export ANTHROPIC_AUTH_TOKEN=bridge-placeholder
     # CLAUDE_CODE_MAX_CONTEXT_TOKENS is deliberately NOT set here. It is a Claude Code
     # env var this bridge never reads, so the harness installer owns it globally for
-    # every session kind. Setting it here as well made this the second writer, and the
-    # lower of the two silently won: peers compacted at the launcher's window, not the
-    # harness cap. grok-4.6's 500K is the floor that sizes the harness value.
-    # See D-CONTEXT-002.
+    # every session kind. It is also inert for these sessions: Claude Code resolves a
+    # recognized model id to its own window before consulting the var, and it sends
+    # claude-opus-5 through this bridge. Compaction is governed by the harness's
+    # CLAUDE_CODE_AUTO_COMPACT_WINDOW alone. See D-CONTEXT-002.
     unset ANTHROPIC_API_KEY
     claude ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
 )
