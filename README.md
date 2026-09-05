@@ -17,7 +17,7 @@ We built a full development protocol on top of Claude Code — a finite state ma
 driving multi-agent workflows. Hundreds of hours of investment in `.claude/` configuration, hooks, CLAUDE.md conventions,
 and muscle memory.
 
-Then one day Claude is overloaded. Or rate-limited. Or you just want to see how GPT-5.6
+Then one day Claude is overloaded. Or rate-limited. Or you just want to see how GPT-6 Astra
 handles the same task with the same tools.
 
 **Without Claude Bridge:** your entire setup is useless. Claude Code only talks to Anthropic.
@@ -25,7 +25,7 @@ handles the same task with the same tools.
 **With Claude Bridge:** one command, same setup, different model.
 
 ```bash
-claude-codex    # your Claude Code + GPT-5.6
+claude-codex    # your Claude Code + GPT-6 Astra
 ```
 
 Core Claude Code flows work — tools, hooks, skills, streaming, multi-turn tool
@@ -135,7 +135,7 @@ which claude-codex claude-grok || echo 'Add to PATH: echo "export PATH=\$HOME/.l
 ### One command (recommended)
 
 ```bash
-claude-codex     # use OpenAI GPT-5.6 (ChatGPT Plus subscription or OPENAI_API_KEY)
+claude-codex     # use OpenAI GPT-6 Astra (ChatGPT Plus subscription or OPENAI_API_KEY)
 claude-grok      # use xAI Grok (grok-4.6) via your Grok subscription
 ```
 
@@ -147,7 +147,7 @@ You'll see:
 | (__| | (_| | |_| | (_| |  __/|___||(_| (_) | (_| |  __/>  <
  \___|_|\__,_|\__,_|\__,_|\___|     \___\___/ \__,_|\___/_/\_\
 
- port:9472  pid:12345  model:gpt-5.6-sol  version:0.9.0
+ port:9472  pid:12345  model:gpt-6-astra  version:0.9.0
  by axdel  github.com/axdel/claude-bridge
 ```
 
@@ -165,7 +165,7 @@ or
 ```
 
 > Claude Code's banner still says "Sonnet 4.6" — it doesn't know about the bridge.
-> For `claude-codex`, the actual model is the `gpt-5.6-sol` model shown in the bridge banner.
+> For `claude-codex`, the actual model is `gpt-6-astra`, shown in the bridge banner.
 > For `claude-grok`, the model is `grok-4.6` — pinned by default (override with `XAI_MODEL`;
 > set `XAI_MODEL=grok-build` to use xAI's rolling latest-coding-model alias instead).
 
@@ -174,7 +174,7 @@ The bridge starts on a random port, launches Claude Code through it, and cleans 
 ### Options
 
 ```bash
-claude-codex              # OpenAI/Codex (GPT-5.6)
+claude-codex              # OpenAI/Codex (GPT-6 Astra)
 claude-grok               # xAI Grok subscription (grok-4.6)
 claude-codex --debug      # show bridge translation logs
 claude-grok --debug       # same for Grok
@@ -248,7 +248,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
     "started_at": "2026-03-20T10:00:00+00:00",
     "uptime_seconds": 3600.0,
     "provider_name": "openai",
-    "model": "gpt-5.6-sol"
+    "model": "gpt-6-astra"
 }
 ```
 
