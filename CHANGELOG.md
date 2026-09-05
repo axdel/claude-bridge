@@ -2,6 +2,14 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-09-05
+
+### feat: pin the OpenAI provider model to gpt-6-astra ([PR #23](https://github.com/axdel/claude-bridge/pull/23))
+Repoint the bridge's OpenAI provider from gpt-5.6-sol to gpt-6-astra (D-OPENAI-001), verified against this account's codex model cache and the published model page; reasoning effort stays max, which astra accepts. The claude-codex banner now derives its model from the DEFAULT_MODEL owner instead of a hardcoded literal (mirroring D-XAI-008), committed ahead of the pin so no commit ships a banner contradicting the model in flight.
+
+- [`4be39da`](https://github.com/axdel/claude-bridge/commit/4be39da) Pin the OpenAI provider model to gpt-6-astra
+- [`cdcf6c3`](https://github.com/axdel/claude-bridge/commit/cdcf6c3) Derive the claude-codex banner model from its config owner
+
 ## 2026-08-31
 
 ### fix: ride out transient DNS resolver blips with a larger retry budget ([PR #22](https://github.com/axdel/claude-bridge/pull/22))
