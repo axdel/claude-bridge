@@ -88,7 +88,11 @@ cat <<'BANNER'
 
 BANNER
 BRIDGE_VERSION=$("$BRIDGE_PY" -I -c "from claude_bridge import __version__; print(__version__)" 2>/dev/null || echo "?")
-echo " port:${PORT}  pid:${BRIDGE_PID}  model:gpt-5.6-sol  version:${BRIDGE_VERSION}"
+# Derive the model from the config owner (providers.openai.DEFAULT_MODEL) rather than
+# hardcoding it, so the banner tracks the pin instead of drifting from what is sent.
+# Mirrors the claude-grok banner (D-XAI-008).
+BRIDGE_MODEL=$("$BRIDGE_PY" -I -c "from claude_bridge.providers.openai import DEFAULT_MODEL; print(DEFAULT_MODEL)" 2>/dev/null || echo "?")
+echo " port:${PORT}  pid:${BRIDGE_PID}  model:${BRIDGE_MODEL}  version:${BRIDGE_VERSION}"
 echo " by axdel  github.com/axdel/claude-bridge"
 echo ""
 

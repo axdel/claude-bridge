@@ -90,6 +90,31 @@ def test_launchers_use_isolated_python():
         assert "export PYTHONPATH" not in text, f"{name} must not re-export inherited PYTHONPATH"
 
 
+def test_launcher_banners_derive_model_from_config_owner():
+    """Neither banner may name a model literal — each resolves it from the module that
+    owns the id, so the printed model cannot drift from the one actually sent.
+
+    D-XAI-008 established this for ``claude-grok``. ``claude-codex`` kept a hardcoded
+    ``gpt-5.6-sol`` beside the authoritative ``DEFAULT_MODEL``: a second writer that
+    stayed correct only by luck, and would have printed the old id while sending the
+    new one the moment either changed. The banner is the operator's only in-terminal
+    statement of what is on the wire, so a stale one is a lie, not a cosmetic bug.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    for name in ("claude-codex", "claude-grok"):
+        text = (repo_root / name).read_text()
+        banner = next(line for line in text.splitlines() if " model:" in line)
+        _, _, after_model = banner.partition("model:")
+        assert after_model.startswith("$"), (
+            f"{name} banner hardcodes a model literal — derive it from the owning "
+            f"module instead (D-XAI-008): {banner.strip()!r}"
+        )
+        assert "BRIDGE_MODEL=$(" in text, f"{name} must resolve its banner model at runtime"
+        assert '"$BRIDGE_PY" -I -c' in text, (
+            f"{name} must resolve the banner model through the isolated venv python"
+        )
+
+
 # Skill-recipe argv that /plan and /review actually dispatch (flags, then wrapper --, then prompt).
 _SKILL_RECIPE = (
     "-p",
