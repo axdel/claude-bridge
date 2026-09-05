@@ -100,9 +100,12 @@ echo ""
 (
     export ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}"
     export ANTHROPIC_AUTH_TOKEN=bridge-placeholder
-    # Tell Claude Code the backing model has a 300k-token window (well within
-    # grok-4.6's 500K context) so it defers auto-compaction and uses more context per session.
-    export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-300000}"
+    # CLAUDE_CODE_MAX_CONTEXT_TOKENS is deliberately NOT set here. It is a Claude Code
+    # env var this bridge never reads, so the harness installer owns it globally for
+    # every session kind. Setting it here as well made this the second writer, and the
+    # lower of the two silently won: peers compacted at the launcher's window, not the
+    # harness cap. grok-4.6's 500K is the floor that sizes the harness value.
+    # See D-CONTEXT-002.
     unset ANTHROPIC_API_KEY
     claude ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
 )
