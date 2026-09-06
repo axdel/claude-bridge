@@ -94,6 +94,8 @@ class _MessageAccumulator:
         delta = data.get("delta", {})
         if delta.get("type") == "text_delta":
             block["text"] = block.get("text", "") + delta.get("text", "")
+        elif delta.get("type") == "thinking_delta":
+            block["thinking"] = block.get("thinking", "") + delta.get("thinking", "")
         elif delta.get("type") == "input_json_delta":
             index = data.get("index", 0)
             self._tool_json[index] = self._tool_json.get(index, "") + delta.get("partial_json", "")
