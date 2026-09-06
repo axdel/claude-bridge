@@ -535,9 +535,14 @@ def anthropic_to_openai(
     # the model rejects the follow-up with "function_call was provided without its
     # required reasoning item". Stateless mode is what triggers this, not the model
     # generation, so it holds for gpt-6-astra exactly as it did for gpt-5-class.
+    # reasoning.summary: the Responses API streams reasoning summaries ONLY when this is
+    # set — omit it and the model reasons silently, leaving the client with nothing
+    # between message_start and the first answer token. "auto" lets the model pick the
+    # granularity. Measured against the Codex endpoint: absent -> 0 reasoning events;
+    # "auto" -> first visible output at 5.52s, with total turn duration unchanged.
     result: dict = {
         "model": translated_model,
-        "reasoning": {"effort": effort},
+        "reasoning": {"effort": effort, "summary": "auto"},
         "store": False,
         "stream": True,
         "include": ["reasoning.encrypted_content"],

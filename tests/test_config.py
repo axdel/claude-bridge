@@ -11,13 +11,18 @@ import pytest
         ("connect_timeout", "CONNECT_TIMEOUT_ENV", 10.0),
         ("stream_idle_timeout", "STREAM_IDLE_TIMEOUT_ENV", 300.0),
         ("pool_idle", "POOL_IDLE_ENV", 90.0),
+        ("keepalive_ping_interval", "KEEPALIVE_PING_INTERVAL_ENV", 15.0),
     ],
 )
 def test_positive_float_timeout_accessor_default_override_and_invalid_fallback(
     monkeypatch, accessor_name, env_name, default
 ):
-    """Each HTTP/2 timeout accessor returns its spec default, honors a positive override,
-    and falls back (invoking on_invalid) for unparseable or non-positive values."""
+    """Each positive-float seconds accessor returns its spec default, honors a positive
+    override, and falls back (invoking on_invalid) for unparseable or non-positive values.
+
+    Covers the HTTP/2 transport timeouts and the downstream keepalive cadence alike: they
+    are different concepts but one contract, so they share one table rather than a copy.
+    """
     import claude_bridge.config as config
 
     accessor = getattr(config, accessor_name)

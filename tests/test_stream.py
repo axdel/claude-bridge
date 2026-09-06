@@ -263,6 +263,119 @@ class TestOpenAIToAnthropicSSETranslation:
         assert isinstance(usage["output_tokens"], int)
 
 
+class TestReasoningSummaryTranslation:
+    """Reasoning-summary events become Anthropic thinking blocks.
+
+    Oracle: the Anthropic streaming protocol represents model reasoning as a
+    ``thinking`` content block — ``content_block_start`` with a ``thinking`` block,
+    ``thinking_delta`` increments, ``content_block_stop``. The Responses side of the
+    mapping is fixed by the OpenAI streaming-events reference and confirmed against a
+    captured gpt-6-astra turn: a reasoning item emits, per summary part,
+    ``reasoning_summary_part.added`` → repeated ``reasoning_summary_text.delta`` →
+    ``reasoning_summary_text.done`` → ``reasoning_summary_part.done``.
+
+    Without this mapping the whole reasoning phase is dropped and the client sees no
+    output at all until the first answer token — measured at 243.75s of silence on a
+    max-effort turn.
+    """
+
+    def test_summary_part_added_opens_a_thinking_block(self):
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        results = translate_openai_sse_event(
+            {
+                "event": "response.reasoning_summary_part.added",
+                "data": {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": "rs_abc",
+                    "output_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                    "sequence_number": 3,
+                    "summary_index": 0,
+                },
+            }
+        )
+        assert len(results) == 1
+        assert results[0]["event"] == "content_block_start"
+        assert results[0]["data"]["content_block"] == {"type": "thinking", "thinking": ""}
+
+    def test_summary_text_delta_becomes_thinking_delta(self):
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        results = translate_openai_sse_event(
+            {
+                "event": "response.reasoning_summary_text.delta",
+                "data": {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "**Assessing task scope**",
+                    "item_id": "rs_abc",
+                    "obfuscation": "EeQeU1re",
+                    "output_index": 0,
+                    "sequence_number": 4,
+                    "summary_index": 0,
+                },
+            }
+        )
+        assert len(results) == 1
+        assert results[0]["event"] == "content_block_delta"
+        assert results[0]["data"]["delta"] == {
+            "type": "thinking_delta",
+            "thinking": "**Assessing task scope**",
+        }
+
+    def test_summary_part_done_closes_the_thinking_block(self):
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        results = translate_openai_sse_event(
+            {
+                "event": "response.reasoning_summary_part.done",
+                "data": {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": "rs_abc",
+                    "output_index": 0,
+                    "part": {"type": "summary_text", "text": "**Assessing task scope**"},
+                    "sequence_number": 6,
+                    "summary_index": 0,
+                },
+            }
+        )
+        assert len(results) == 1
+        assert results[0]["event"] == "content_block_stop"
+
+    def test_summary_text_done_emits_nothing(self):
+        # The deltas already carried the text; re-emitting the assembled `text`
+        # would duplicate the whole summary inside the block.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        results = translate_openai_sse_event(
+            {
+                "event": "response.reasoning_summary_text.done",
+                "data": {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": "rs_abc",
+                    "output_index": 0,
+                    "sequence_number": 5,
+                    "summary_index": 0,
+                    "text": "**Assessing task scope**",
+                },
+            }
+        )
+        assert results == []
+
+    def test_reasoning_output_item_added_still_opens_no_block(self):
+        # The block is opened by the summary part, not by the reasoning item itself —
+        # a reasoning item may carry several parts, each its own thinking block.
+        from claude_bridge.providers.openai import translate_openai_sse_event
+
+        results = translate_openai_sse_event(
+            {
+                "event": "response.output_item.added",
+                "data": {"output_index": 0, "item": {"type": "reasoning", "id": "rs_abc"}},
+            }
+        )
+        assert results == []
+
+
 class TestTerminalStreamEvents:
     """Every Responses terminal event type must produce an Anthropic stream
     terminator.
@@ -887,6 +1000,128 @@ class TestTranslateStream:
             events.append(event)
 
         assert any(e["event"] == "error" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_multi_part_reasoning_then_text_gets_distinct_block_indices(self):
+        """Each summary part is its own thinking block, and the answer text follows.
+
+        Oracle: the captured gpt-6-astra turn emits three summary parts under ONE
+        reasoning item — all three carry ``output_index: 0`` while the answer's text
+        block carries ``content_index: 0``. Anthropic requires content-block indices to
+        be distinct and sequential, so ``_remap_block_index`` must hand out 0, 1, 2 to
+        the parts and 3 to the text rather than collapsing them onto one index.
+        """
+        from claude_bridge.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider()
+
+        blobs = [
+            _make_sse_event(
+                "response.created",
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_r",
+                        "model": "gpt-6-astra",
+                        "status": "in_progress",
+                        "usage": {"input_tokens": 5, "output_tokens": 0},
+                    },
+                },
+            ),
+            _make_sse_event(
+                "response.output_item.added",
+                {"output_index": 0, "item": {"type": "reasoning", "id": "rs_a"}},
+            ),
+        ]
+        for summary_index, text in enumerate(["first", "second", "third"]):
+            blobs.append(
+                _make_sse_event(
+                    "response.reasoning_summary_part.added",
+                    {
+                        "item_id": "rs_a",
+                        "output_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                        "summary_index": summary_index,
+                    },
+                )
+            )
+            blobs.append(
+                _make_sse_event(
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "item_id": "rs_a",
+                        "output_index": 0,
+                        "delta": text,
+                        "summary_index": summary_index,
+                    },
+                )
+            )
+            blobs.append(
+                _make_sse_event(
+                    "response.reasoning_summary_part.done",
+                    {
+                        "item_id": "rs_a",
+                        "output_index": 0,
+                        "part": {"type": "summary_text", "text": text},
+                        "summary_index": summary_index,
+                    },
+                )
+            )
+        blobs.append(
+            _make_sse_event(
+                "response.content_part.added",
+                {"output_index": 1, "content_index": 0, "part": {"type": "output_text"}},
+            )
+        )
+        blobs.append(
+            _make_sse_event(
+                "response.output_text.delta",
+                {"output_index": 1, "content_index": 0, "delta": "answer"},
+            )
+        )
+        blobs.append(
+            _make_sse_event(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_r",
+                        "model": "gpt-6-astra",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 5, "output_tokens": 9},
+                    },
+                },
+            )
+        )
+
+        events = []
+        async for event in provider.translate_stream(_chunks_from([b"".join(blobs)])):
+            events.append(event)
+
+        starts = [e for e in events if e["event"] == "content_block_start"]
+        assert [s["data"]["index"] for s in starts] == [0, 1, 2, 3]
+        assert [s["data"]["content_block"]["type"] for s in starts] == [
+            "thinking",
+            "thinking",
+            "thinking",
+            "text",
+        ]
+
+        thinking = [
+            (e["data"]["index"], e["data"]["delta"]["thinking"])
+            for e in events
+            if e["event"] == "content_block_delta"
+            and e["data"]["delta"]["type"] == "thinking_delta"
+        ]
+        assert thinking == [(0, "first"), (1, "second"), (2, "third")]
+
+        text_deltas = [
+            (e["data"]["index"], e["data"]["delta"]["text"])
+            for e in events
+            if e["event"] == "content_block_delta" and e["data"]["delta"]["type"] == "text_delta"
+        ]
+        assert text_deltas == [(3, "answer")]
 
 
 # ---------------------------------------------------------------------------

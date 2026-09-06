@@ -2140,12 +2140,83 @@ class TestSseEventTranslation:
             "input": {},
         }
 
-    def test_reasoning_output_item_added_is_dropped(self):
-        # A reasoning item is not surfaced as an Anthropic content block in the stream.
+    def test_reasoning_output_item_added_opens_no_block(self):
+        # The reasoning ITEM opens nothing — a thinking block is opened per summary
+        # part instead, since one reasoning item may carry several parts.
         events = translate_xai_sse_event(
             {
                 "event": "response.output_item.added",
                 "data": {"output_index": 0, "item": {"type": "reasoning", "id": "rs_r"}},
+            }
+        )
+        assert events == []
+
+    def test_summary_part_added_opens_a_thinking_block(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.reasoning_summary_part.added",
+                "data": {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": "rs_r",
+                    "output_index": 0,
+                    "part": {"text": "", "type": "summary_text"},
+                    "sequence_number": 3,
+                    "summary_index": 0,
+                },
+            }
+        )
+        assert len(events) == 1
+        assert events[0]["event"] == "content_block_start"
+        assert events[0]["data"]["content_block"] == {"type": "thinking", "thinking": ""}
+
+    def test_summary_text_delta_becomes_thinking_delta(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.reasoning_summary_text.delta",
+                "data": {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "The",
+                    "item_id": "rs_r",
+                    "output_index": 0,
+                    "sequence_number": 4,
+                    "summary_index": 0,
+                },
+            }
+        )
+        assert len(events) == 1
+        assert events[0]["event"] == "content_block_delta"
+        assert events[0]["data"]["delta"] == {"type": "thinking_delta", "thinking": "The"}
+
+    def test_summary_part_done_closes_the_thinking_block(self):
+        events = translate_xai_sse_event(
+            {
+                "event": "response.reasoning_summary_part.done",
+                "data": {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": "rs_r",
+                    "output_index": 0,
+                    "part": {"text": "The bridge", "type": "summary_text"},
+                    "sequence_number": 52,
+                    "summary_index": 0,
+                },
+            }
+        )
+        assert len(events) == 1
+        assert events[0]["event"] == "content_block_stop"
+
+    def test_summary_text_done_emits_nothing(self):
+        # The deltas already carried the text; the assembled `text` would duplicate it.
+        events = translate_xai_sse_event(
+            {
+                "event": "response.reasoning_summary_text.done",
+                "data": {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": "rs_r",
+                    "output_index": 0,
+                    "sequence_number": 51,
+                    "summary_index": 0,
+                    "text": "The bridge",
+                },
             }
         )
         assert events == []
@@ -2257,21 +2328,28 @@ class TestSseEventTranslation:
             assert translate_xai_sse_event({"event": event_type, "data": {}}) == []
 
     def test_unknown_event_yields_nothing(self):
-        assert (
-            translate_xai_sse_event({"event": "response.reasoning_summary_text.delta", "data": {}})
-            == []
-        )
+        # An event type the translator has no mapping for is dropped rather than
+        # guessed at. Must stay a genuinely unrecognized type — this assertion once
+        # used a reasoning-summary event, which pinned the reasoning-drop bug as
+        # intended behavior.
+        assert translate_xai_sse_event({"event": "response.not_a_real_event", "data": {}}) == []
 
 
 class TestStreamLifecycle:
     """XAIProvider.translate_stream: full lifecycle over the golden capture + block remapping."""
 
     def test_text_stream_full_lifecycle_matches_golden_capture(self):
+        # The capture carries a reasoning summary (1 part, 10 text deltas) ahead of the
+        # answer (1 part, 2 text deltas). Both become Anthropic content blocks: the
+        # reasoning as a thinking block, the answer as a text block.
         raw = (_FIXTURES / "text_stream.txt").read_bytes()
         events = _run_stream([raw])
         assert _event_names(events) == [
             "message_start",
             "ping",
+            "content_block_start",
+            *["content_block_delta"] * 10,
+            "content_block_stop",
             "content_block_start",
             "content_block_delta",
             "content_block_delta",
@@ -2284,9 +2362,25 @@ class TestStreamLifecycle:
         raw = (_FIXTURES / "text_stream.txt").read_bytes()
         events = _run_stream([raw])
         deltas = [
-            e["data"]["delta"]["text"] for e in events if e["event"] == "content_block_delta"
+            e["data"]["delta"]["text"]
+            for e in events
+            if e["event"] == "content_block_delta" and e["data"]["delta"]["type"] == "text_delta"
         ]
         assert "".join(deltas) == "hi there"
+
+    def test_text_stream_surfaces_the_reasoning_summary(self):
+        # The capture's 10 reasoning deltas were previously dropped, leaving the client
+        # with no output at all until the answer began.
+        raw = (_FIXTURES / "text_stream.txt").read_bytes()
+        events = _run_stream([raw])
+        thinking = [
+            e["data"]["delta"]["thinking"]
+            for e in events
+            if e["event"] == "content_block_delta"
+            and e["data"]["delta"]["type"] == "thinking_delta"
+        ]
+        assert len(thinking) == 10
+        assert "".join(thinking).strip() != ""
 
     def test_text_stream_terminal_carries_end_turn_and_full_usage(self):
         raw = (_FIXTURES / "text_stream.txt").read_bytes()
@@ -2303,13 +2397,29 @@ class TestStreamLifecycle:
         assert message["model"] == "grok-4.20-0309-reasoning"
 
     def test_block_indices_are_sequential_from_zero(self):
+        # Anthropic requires distinct, sequential block indices. The thinking block
+        # takes 0 and the answer's text block takes 1, and every delta/stop lands on
+        # its own block — upstream numbers both as output_index/content_index 0.
         raw = (_FIXTURES / "text_stream.txt").read_bytes()
         events = _run_stream([raw])
-        block_start = next(e for e in events if e["event"] == "content_block_start")
-        assert block_start["data"]["index"] == 0
-        for e in events:
-            if e["event"] in ("content_block_delta", "content_block_stop"):
-                assert e["data"]["index"] == 0
+        starts = [e for e in events if e["event"] == "content_block_start"]
+        assert [s["data"]["index"] for s in starts] == [0, 1]
+        assert [s["data"]["content_block"]["type"] for s in starts] == ["thinking", "text"]
+
+        thinking_indices = {
+            e["data"]["index"]
+            for e in events
+            if e["event"] == "content_block_delta"
+            and e["data"]["delta"]["type"] == "thinking_delta"
+        }
+        text_indices = {
+            e["data"]["index"]
+            for e in events
+            if e["event"] == "content_block_delta" and e["data"]["delta"]["type"] == "text_delta"
+        }
+        assert thinking_indices == {0}
+        assert text_indices == {1}
+        assert [e["data"]["index"] for e in events if e["event"] == "content_block_stop"] == [0, 1]
 
     def test_stream_survives_chunk_boundaries_mid_event(self):
         # Splitting the raw bytes at an arbitrary offset (mid-event) must not change the

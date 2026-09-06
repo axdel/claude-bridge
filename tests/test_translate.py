@@ -259,8 +259,27 @@ class TestAnthropicToOpenaiStripping:
         }
         result, warnings = anthropic_to_openai(request)
         assert "output_config" not in result
-        assert result["reasoning"] == {"effort": "high"}
+        assert result["reasoning"]["effort"] == "high"
         assert any("format" in w for w in warnings)
+
+    def test_request_asks_for_a_reasoning_summary(self):
+        """The Responses API streams reasoning summaries ONLY when reasoning.summary is
+        set; omit it and the model reasons silently.
+
+        Oracle: the OpenAI reasoning guide documents summary as auto/concise/detailed,
+        with no summary events emitted when the field is absent. Probed against the live
+        Codex endpoint on one question: absent -> 0 reasoning events; auto -> 4, first at
+        5.52s. Without this the bridge has nothing to show during the reasoning phase, so
+        a long turn is indistinguishable from a hung connection.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 100,
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result, _ = anthropic_to_openai(request)
+        assert result["reasoning"] == {"effort": "max", "summary": "auto"}
 
     # -- output_config.effort mapping (gpt-6-astra covers Anthropic's vocabulary) --
     # Oracle: gpt-6-astra accepts low/medium/high/xhigh/max — a superset of the set
@@ -277,7 +296,7 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, _ = anthropic_to_openai(request)
-        assert result["reasoning"] == {"effort": "low"}
+        assert result["reasoning"]["effort"] == "low"
 
     def test_output_config_effort_max_maps_1to1(self):
         """The real Claude Code case: effort=max maps 1:1 to reasoning.effort=max."""
@@ -288,7 +307,7 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, _ = anthropic_to_openai(request)
-        assert result["reasoning"] == {"effort": "max"}
+        assert result["reasoning"]["effort"] == "max"
 
     def test_no_output_config_defaults_to_max(self):
         """With no output_config the effort defaults to max (prior behavior preserved)."""
@@ -298,7 +317,7 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, warnings = anthropic_to_openai(request)
-        assert result["reasoning"] == {"effort": "max"}
+        assert result["reasoning"]["effort"] == "max"
         assert not any("output_config" in w for w in warnings)
 
     def test_output_config_format_subkey_is_lossy_warning(self):
@@ -311,7 +330,7 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, warnings = anthropic_to_openai(request)
-        assert result["reasoning"] == {"effort": "max"}
+        assert result["reasoning"]["effort"] == "max"
         assert any("format" in w for w in warnings)
 
     def test_output_config_unrecognized_effort_defaults_max_with_warning(self):
@@ -323,7 +342,7 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, warnings = anthropic_to_openai(request)
-        assert result["reasoning"] == {"effort": "max"}
+        assert result["reasoning"]["effort"] == "max"
         assert any("turbo" in w for w in warnings)
 
     def test_nonstring_effort_logged_as_type_not_contents(self):
@@ -340,7 +359,7 @@ class TestAnthropicToOpenaiStripping:
             "messages": [{"role": "user", "content": "Hi"}],
         }
         result, warnings = anthropic_to_openai(request)
-        assert result["reasoning"] == {"effort": "max"}
+        assert result["reasoning"]["effort"] == "max"
         assert any("<dict>" in w for w in warnings)
         assert not any("sk-leak" in w for w in warnings)
 

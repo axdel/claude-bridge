@@ -61,7 +61,8 @@ def _sse_output_item_added(data: dict) -> list[dict]:
     xAI divergence: the tool_use ``id`` is the upstream ``call_id`` VERBATIM (no ``fc_``/
     ``call_`` rewrite), identical to the non-stream ``xai_to_anthropic`` path, so a tool call
     streamed and the same call replayed as a ``function_call_output`` share one id.
-    Non-function_call items (reasoning, message) are surfaced via their own events, not here.
+    A reasoning item opens nothing here — its content is surfaced per summary part by
+    ``_sse_reasoning_summary``, since one item may carry several parts.
     """
     item = data.get("item", {})
     output_index = data.get("output_index", 0)
@@ -82,6 +83,61 @@ def _sse_output_item_added(data: dict) -> list[dict]:
                 },
             },
         }
+    ]
+
+
+# The three reasoning-summary events that carry a summary part's lifecycle.
+# ``response.reasoning_summary_text.done`` is deliberately absent: its ``text`` field
+# repeats what the deltas already delivered, so translating it would duplicate the
+# whole summary inside the block. It is skipped explicitly below.
+_REASONING_SUMMARY_EVENTS = frozenset(
+    {
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_part.done",
+    }
+)
+
+
+def _sse_reasoning_summary(event_type: str, data: dict) -> list[dict]:
+    """Translate one reasoning-summary event → one Anthropic thinking-block event.
+
+    A reasoning item emits ``part.added`` → repeated ``text.delta`` → ``part.done`` per
+    summary part, which maps exactly onto Anthropic's ``content_block_start`` →
+    ``thinking_delta`` → ``content_block_stop``. Without this the entire reasoning
+    phase is dropped and the client sees nothing until the first answer token — grok
+    streams these deltas continuously through a multi-minute reasoning phase.
+
+    Blocks are keyed on ``output_index`` — the space ``function_call`` items already
+    use, distinct from the ``content_index`` text blocks use — which
+    ``_remap_block_index`` renumbers into sequential Anthropic block indices. Several
+    parts share one ``output_index``, so each opens and closes before the next begins.
+    """
+    index = data.get("output_index", 0)
+    if event_type == "response.reasoning_summary_part.added":
+        return [
+            {
+                "event": "content_block_start",
+                "data": {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            }
+        ]
+    if event_type == "response.reasoning_summary_text.delta":
+        return [
+            {
+                "event": "content_block_delta",
+                "data": {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": data.get("delta", "")},
+                },
+            }
+        ]
+    return [
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": index}}
     ]
 
 
@@ -217,6 +273,8 @@ _SKIPPED_SSE_EVENTS = frozenset(
         "response.queued",
         "response.content_part.done",
         "response.output_item.done",
+        # Carries the assembled summary text the deltas already streamed.
+        "response.reasoning_summary_text.done",
     }
 )
 
@@ -275,6 +333,9 @@ def translate_xai_sse_event(
                 },
             }
         ]
+
+    if event_type in _REASONING_SUMMARY_EVENTS:
+        return _sse_reasoning_summary(event_type, data)
 
     if event_type == "response.output_item.added":
         return _sse_output_item_added(data)

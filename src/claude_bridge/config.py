@@ -27,6 +27,7 @@ XAI_REASONING_EFFORT_ENV = "XAI_REASONING_EFFORT"
 CONNECT_TIMEOUT_ENV = "CONNECT_TIMEOUT"
 STREAM_IDLE_TIMEOUT_ENV = "STREAM_IDLE_TIMEOUT"
 POOL_IDLE_ENV = "POOL_IDLE"
+KEEPALIVE_PING_INTERVAL_ENV = "KEEPALIVE_PING_INTERVAL"
 
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_ANTHROPIC_REAL_URL = "https://api.anthropic.com"
@@ -58,6 +59,13 @@ _XAI_REASONING_EFFORTS = ("low", "medium", "high")
 DEFAULT_CONNECT_TIMEOUT = 10.0
 DEFAULT_STREAM_IDLE_TIMEOUT = 300.0
 DEFAULT_POOL_IDLE = 90.0
+
+# Downstream keepalive cadence (seconds) — the mirror of DEFAULT_STREAM_IDLE_TIMEOUT above,
+# which bounds silence on the *upstream* socket. This bounds silence on the socket back to
+# Claude Code: after this long without a translatable event, the bridge emits a ping so the
+# client can tell a working stream from a dead connection. Well under the 300s upstream idle
+# timeout, so a client sees liveness long before the transport would give up.
+DEFAULT_KEEPALIVE_PING_INTERVAL = 15.0
 
 # cli-chat-proxy.grok.com answers HTTP 426 below this x-grok-client-version; the
 # resolver never sends a header older than this floor. Bundle dir layout:
@@ -147,6 +155,21 @@ def stream_idle_timeout(*, on_invalid: Callable[[str], None] | None = None) -> f
     """
     return _positive_env_number(
         STREAM_IDLE_TIMEOUT_ENV, DEFAULT_STREAM_IDLE_TIMEOUT, cast=float, on_invalid=on_invalid
+    )
+
+
+def keepalive_ping_interval(*, on_invalid: Callable[[str], None] | None = None) -> float:
+    """Return the positive KEEPALIVE_PING_INTERVAL override (seconds) or the default.
+
+    How long the translated stream may go without a downstream event before the bridge
+    emits a ping — a cadence for the connection back to Claude Code, not a deadline: a
+    quiet stream pings repeatedly and is never cut off.
+    """
+    return _positive_env_number(
+        KEEPALIVE_PING_INTERVAL_ENV,
+        DEFAULT_KEEPALIVE_PING_INTERVAL,
+        cast=float,
+        on_invalid=on_invalid,
     )
 
 

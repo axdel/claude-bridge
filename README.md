@@ -59,6 +59,8 @@ of leaking provider-incompatible content.
 - **Direct API key auth** — set `OPENAI_API_KEY` for the official OpenAI Responses API
 - **Subscription OAuth** — no API key? Uses Codex OAuth (OpenAI, `~/.codex/auth.json`) or Grok CLI OAuth (xAI, `~/.grok/auth.json`) automatically — xAI is subscription-only, no API key
 - **Reasoning continuity** — encrypted reasoning blobs are cached in memory and echoed across tool turns (OpenAI and xAI)
+- **Live reasoning** — the provider's reasoning summary streams to the client as Anthropic `thinking` blocks while the model works, instead of nothing until the answer begins (OpenAI and xAI). Measured on a max-effort turn: first visible output at 7s rather than 333s
+- **Keepalive pings** — a `ping` every `KEEPALIVE_PING_INTERVAL` seconds whenever the translated stream goes quiet, so a client can tell a working stream from a dead connection even from a provider that emits no reasoning at all
 - **Reasoning passthrough controls** — `REASONING_MODE` preserves or drops thinking blocks (OpenAI and xAI)
 - **Non-text input** — image and document (PDF) blocks forward to OpenAI and xAI as `input_image`/`input_file`, including media nested in `tool_result`; unsupported media degrades to a redacted placeholder with a warning (never echoes the payload)
 - **Auto-failover** — circuit breaker routes Anthropic 429/500/502/503 to the first available fallback provider
@@ -265,6 +267,7 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | `CONNECT_TIMEOUT` | `10.0` | Data-plane TCP connect timeout in seconds (httpx transport) — a dead connect fails fast; invalid, zero, or negative values fall back to the default |
 | `STREAM_IDLE_TIMEOUT` | `300.0` | Data-plane read/write idle timeout in seconds — the gap between streamed chunks, so long grok-4.6 thinking survives as long as chunks keep arriving; invalid, zero, or negative values fall back to the default |
 | `POOL_IDLE` | `90.0` | Data-plane connection-pool idle timeout in seconds for the shared keep-alive `AsyncClient`; invalid, zero, or negative values fall back to the default |
+| `KEEPALIVE_PING_INTERVAL` | `15.0` | Downstream keepalive cadence in seconds — how long the translated stream may go without an event before the bridge sends the client a `ping`. A cadence, not a deadline: a quiet stream pings repeatedly and is never cut off. Invalid, zero, or negative values fall back to the default |
 | `MAX_REQUEST_BODY` | `10485760` | Maximum request body size in bytes (default 10 MiB) |
 | `LLM_BRIDGE_FALLBACK` | `openai` | Comma-separated fallback preference list; the first registered provider is used |
 | `LLM_BRIDGE_PORT` | `9999` | Shell launcher default proxy port |
