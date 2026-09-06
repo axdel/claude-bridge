@@ -15,6 +15,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 
 import httpx
 
+from claude_bridge import config
 from claude_bridge.http_client import (
     _is_remote_protocol_error,
     open_stream,
@@ -323,17 +324,16 @@ def _accumulate_usage(
     return tokens_in, tokens_out
 
 
-# How long the translated event stream may go quiet before the pump emits a keepalive
-# ping. A provider can reason for minutes without producing a single translatable event,
-# and a client receiving no bytes cannot tell that from a dead connection. ``ping`` is a
-# no-op in the Anthropic streaming protocol, so injecting one is always safe.
-_KEEPALIVE_PING_SECONDS = 15.0
-
-
 async def _with_keepalive_pings(
-    events: AsyncIterator[dict], interval: float = _KEEPALIVE_PING_SECONDS
+    events: AsyncIterator[dict], interval: float | None = None
 ) -> AsyncGenerator[dict, None]:
     """Yield ``events``, injecting a ping whenever the source stays quiet for ``interval``.
+
+    A provider can reason for minutes without producing a single translatable event, and a
+    client receiving no bytes cannot tell that from a dead connection. ``ping`` is a no-op
+    in the Anthropic streaming protocol, so injecting one is always safe. ``interval``
+    defaults to the configured cadence, resolved per call so the environment is read when
+    the stream starts rather than when this module is imported.
 
     The pending ``__anext__`` is awaited through ``asyncio.wait`` rather than
     ``asyncio.wait_for`` because a timeout must NOT cancel it: cancelling would close the
@@ -342,6 +342,8 @@ async def _with_keepalive_pings(
     nothing else is ready, and an exception from the source still surfaces at its
     ``result()`` and propagates to the pump.
     """
+    if interval is None:
+        interval = config.keepalive_ping_interval()
     iterator = events.__aiter__()
     pending: asyncio.Task[dict] | None = None
     try:

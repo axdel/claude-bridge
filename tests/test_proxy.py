@@ -2191,6 +2191,25 @@ class TestKeepalivePings:
         assert seen[-1]["event"] == "message_stop"
 
     @pytest.mark.asyncio
+    async def test_the_cadence_comes_from_config_not_a_literal(self, monkeypatch):
+        # config.py is the single owner of the bridge's second-valued knobs; a literal here
+        # would be a second writer, and an operator's KEEPALIVE_PING_INTERVAL would silently
+        # do nothing. The override is set an order of magnitude BELOW the source's own delay,
+        # so a ping is only possible if the override was read: against the 15s default this
+        # source stops long before any ping is due.
+        from claude_bridge.proxy_streaming import _with_keepalive_pings
+
+        monkeypatch.setenv("KEEPALIVE_PING_INTERVAL", "0.01")
+
+        async def quiet_then_stop():
+            await asyncio.sleep(0.2)
+            yield {"event": "message_stop", "data": {"type": "message_stop"}}
+
+        seen = [e async for e in _with_keepalive_pings(quiet_then_stop())]
+        assert seen[0]["event"] == "ping"
+        assert seen[-1]["event"] == "message_stop"
+
+    @pytest.mark.asyncio
     async def test_no_ping_is_injected_while_events_flow(self):
         from claude_bridge.proxy_streaming import _with_keepalive_pings
 
