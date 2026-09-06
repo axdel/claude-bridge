@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 
 import httpx
 
@@ -323,6 +323,45 @@ def _accumulate_usage(
     return tokens_in, tokens_out
 
 
+# How long the translated event stream may go quiet before the pump emits a keepalive
+# ping. A provider can reason for minutes without producing a single translatable event,
+# and a client receiving no bytes cannot tell that from a dead connection. ``ping`` is a
+# no-op in the Anthropic streaming protocol, so injecting one is always safe.
+_KEEPALIVE_PING_SECONDS = 15.0
+
+
+async def _with_keepalive_pings(
+    events: AsyncIterator[dict], interval: float = _KEEPALIVE_PING_SECONDS
+) -> AsyncGenerator[dict, None]:
+    """Yield ``events``, injecting a ping whenever the source stays quiet for ``interval``.
+
+    The pending ``__anext__`` is awaited through ``asyncio.wait`` rather than
+    ``asyncio.wait_for`` because a timeout must NOT cancel it: cancelling would close the
+    underlying generator mid-event and lose the event it is assembling. The same task is
+    re-awaited after each ping, so ordering is exact — a ping is only ever emitted while
+    nothing else is ready, and an exception from the source still surfaces at its
+    ``result()`` and propagates to the pump.
+    """
+    iterator = events.__aiter__()
+    pending: asyncio.Task[dict] | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                yield {"event": "ping", "data": {"type": "ping"}}
+                continue
+            finished, pending = pending, None
+            try:
+                yield finished.result()
+            except StopAsyncIteration:
+                return
+    finally:
+        if pending is not None:
+            pending.cancel()
+
+
 async def _emit_stream_error(
     writer: asyncio.StreamWriter, tokens_in: int, tokens_out: int
 ) -> StreamOutcome:
@@ -370,7 +409,9 @@ async def _pump_provider_stream(
     try:
         write_sse_headers(writer)
         try:
-            async for anthropic_event in provider.translate_stream(_raw_chunks()):
+            async for anthropic_event in _with_keepalive_pings(
+                provider.translate_stream(_raw_chunks())
+            ):
                 event_name = anthropic_event["event"]
                 data = anthropic_event["data"]
                 tokens_in, tokens_out = _accumulate_usage(event_name, data, tokens_in, tokens_out)

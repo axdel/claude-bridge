@@ -2077,6 +2077,149 @@ def test_aggregate_stream_to_message_concatenates_text_deltas():
     assert message["usage"] == {"input_tokens": 10, "output_tokens": 5}
 
 
+def test_aggregate_stream_to_message_folds_thinking_deltas():
+    """thinking_delta fragments fold into the thinking block for non-streaming clients.
+
+    Oracle: the streaming spec concatenates deltas the same way for every delta type,
+    so "rea" + "soned" is "reasoned". Without this the aggregator drops the text and a
+    non-streaming client receives an empty thinking block.
+    """
+    from claude_bridge.proxy_streaming import aggregate_stream_to_message
+
+    events = [
+        {
+            "event": "message_start",
+            "data": {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_bridge_r",
+                    "model": "gpt-6-astra",
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                },
+            },
+        },
+        {
+            "event": "content_block_start",
+            "data": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "rea"},
+            },
+        },
+        {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "soned"},
+            },
+        },
+        {"event": "content_block_stop", "data": {"type": "content_block_stop", "index": 0}},
+        {"event": "message_stop", "data": {"type": "message_stop"}},
+    ]
+    message = aggregate_stream_to_message(events)
+    assert message is not None
+    assert message["content"] == [{"type": "thinking", "thinking": "reasoned"}]
+
+
+class TestKeepalivePings:
+    """A silent upstream must still produce downstream bytes.
+
+    Oracle: the Anthropic streaming protocol defines ``ping`` as a no-op event a server
+    may send at any point, and its own streams emit them periodically. A provider can
+    reason for minutes without producing a single translatable event — measured at
+    243.75s of dead air — during which a client cannot distinguish a working stream from
+    a dead connection.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ping_is_emitted_while_the_source_is_silent(self):
+        from claude_bridge.proxy_streaming import _with_keepalive_pings
+
+        release = asyncio.Event()
+
+        async def silent_then_stop():
+            await release.wait()
+            yield {"event": "message_stop", "data": {"type": "message_stop"}}
+
+        seen = []
+
+        async def consume():
+            async for event in _with_keepalive_pings(silent_then_stop(), interval=0.01):
+                seen.append(event)
+                release.set()
+
+        await asyncio.wait_for(consume(), timeout=5)
+        assert seen[0] == {"event": "ping", "data": {"type": "ping"}}
+        assert seen[-1]["event"] == "message_stop"
+
+    @pytest.mark.asyncio
+    async def test_no_ping_is_injected_while_events_flow(self):
+        from claude_bridge.proxy_streaming import _with_keepalive_pings
+
+        async def steady():
+            yield {"event": "message_start", "data": {"type": "message_start"}}
+            yield {"event": "message_stop", "data": {"type": "message_stop"}}
+
+        seen = [e async for e in _with_keepalive_pings(steady(), interval=30)]
+        assert [e["event"] for e in seen] == ["message_start", "message_stop"]
+
+    @pytest.mark.asyncio
+    async def test_event_order_is_preserved(self):
+        from claude_bridge.proxy_streaming import _with_keepalive_pings
+
+        async def ordered():
+            for index in range(5):
+                yield {"event": "content_block_delta", "data": {"index": index}}
+
+        seen = [e async for e in _with_keepalive_pings(ordered(), interval=30)]
+        assert [e["data"]["index"] for e in seen] == [0, 1, 2, 3, 4]
+
+    @pytest.mark.asyncio
+    async def test_source_exception_propagates(self):
+        # The pump maps a mid-stream transport error to a terminal Anthropic error event;
+        # swallowing it here would strand the client on a stream that never terminates.
+        from claude_bridge.proxy_streaming import _with_keepalive_pings
+
+        async def failing():
+            raise httpx.ReadTimeout("upstream stalled")
+            yield  # pragma: no cover - unreachable, makes this an async generator
+
+        with pytest.raises(httpx.ReadTimeout):
+            async for _ in _with_keepalive_pings(failing(), interval=30):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_abandoning_the_stream_leaves_no_pending_task(self):
+        # A client disconnect breaks out of the pump's `async for`; the in-flight
+        # __anext__ must be cancelled rather than left running past the request.
+        from claude_bridge.proxy_streaming import _with_keepalive_pings
+
+        started = asyncio.Event()
+
+        async def never_finishes():
+            started.set()
+            await asyncio.sleep(3600)
+            yield {"event": "message_stop", "data": {"type": "message_stop"}}
+
+        before = len(asyncio.all_tasks())
+        wrapped = _with_keepalive_pings(never_finishes(), interval=0.01)
+        async for event in wrapped:
+            assert event["event"] == "ping"
+            break
+        await wrapped.aclose()
+        await asyncio.sleep(0)
+        assert len(asyncio.all_tasks()) <= before
+
+
 def test_aggregate_stream_to_message_parses_tool_use_json():
     """input_json_delta fragments fold into a parsed tool_use input dict."""
     from claude_bridge.proxy_streaming import aggregate_stream_to_message
