@@ -35,6 +35,35 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+class _RaisingAsyncIterator:
+    """An async iterator that raises the given exception on first advance.
+
+    A class rather than an async generator: the generator form needs a ``yield`` after
+    the ``raise`` purely to make the function a generator at all, and that yield is
+    unreachable dead code. Callers only ever ``async for`` over these stubs, so an
+    object with ``__aiter__``/``__anext__`` is equivalent and carries no dead branch.
+    """
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    def __aiter__(self) -> _RaisingAsyncIterator:
+        return self
+
+    async def __anext__(self) -> object:
+        raise self._error
+
+
+class _EmptyAsyncIterator:
+    """An async iterator that yields nothing and stops immediately."""
+
+    def __aiter__(self) -> _EmptyAsyncIterator:
+        return self
+
+    async def __anext__(self) -> object:
+        raise StopAsyncIteration
+
+
 class _MockUpstreamHandler(BaseHTTPRequestHandler):
     """Echoes back a canned Anthropic response."""
 
@@ -2189,13 +2218,15 @@ class TestKeepalivePings:
         # swallowing it here would strand the client on a stream that never terminates.
         from claude_bridge.proxy_streaming import _with_keepalive_pings
 
-        async def failing():
+        async def fails_after_one_event():
+            yield {"event": "message_start", "data": {"type": "message_start"}}
             raise httpx.ReadTimeout("upstream stalled")
-            yield  # pragma: no cover - unreachable, makes this an async generator
 
+        seen = []
         with pytest.raises(httpx.ReadTimeout):
-            async for _ in _with_keepalive_pings(failing(), interval=30):
-                pass
+            async for event in _with_keepalive_pings(fails_after_one_event(), interval=30):
+                seen.append(event)
+        assert [e["event"] for e in seen] == ["message_start"]
 
     @pytest.mark.asyncio
     async def test_abandoning_the_stream_leaves_no_pending_task(self):
@@ -3389,9 +3420,13 @@ class _UnusedStreamProvider:
 
     name = "unused"
 
-    async def translate_stream(self, _raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
-        raise AssertionError("translate_stream must not run when SSE headers fail")
-        yield {}  # pragma: no cover — makes this an async generator
+    def translate_stream(self, _raw_chunks: AsyncIterator[bytes]) -> AsyncIterator[dict]:
+        return cast(
+            AsyncIterator[dict],
+            _RaisingAsyncIterator(
+                AssertionError("translate_stream must not run when SSE headers fail")
+            ),
+        )
 
 
 class _HeldResponse:
@@ -3410,9 +3445,8 @@ class _HeldResponse:
     async def aclose(self) -> None:
         self.is_closed = True
 
-    async def aiter_bytes(self) -> AsyncIterator[bytes]:
-        if False:
-            yield b""
+    def aiter_bytes(self) -> AsyncIterator[bytes]:
+        return cast(AsyncIterator[bytes], _EmptyAsyncIterator())
 
 
 @pytest.mark.asyncio
@@ -3462,11 +3496,15 @@ async def test_pump_provider_stream_retires_pool_on_stream_reset(monkeypatch):
         async def aclose(self) -> None:
             self.is_closed = True
 
-        async def aiter_bytes(self) -> AsyncIterator[bytes]:
-            raise httpx.RemoteProtocolError(
-                "<StreamReset stream_id:1, error_code:1, remote_reset:True>"
+        def aiter_bytes(self) -> AsyncIterator[bytes]:
+            return cast(
+                AsyncIterator[bytes],
+                _RaisingAsyncIterator(
+                    httpx.RemoteProtocolError(
+                        "<StreamReset stream_id:1, error_code:1, remote_reset:True>"
+                    )
+                ),
             )
-            yield b""  # pragma: no cover
 
     class _PassThroughProvider:
         name = "reset"
