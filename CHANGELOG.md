@@ -2,6 +2,20 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-09-06
+
+### fix: surface provider reasoning while it happens instead of streaming silence ([PR #24](https://github.com/axdel/claude-bridge/pull/24))
+Both SSE translators discarded every reasoning-summary event and the OpenAI provider never requested summaries at all, so a long reasoning turn sent zero downstream bytes for minutes; reasoning now streams as Anthropic thinking blocks, with a configurable keepalive ping covering providers that emit none.
+
+- [`ecd84c6`](https://github.com/axdel/claude-bridge/commit/ecd84c6) Record the vulture dev-dependency decision
+- [`ad39024`](https://github.com/axdel/claude-bridge/commit/ad39024) Document live reasoning and the keepalive knob
+- [`d228f3f`](https://github.com/axdel/claude-bridge/commit/d228f3f) Move the keepalive cadence to its owner in config.py
+- [`8900524`](https://github.com/axdel/claude-bridge/commit/8900524) Record the reasoning-block and keepalive decisions
+- [`5e53230`](https://github.com/axdel/claude-bridge/commit/5e53230) Replace the unreachable-yield idiom with real async-iterator stubs
+- [`7604689`](https://github.com/axdel/claude-bridge/commit/7604689) Emit keepalive pings while the provider stream is quiet
+- [`59f5bec`](https://github.com/axdel/claude-bridge/commit/59f5bec) Ask OpenAI for reasoning summaries so there is progress to stream
+- [`7b35d7b`](https://github.com/axdel/claude-bridge/commit/7b35d7b) Surface provider reasoning as Anthropic thinking blocks
+
 ## 2026-09-05
 
 ### feat: pin the OpenAI provider model to gpt-6-astra ([PR #23](https://github.com/axdel/claude-bridge/pull/23))
