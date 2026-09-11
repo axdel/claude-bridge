@@ -227,12 +227,13 @@ def test_launcher_parse_debug_is_consumed_not_forwarded():
 def test_launchers_do_not_set_the_claude_code_context_window():
     """The harness installer is the single writer for CLAUDE_CODE_MAX_CONTEXT_TOKENS.
 
-    It is a Claude Code env var the bridge never reads, and it is inert for these
-    sessions besides: Claude Code resolves a recognized model id to its own window
-    before consulting the var, and it sends claude-opus-5 through this bridge. A
-    launcher-local export therefore states a window that nothing acts on, in a
-    second place, inviting drift against the harness value that does matter.
-    See D-CONTEXT-002.
+    It is a Claude Code env var the bridge never reads, and setting it here would do
+    nothing: Claude Code resolves a recognized model id to that model's own window and
+    never consults the var, measured by driving the TUI ``/context`` panel with the var
+    at 333000 and observing an unchanged 200k window. A launcher-local export therefore
+    states a window nothing acts on, in a second place, inviting drift against the
+    harness value. The window is raised by arming the 1M model path instead — see the
+    companion test below and D-CONTEXT-003.
     """
     repo_root = Path(__file__).resolve().parents[1]
     for name in ("claude-codex", "claude-grok"):
@@ -244,5 +245,29 @@ def test_launchers_do_not_set_the_claude_code_context_window():
         ]
         assert not offenders, (
             f"{name} sets CLAUDE_CODE_MAX_CONTEXT_TOKENS ({offenders!r}); the harness "
-            f"installer owns it globally — a second writer here clamps compaction"
+            f"installer owns it globally, and it is inert for a recognized model id"
+        )
+
+
+def test_launchers_arm_the_one_million_context_model():
+    """Both launchers must default ANTHROPIC_MODEL to the ``[1m]``-suffixed model id.
+
+    ANTHROPIC_AUTH_TOKEN puts a bridge session in API-billing mode, where claude-opus-5
+    resolves to its 200k base window and CLAUDE_CODE_AUTO_COMPACT_WINDOW (350k) is never
+    the binding term. The ``[1m]`` suffix arms the 1M path, restoring the harness window;
+    dropping it silently halves every bridge session's context. The ``:-`` default form is
+    load-bearing — a bare assignment would clobber an operator's own ANTHROPIC_MODEL.
+    See D-CONTEXT-003.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    for name in ("claude-codex", "claude-grok"):
+        text = (repo_root / name).read_text()
+        exports = [
+            line.strip()
+            for line in text.splitlines()
+            if "ANTHROPIC_MODEL" in line and not line.lstrip().startswith("#")
+        ]
+        assert exports == ['export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-opus-5[1m]}"'], (
+            f"{name} must default ANTHROPIC_MODEL to the [1m]-suffixed id exactly once; "
+            f"found {exports!r}"
         )

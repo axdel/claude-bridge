@@ -100,12 +100,11 @@ echo ""
 (
     export ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}"
     export ANTHROPIC_AUTH_TOKEN=bridge-placeholder
-    # CLAUDE_CODE_MAX_CONTEXT_TOKENS is deliberately NOT set here. It is a Claude Code
-    # env var this bridge never reads, so the harness installer owns it globally for
-    # every session kind. It is also inert for these sessions: Claude Code resolves a
-    # recognized model id to its own window before consulting the var, and it sends
-    # claude-opus-5 through this bridge. Compaction is governed by the harness's
-    # CLAUDE_CODE_AUTO_COMPACT_WINDOW alone. See D-CONTEXT-002.
+    # A bridge session runs in API-billing mode (ANTHROPIC_AUTH_TOKEN), where
+    # claude-opus-5 resolves to its 200k base window, the 1M path never arms, and
+    # CLAUDE_CODE_MAX_CONTEXT_TOKENS is ignored for a recognized model id. The [1m]
+    # suffix arms it so CLAUDE_CODE_AUTO_COMPACT_WINDOW governs again (D-CONTEXT-003).
+    export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-opus-5[1m]}"
     unset ANTHROPIC_API_KEY
     claude ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
 )
