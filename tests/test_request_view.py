@@ -29,16 +29,18 @@ _LOGGER_NAME = "claude_bridge.request_view"
 class TestTranslationWarningLevels:
     """emit_translation_warnings splits routine (DEBUG) from lossy (WARNING)."""
 
-    def test_thinking_passthrough_notice_logged_at_debug(self, capture_logger):
+    def test_omitted_thinking_block_notice_logged_at_debug(self, capture_logger):
+        """Fires once per thinking block in the replayed history — the per-BLOCK volume
+        that floods a TUI at WARNING, where the per-request config notice never could."""
         records = capture_logger(_LOGGER_NAME)
         emit_translation_warnings(
-            ["Thinking config passed through (reasoning_mode=passthrough)"], {}
+            ["Omitted thinking block (no Responses input slot for prior reasoning)"], {}
         )
         assert [r.levelno for r in records] == [logging.DEBUG]
 
-    def test_thinking_drop_notice_logged_at_debug(self, capture_logger):
+    def test_stripped_thinking_config_notice_logged_at_debug(self, capture_logger):
         records = capture_logger(_LOGGER_NAME)
-        emit_translation_warnings(["Stripped 'thinking' config (reasoning_mode=drop)"], {})
+        emit_translation_warnings(["Stripped 'thinking' config (no Responses equivalent)"], {})
         assert [r.levelno for r in records] == [logging.DEBUG]
 
     def test_effort_clamp_notice_logged_at_debug(self, capture_logger):
@@ -111,20 +113,28 @@ class TestTranslationWarningLevels:
         assert [r.levelno for r in records] == [logging.WARNING]
 
     def test_mixed_batch_splits_levels(self, capture_logger):
+        """A routine notice and a lossy one in one batch are classified independently."""
         records = capture_logger(_LOGGER_NAME)
         emit_translation_warnings(
             [
-                "Thinking config passed through (reasoning_mode=passthrough)",
+                "Omitted thinking block (no Responses input slot for prior reasoning)",
                 "Dropped unsupported output_config.format",
+                "Unsupported tool_choice type 'wild', omitting tool_choice",
             ],
             {},
         )
         levels = {r.getMessage(): r.levelno for r in records}
         assert (
-            levels["Translation: Thinking config passed through (reasoning_mode=passthrough)"]
+            levels[
+                "Translation: Omitted thinking block (no Responses input slot for prior reasoning)"
+            ]
             == logging.DEBUG
         )
         assert levels["Translation: Dropped unsupported output_config.format"] == logging.DEBUG
+        assert (
+            levels["Translation: Unsupported tool_choice type 'wild', omitting tool_choice"]
+            == logging.WARNING
+        )
 
 
 class TestRealTranslatorNoFlood:

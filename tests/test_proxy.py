@@ -1266,6 +1266,28 @@ class TestMediaAwareTokenEstimation:
         estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]})
         assert any(r.levelno == logging.WARNING and "image" in r.getMessage() for r in records)
 
+    def test_oversized_media_warns_once_across_repeated_estimates(self, capture_logger):
+        # Oracle: Claude Code calls /v1/messages/count_tokens repeatedly against the
+        # SAME history, so the count of warnings must track the count of distinct
+        # oversized ITEMS (1), not the count of estimates (5). The old code re-walked
+        # the history per call and warned every time, flooding the shared TUI stderr.
+        records = capture_logger("claude_bridge.request_view", level=logging.WARNING)
+        request = {"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]}
+        for _ in range(5):
+            estimate_input_tokens(request)
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f"one item, five estimates, {len(warnings)} warnings"
+
+    def test_a_second_distinct_oversized_item_still_warns(self, capture_logger):
+        # Oracle: warn-once is per ITEM, not a global latch. Suppressing the second,
+        # genuinely different oversized item would hide the signal the warning exists
+        # for. The two differ in decoded size, which is part of the identity key.
+        records = capture_logger("claude_bridge.request_view", level=logging.WARNING)
+        estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]})
+        estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(9 * 1024 * 1024))])]})
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2, f"two distinct items should both warn, got {len(warnings)}"
+
     def test_approx_decoded_bytes_recovers_payload_size(self):
         # Oracle: base64 of N bytes decodes back to N; the approximation recovers N
         # within base64 padding rounding (<= 2 bytes). 900 % 3 == 0 → exact.

@@ -17,6 +17,7 @@ from claude_bridge.log import upstream_request_id_var
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.providers.xai.auth import _XAI_CLIENT_IDENTIFIER, get_xai_bearer_token
 from claude_bridge.providers.xai.stream import (
+    ThinkingCoalescer,
     _remap_block_index,
     _sse_synthetic_termination,
     translate_xai_sse_event,
@@ -251,31 +252,44 @@ class XAIProvider:
         has_tool_calls = False
         started = False
         terminated = False
+        coalescer = ThinkingCoalescer()
 
-        def _emit(event_bytes: bytes) -> list[dict]:
-            """Translate one SSE blob, threading block-index and lifecycle state."""
+        def _renumber(events: list[dict]) -> list[dict]:
+            """Remap raw provider indices to Anthropic ones, tracking stream lifecycle."""
             nonlocal block_index, has_tool_calls, started, terminated
             out: list[dict] = []
+            for event in events:
+                event, block_index, has_tool_calls = _remap_block_index(
+                    event, index_map, block_index, has_tool_calls
+                )
+                name = event.get("event")
+                if name == "message_start":
+                    started = True
+                elif name in ("message_stop", "error"):
+                    terminated = True
+                out.append(event)
+            return out
+
+        def _emit(event_bytes: bytes) -> list[dict]:
+            """Translate one SSE blob, then coalesce thinking parts and renumber blocks."""
+            coalesced: list[dict] = []
             for parsed_event in parse_sse_events(event_bytes):
                 self._capture_stream_reasoning(parsed_event)
                 for translated in translate_xai_sse_event(
                     parsed_event,
                     token_count_multiplier=self.capabilities.token_count_multiplier,
                 ):
-                    translated, block_index, has_tool_calls = _remap_block_index(
-                        translated, index_map, block_index, has_tool_calls
-                    )
-                    name = translated.get("event")
-                    if name == "message_start":
-                        started = True
-                    elif name in ("message_stop", "error"):
-                        terminated = True
-                    out.append(translated)
-            return out
+                    coalesced.extend(coalescer.feed(translated))
+            return _renumber(coalesced)
 
         async for event_bytes in iter_sse_event_blobs(raw_chunks, max_buffer=_MAX_SSE_BUFFER):
             for translated in _emit(event_bytes):
                 yield translated
+
+        # An upstream that drops mid-reasoning leaves the merged block open; close it
+        # before the synthetic terminator so no block outlives the stream.
+        for translated in _renumber(coalescer.flush()):
+            yield translated
 
         if started and not terminated:
             for translated in _sse_synthetic_termination(has_tool_calls):

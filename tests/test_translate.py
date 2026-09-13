@@ -221,32 +221,30 @@ class TestAnthropicToOpenaiToolUse:
 class TestAnthropicToOpenaiStripping:
     """Unsupported features stripped with warnings."""
 
-    def test_thinking_passthrough_by_default(self):
-        """Thinking config emits passthrough warning (not stripped) in default mode."""
-        request = {
-            "model": "claude-opus-4-6",
-            "max_tokens": 100,
-            "thinking": {"type": "enabled", "budget_tokens": 5000},
-            "messages": [{"role": "user", "content": "Hi"}],
-        }
-        _, warnings = anthropic_to_openai(request)
-        assert any("passthrough" in w.lower() for w in warnings)
-        # Should NOT say "Stripped"
-        assert not any("stripped" in w.lower() and "thinking" in w.lower() for w in warnings)
+    def test_thinking_config_never_forwarded_and_never_mode_dependent(self, monkeypatch):
+        """The thinking config is stripped under every mode, and never reaches upstream.
 
-    def test_thinking_stripped_when_drop_mode(self, monkeypatch):
-        """Thinking config stripped when REASONING_MODE=drop."""
+        Oracle: the Responses API has no ``thinking`` request field — reasoning depth is
+        set by ``reasoning.effort``. So the config is dropped regardless of mode, and a
+        notice that blamed ``reasoning_mode`` for it was describing a branch that did not
+        change the payload.
+        """
         import claude_bridge.providers.openai.translate as oai_translate
 
-        monkeypatch.setattr(oai_translate, "_REASONING_MODE", "drop")
         request = {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
             "thinking": {"type": "enabled", "budget_tokens": 5000},
             "messages": [{"role": "user", "content": "Hi"}],
         }
-        _, warnings = anthropic_to_openai(request)
-        assert any("drop" in w.lower() and "thinking" in w.lower() for w in warnings)
+        result, warnings = anthropic_to_openai(request)
+        assert "thinking" not in result
+        assert "Stripped 'thinking' config (no Responses equivalent)" in warnings
+
+        monkeypatch.setattr(oai_translate, "_REASONING_MODE", "drop")
+        dropped, drop_warnings = anthropic_to_openai(request)
+        assert dropped == result, "the thinking config's fate must not depend on the mode"
+        assert drop_warnings == warnings
 
     def test_output_config_never_leaks_into_result(self):
         """output_config is consumed (effort mapped), never forwarded to the Responses
@@ -465,15 +463,21 @@ class TestAnthropicToOpenaiStripping:
 
 
 # ---------------------------------------------------------------------------
-# Thinking block passthrough
+# Thinking block omission
 # ---------------------------------------------------------------------------
 
 
-class TestThinkingBlockPassthrough:
-    """Thinking content blocks preserved or dropped based on reasoning mode."""
+class TestThinkingBlockOmission:
+    """A returned thinking block leaves no trace in the upstream payload.
 
-    def test_thinking_block_preserved_as_tagged_text(self):
-        """In passthrough mode, thinking blocks become [thinking]...[/thinking]."""
+    Oracle: the Responses API input array has no slot for prior reasoning — its content
+    part types are input_text / input_image / input_file. Reasoning continuity is carried
+    by ``reasoning.encrypted_content`` echoed per ``call_id`` (D-REASON-001), so a
+    thinking block has nowhere correct to go and is dropped rather than re-rendered.
+    """
+
+    def test_thinking_block_leaves_no_trace_in_the_payload(self):
+        """Neither the reasoning text nor any bridge-invented tag reaches upstream."""
         request = {
             "model": "claude-opus-4-6",
             "messages": [
@@ -486,16 +490,44 @@ class TestThinkingBlockPassthrough:
                 }
             ],
         }
-        result, _ = anthropic_to_openai(request)
+        result, warnings = anthropic_to_openai(request)
         assistant_items = [i for i in result["input"] if i.get("role") == "assistant"]
         assert len(assistant_items) == 1
         content = assistant_items[0]["content"]
-        # First block should be the thinking text
-        assert "[thinking]" in content[0]["text"]
-        assert "Let me reason about this." in content[0]["text"]
+        assert content == [{"type": "output_text", "text": "Here is my answer."}]
+        assert "[thinking" not in json.dumps(result)
+        assert "Let me reason about this." not in json.dumps(result)
+        assert any("omitted thinking block" in w.lower() for w in warnings)
 
-    def test_thinking_block_dropped_in_drop_mode(self, monkeypatch):
-        """In drop mode, thinking blocks become empty text."""
+    def test_thinking_only_turn_emits_no_assistant_item(self):
+        """A turn that was pure reasoning contributes nothing — not an empty message.
+
+        Oracle: the old drop path emitted ``{"type": "input_text", "text": ""}``, so a
+        reasoning-only turn became an assistant message with one empty content part.
+        An omitted block leaves the message with no content, and a message with no
+        content is not emitted at all.
+        """
+        request = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "Secret reasoning."}],
+                },
+            ],
+        }
+        result, _ = anthropic_to_openai(request)
+        assert [i for i in result["input"] if i.get("role") == "assistant"] == []
+        assert "Secret reasoning" not in json.dumps(result)
+
+    def test_thinking_block_omitted_in_drop_mode_too(self, monkeypatch):
+        """Omission is unconditional — drop mode governs the OUTBOUND direction only.
+
+        Oracle: there is no reasoning mode under which injecting a bridge-invented
+        ``[thinking]`` literal into the prompt is correct, so the inbound path has no
+        mode branch left to take.
+        """
         import claude_bridge.providers.openai.translate as oai_translate
 
         monkeypatch.setattr(oai_translate, "_REASONING_MODE", "drop")
@@ -511,12 +543,10 @@ class TestThinkingBlockPassthrough:
                 }
             ],
         }
-        result, warnings = anthropic_to_openai(request)
+        result, _ = anthropic_to_openai(request)
         assistant_items = [i for i in result["input"] if i.get("role") == "assistant"]
-        content = assistant_items[0]["content"]
-        # Thinking block becomes empty, not preserved
-        assert "Secret reasoning" not in str(content)
-        assert any("drop" in w.lower() for w in warnings)
+        assert assistant_items[0]["content"] == [{"type": "output_text", "text": "Answer."}]
+        assert "Secret reasoning" not in json.dumps(result)
 
     def test_thinking_block_empty_text_field(self):
         """Thinking block with empty text doesn't crash."""

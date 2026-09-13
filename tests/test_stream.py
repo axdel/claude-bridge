@@ -297,7 +297,14 @@ class TestReasoningSummaryTranslation:
         )
         assert len(results) == 1
         assert results[0]["event"] == "content_block_start"
-        assert results[0]["data"]["content_block"] == {"type": "thinking", "thinking": ""}
+        # Oracle: the published Messages API wire format carries `signature` on every
+        # thinking block. The bridge cannot mint a verifiable one for reasoning it did
+        # not produce, so it declares the block unsigned rather than omitting the field.
+        assert results[0]["data"]["content_block"] == {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "",
+        }
 
     def test_summary_text_delta_becomes_thinking_delta(self):
         from claude_bridge.providers.openai import translate_openai_sse_event
@@ -1002,14 +1009,18 @@ class TestTranslateStream:
         assert any(e["event"] == "error" for e in events)
 
     @pytest.mark.asyncio
-    async def test_multi_part_reasoning_then_text_gets_distinct_block_indices(self):
-        """Each summary part is its own thinking block, and the answer text follows.
+    async def test_multi_part_reasoning_merges_into_one_block_before_the_text(self):
+        """Summary parts merge into ONE thinking block; the answer text is a second.
 
-        Oracle: the captured gpt-6-astra turn emits three summary parts under ONE
-        reasoning item — all three carry ``output_index: 0`` while the answer's text
-        block carries ``content_index: 0``. Anthropic requires content-block indices to
-        be distinct and sequential, so ``_remap_block_index`` must hand out 0, 1, 2 to
-        the parts and 3 to the text rather than collapsing them onto one index.
+        Oracle: the Anthropic Messages API carries a turn's reasoning in a SINGLE
+        ``thinking`` content block alongside ``text`` and ``tool_use``
+        (platform.claude.com/docs/en/build-with-claude/thinking-tool-workflows), so the
+        three summary parts of one reasoning item are one block, not three.
+
+        This fixture also pins the index-space collision that makes the merge
+        non-trivial: the parts are keyed on ``output_index: 0`` while the answer's text
+        block is keyed on ``content_index: 0`` — the same raw number in a different
+        space. The merged block must still get an index distinct from the text's.
         """
         from claude_bridge.providers.openai import OpenAIProvider
 
@@ -1081,6 +1092,12 @@ class TestTranslateStream:
         )
         blobs.append(
             _make_sse_event(
+                "response.output_text.done",
+                {"output_index": 1, "content_index": 0, "text": "answer"},
+            )
+        )
+        blobs.append(
+            _make_sse_event(
                 "response.completed",
                 {
                     "type": "response.completed",
@@ -1100,13 +1117,8 @@ class TestTranslateStream:
             events.append(event)
 
         starts = [e for e in events if e["event"] == "content_block_start"]
-        assert [s["data"]["index"] for s in starts] == [0, 1, 2, 3]
-        assert [s["data"]["content_block"]["type"] for s in starts] == [
-            "thinking",
-            "thinking",
-            "thinking",
-            "text",
-        ]
+        assert [s["data"]["index"] for s in starts] == [0, 1]
+        assert [s["data"]["content_block"]["type"] for s in starts] == ["thinking", "text"]
 
         thinking = [
             (e["data"]["index"], e["data"]["delta"]["thinking"])
@@ -1114,14 +1126,18 @@ class TestTranslateStream:
             if e["event"] == "content_block_delta"
             and e["data"]["delta"]["type"] == "thinking_delta"
         ]
-        assert thinking == [(0, "first"), (1, "second"), (2, "third")]
+        assert {index for index, _ in thinking} == {0}, "parts landed on more than one block"
+        assert "".join(text for _, text in thinking) == "first\n\nsecond\n\nthird"
 
         text_deltas = [
             (e["data"]["index"], e["data"]["delta"]["text"])
             for e in events
             if e["event"] == "content_block_delta" and e["data"]["delta"]["type"] == "text_delta"
         ]
-        assert text_deltas == [(3, "answer")]
+        assert text_deltas == [(1, "answer")]
+
+        stops = [e["data"]["index"] for e in events if e["event"] == "content_block_stop"]
+        assert stops == [0, 1], "each block closes exactly once, in order"
 
 
 # ---------------------------------------------------------------------------

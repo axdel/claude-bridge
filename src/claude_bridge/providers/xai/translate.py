@@ -15,11 +15,27 @@ import claude_bridge.config as config
 from claude_bridge.content import MediaSource, parse_media_source
 from claude_bridge.provider import ProviderCapabilities
 
-# Reasoning mode (shared REASONING_MODE env): "passthrough" keeps a replayed
-# Anthropic thinking block as bracketed text, "drop" strips it. xAI reasoning
-# *continuity* rides on encrypted reasoning items (include=reasoning.encrypted_content),
-# replayed by the provider — not this text path. Read once at import, like openai.py.
+# Reasoning mode (shared REASONING_MODE env) governs the OUTBOUND direction only —
+# whether reasoning summaries reach Claude Code as thinking blocks (see stream.py).
+# Inbound, a returned thinking block is omitted under every mode: the Responses API has
+# no input slot for one, and xAI reasoning *continuity* rides on encrypted reasoning
+# items (include=reasoning.encrypted_content) replayed by the provider, never on a text
+# path (D-THINK-003). Read once at import, like openai.
 _XAI_REASONING_MODE = config.reasoning_mode()
+
+# Emitted once per omitted thinking block. Routine by construction — it fires on every
+# request carrying prior reasoning — so request_view classifies it as a DEBUG notice.
+_OMITTED_THINKING_NOTICE = "Omitted thinking block (no Responses input slot for prior reasoning)"
+
+
+def _reasoning_surfaced() -> bool:
+    """Whether reasoning summaries reach Claude Code as thinking blocks.
+
+    A predicate rather than an exported constant so ``stream.py`` resolves the mode in
+    THIS module's namespace on every call — one owner, and one place to override it.
+    """
+    return _XAI_REASONING_MODE != "drop"
+
 
 # Clamp Anthropic's output_config.effort (low/medium/high/xhigh/max) to grok-4.6's supported
 # set (low/medium/high). grok has no max/xhigh, so both map to high — the closest supported
@@ -96,14 +112,21 @@ def _safe_token(value: object) -> str:
     return cleaned
 
 
-def _translate_thinking_block(block: dict) -> tuple[dict, list[str]]:
-    """Translate an Anthropic thinking block per the configured reasoning mode."""
-    if _XAI_REASONING_MODE == "drop":
-        return {"type": "input_text", "text": ""}, [
-            "Stripped thinking block (reasoning_mode=drop)"
-        ]
-    thinking_text = block.get("thinking", "")
-    return {"type": "input_text", "text": f"[thinking]\n{thinking_text}\n[/thinking]"}, []
+def _translate_thinking_block() -> tuple[dict, list[str]]:
+    """Omit an Anthropic thinking block — the Responses API has no input slot for one.
+
+    Prior reasoning reaches the model through ``reasoning.encrypted_content``, echoed
+    per ``call_id`` before its function_call (D-XAI-004). That channel carries the
+    model's own reasoning rather than a summary of it, so it is the whole continuity
+    story; a returned thinking block adds nothing the model can use.
+
+    Rendering the block as assistant text instead put a bridge-invented
+    ``[thinking]…[/thinking]`` literal in the prompt, and because Claude Code echoes the
+    full history every turn the literals accumulated without bound — teaching the model
+    to emit the tag as its own output. Unconditional, not mode-gated: there is no
+    reasoning mode under which injecting it is correct (D-THINK-003).
+    """
+    return {"_omit": True}, [_OMITTED_THINKING_NOTICE]
 
 
 def _media_placeholder(kind: str, reason: str) -> tuple[dict, list[str]]:
@@ -319,7 +342,9 @@ def _translate_content_block(
 
     Returns ``(translated_block, warnings)``. tool_use / tool_result carry a special
     ``_toplevel`` key signaling the caller to emit them as top-level input items rather
-    than nesting them inside a message's content array. Media blocks (image/document)
+    than nesting them inside a message's content array; ``_omit`` instead tells the
+    caller to drop the block entirely, which is how a thinking block leaves no trace in
+    the prompt. Media blocks (image/document)
     become real Responses content parts when ``capabilities.input_modalities`` allows,
     and degrade to a redacted placeholder (never echoing base64) otherwise. Thin
     dispatcher — each type delegates to a helper so this stays under the CCN ceiling.
@@ -328,7 +353,7 @@ def _translate_content_block(
     if block_type == "text":
         return {"type": "input_text", "text": block["text"]}, []
     if block_type == "thinking":
-        return _translate_thinking_block(block)
+        return _translate_thinking_block()
     if block_type == "image":
         return _translate_image_block(parse_media_source(block), capabilities)
     if block_type == "document":
@@ -364,6 +389,9 @@ def _translate_message(
     for block in content:
         translated, block_warnings = _translate_content_block(block, capabilities)
         warnings.extend(block_warnings)
+
+        if translated.pop("_omit", False):
+            continue
 
         if translated.pop("_toplevel", False):
             toplevel_items.append(translated)
@@ -532,11 +560,11 @@ def anthropic_to_xai(
     """
     warnings: list[str] = []
 
+    # The thinking config has no Responses equivalent and is never forwarded — reasoning
+    # depth is driven by reasoning.effort instead. Mode-independent: reasoning_mode
+    # governs only whether summaries come BACK as thinking blocks (D-THINK-003).
     if "thinking" in request:
-        if _XAI_REASONING_MODE == "drop":
-            warnings.append("Stripped 'thinking' config (reasoning_mode=drop)")
-        else:
-            warnings.append("Thinking config passed through (reasoning_mode=passthrough)")
+        warnings.append("Stripped 'thinking' config (no Responses equivalent)")
 
     # include=reasoning.encrypted_content + store=false: the stateless model returns each
     # reasoning item's encrypted continuation blob, replayed before its function_call on the

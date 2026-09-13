@@ -12,6 +12,7 @@ from claude_bridge.providers.xai.translate import (
     _XAI_TOKEN_COUNT_MULTIPLIER,
     _anthropic_usage,
     _incomplete_reason,
+    _reasoning_surfaced,
     _scale_token_count,
     _stop_reason,
 )
@@ -110,9 +111,23 @@ def _sse_reasoning_summary(event_type: str, data: dict) -> list[dict]:
 
     Blocks are keyed on ``output_index`` — the space ``function_call`` items already
     use, distinct from the ``content_index`` text blocks use — which
-    ``_remap_block_index`` renumbers into sequential Anthropic block indices. Several
-    parts share one ``output_index``, so each opens and closes before the next begins.
+    ``_remap_block_index`` renumbers into sequential Anthropic block indices.
+
+    Emits one block PER PART; ``ThinkingCoalescer`` downstream merges a turn's parts
+    into the single thinking block the Anthropic shape specifies. Splitting the two
+    keeps this function pure per event.
+
+    The ``signature`` field is present but empty: the published wire format carries one
+    on every thinking block, and the bridge cannot mint a verifiable signature for
+    reasoning it did not produce. Declaring it empty states "unsigned" explicitly rather
+    than omitting the field and leaving each client to invent a default (D-THINK-004).
+
+    ``REASONING_MODE=drop`` suppresses the whole reasoning phase here — the one direction
+    the knob still governs, now that a returned block is omitted under every mode
+    (D-THINK-003).
     """
+    if not _reasoning_surfaced():
+        return []
     index = data.get("output_index", 0)
     if event_type == "response.reasoning_summary_part.added":
         return [
@@ -121,7 +136,7 @@ def _sse_reasoning_summary(event_type: str, data: dict) -> list[dict]:
                 "data": {
                     "type": "content_block_start",
                     "index": index,
-                    "content_block": {"type": "thinking", "thinking": ""},
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""},
                 },
             }
         ]
@@ -368,6 +383,98 @@ def translate_xai_sse_event(
         return []
 
     return []
+
+
+# Separator joining two summary parts merged into one thinking block. Each part is a
+# short bold heading, so a blank line keeps them readable as distinct steps.
+_THINKING_PART_SEPARATOR = "\n\n"
+
+# Events that end a turn's reasoning phase: once one is reached, a thinking block held
+# open for coalescing must be closed before the event is forwarded.
+_THINKING_CLOSING_EVENTS = frozenset({"message_delta", "message_stop", "error"})
+
+
+class ThinkingCoalescer:
+    """Merge a turn's reasoning-summary parts into ONE Anthropic thinking block.
+
+    A turn commonly emits several reasoning ITEMS, each with several summary PARTS —
+    five parts across three items in a captured live turn. Translating each part into
+    its own thinking block put N blocks in one assistant turn where the published
+    Anthropic shape carries one, and Claude Code echoes every block back on every
+    subsequent request, so N compounded turn over turn (measured 0 → 14 over six turns
+    of a trivial task).
+
+    Holds the first part's block open, rewrites later parts' deltas onto it, and defers
+    the close until the reasoning phase ends — the first non-thinking block or a
+    terminal event. State lives here rather than in ``translate_xai_sse_event`` so that
+    translation stays a pure function of one event, matching ``_remap_block_index``.
+
+    Runs BEFORE ``_remap_block_index``, so every index it reads or writes is still a raw
+    provider index. That ordering is what keeps the merge invisible downstream: remap
+    sees one thinking ``content_block_start`` and therefore allocates one Anthropic
+    index, and the absorbed parts' deltas resolve onto it through the existing map.
+
+    Alternatives weighed in D-THINK-005.
+    """
+
+    def __init__(self) -> None:
+        self._open_index: int | None = None
+        self._absorbed: set[int] = set()
+
+    def feed(self, event: dict) -> list[dict]:
+        """Return the events to forward for ``event`` (0, 1, or 2 of them)."""
+        name = event.get("event")
+        data = event.get("data", {})
+        index = data.get("index", 0)
+        is_thinking_start = (
+            name == "content_block_start"
+            and data.get("content_block", {}).get("type") == "thinking"
+        )
+
+        if is_thinking_start:
+            self._absorbed.add(index)
+            if self._open_index is None:
+                self._open_index = index
+                return [event]
+            # A later part of the same turn: keep the open block, insert a separator.
+            return [self._separator_delta()]
+
+        if self._open_index is not None:
+            # Parts of a LATER reasoning item carry a different raw index, so membership
+            # of the absorbed set — not equality with the open one — is the test.
+            if index in self._absorbed and name in ("content_block_delta", "content_block_stop"):
+                if name == "content_block_stop":
+                    return []  # defer: more parts may still arrive
+                data["index"] = self._open_index
+                return [event]
+            if name == "content_block_start" or name in _THINKING_CLOSING_EVENTS:
+                return [self._close(), event]
+
+        return [event]
+
+    def _separator_delta(self) -> dict:
+        """A thinking_delta carrying the blank line between two merged parts."""
+        return {
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": self._open_index,
+                "delta": {"type": "thinking_delta", "thinking": _THINKING_PART_SEPARATOR},
+            },
+        }
+
+    def _close(self) -> dict:
+        """Close the held-open thinking block and forget it."""
+        index, self._open_index = self._open_index, None
+        self._absorbed.clear()
+        return {
+            "event": "content_block_stop",
+            "data": {"type": "content_block_stop", "index": index},
+        }
+
+    def flush(self) -> list[dict]:
+        """Close a still-open thinking block at stream end (upstream dropped mid-turn)."""
+        return [self._close()] if self._open_index is not None else []
 
 
 def _remap_block_index(

@@ -6,6 +6,23 @@ import logging
 
 import pytest
 
+from claude_bridge import request_view
+
+
+@pytest.fixture(autouse=True)
+def reset_oversized_media_warnings():
+    """Clear the process-wide oversized-media warn-once set before every test.
+
+    ``request_view`` remembers which oversized media it has already warned about so a
+    repeated ``count_tokens`` over one history does not re-warn. That memory outlives a
+    test, so without this any two tests asserting on the warning would be order-dependent
+    — and ``pytest-randomly`` reorders every run, which turns that into a flake rather
+    than a stable failure. Autouse because the coupling is invisible at the call site.
+    """
+    request_view._warned_oversized_media.clear()
+    yield
+    request_view._warned_oversized_media.clear()
+
 
 @pytest.fixture
 def capture_logger():

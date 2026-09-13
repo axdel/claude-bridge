@@ -1440,43 +1440,70 @@ class TestRequestTranslation:
             {"role": "user", "content": [{"type": "input_text", "text": "plain"}]}
         ]
 
-    # -- thinking-block reasoning modes (module-attr patched) -----------------
+    # -- thinking-block omission ---------------------------------------------
 
-    def test_thinking_block_passthrough_wraps_text(self):
-        """Default reasoning mode keeps a thinking block as bracketed text (→ output_text)."""
+    def test_thinking_block_leaves_no_trace_in_the_payload(self):
+        """A returned thinking block is omitted, not re-rendered as bracketed text.
+
+        Oracle: the Responses API input array has no slot for prior reasoning — its
+        content part types are input_text / input_image / input_file. xAI continuity
+        rides on ``reasoning.encrypted_content`` instead (D-XAI-004), so the block has
+        nowhere correct to go.
+        """
+        result, warnings = anthropic_to_xai(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "pondering"},
+                            {"type": "text", "text": "answer"},
+                        ],
+                    }
+                ]
+            }
+        )
+        assert result["input"][0]["content"] == [{"type": "output_text", "text": "answer"}]
+        assert "[thinking" not in json.dumps(result)
+        assert "pondering" not in json.dumps(result)
+        assert any("omitted thinking block" in w.lower() for w in warnings)
+
+    def test_thinking_only_turn_emits_no_assistant_item(self):
+        """A turn that was pure reasoning contributes nothing — not an empty message."""
         result, _ = anthropic_to_xai(
             {
                 "messages": [
+                    {"role": "user", "content": "hi"},
                     {
                         "role": "assistant",
-                        "content": [{"type": "thinking", "thinking": "pondering"}],
-                    }
+                        "content": [{"type": "thinking", "thinking": "secret-cot"}],
+                    },
                 ]
             }
         )
-        block = result["input"][0]["content"][0]
-        assert block["type"] == "output_text"
-        assert "[thinking]" in block["text"]
-        assert "pondering" in block["text"]
+        assert [i for i in result["input"] if i.get("role") == "assistant"] == []
+        assert "secret-cot" not in json.dumps(result)
 
-    def test_thinking_block_dropped_in_drop_mode(self, monkeypatch):
-        """reasoning_mode=drop empties the thinking block — the text never survives."""
+    def test_thinking_block_omitted_in_drop_mode_too(self, monkeypatch):
+        """Omission is unconditional — drop mode governs the OUTBOUND direction only."""
         import claude_bridge.providers.xai.translate as xai_translate
 
         monkeypatch.setattr(xai_translate, "_XAI_REASONING_MODE", "drop")
-        result, warnings = xai_translate.anthropic_to_xai(
+        result, _ = xai_translate.anthropic_to_xai(
             {
                 "messages": [
                     {
                         "role": "assistant",
-                        "content": [{"type": "thinking", "thinking": "secret-cot"}],
+                        "content": [
+                            {"type": "thinking", "thinking": "secret-cot"},
+                            {"type": "text", "text": "answer"},
+                        ],
                     }
                 ]
             }
         )
+        assert result["input"][0]["content"] == [{"type": "output_text", "text": "answer"}]
         assert "secret-cot" not in json.dumps(result)
-        assert result["input"][0]["content"][0]["text"] == ""
-        assert any("drop" in w.lower() for w in warnings)
 
     # -- unsupported blocks (B3 is text+tools only) --------------------------
 
@@ -1552,15 +1579,23 @@ class TestRequestTranslation:
             assert "\x1b" not in notice
             assert notice.splitlines() == [notice]
 
-    def test_thinking_config_drop_mode_warns_stripped(self, monkeypatch):
-        """In drop mode a top-level thinking config is reported as stripped."""
+    def test_thinking_config_never_forwarded_and_never_mode_dependent(self, monkeypatch):
+        """The thinking config is stripped under every mode, and never reaches upstream.
+
+        Oracle: the Responses API has no ``thinking`` request field — reasoning depth is
+        set by ``reasoning.effort``. So the config is dropped regardless of mode.
+        """
         import claude_bridge.providers.xai.translate as xai_translate
 
+        request = {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 5}}
+        result, warnings = xai_translate.anthropic_to_xai(request)
+        assert "thinking" not in result
+        assert "Stripped 'thinking' config (no Responses equivalent)" in warnings
+
         monkeypatch.setattr(xai_translate, "_XAI_REASONING_MODE", "drop")
-        _, warnings = xai_translate.anthropic_to_xai(
-            {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 5}}
-        )
-        assert any("drop" in w.lower() for w in warnings)
+        dropped, drop_warnings = xai_translate.anthropic_to_xai(request)
+        assert dropped == result, "the thinking config's fate must not depend on the mode"
+        assert drop_warnings == warnings
 
     def test_cache_control_on_system_stripped_without_warning(self):
         result, warnings = anthropic_to_xai(
@@ -2167,7 +2202,14 @@ class TestSseEventTranslation:
         )
         assert len(events) == 1
         assert events[0]["event"] == "content_block_start"
-        assert events[0]["data"]["content_block"] == {"type": "thinking", "thinking": ""}
+        # Oracle: the published Messages API wire format carries `signature` on every
+        # thinking block. The bridge cannot mint a verifiable one for reasoning it did
+        # not produce, so it declares the block unsigned rather than omitting the field.
+        assert events[0]["data"]["content_block"] == {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "",
+        }
 
     def test_summary_text_delta_becomes_thinking_delta(self):
         events = translate_xai_sse_event(
