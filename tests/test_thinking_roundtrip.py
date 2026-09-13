@@ -9,11 +9,15 @@ These tests pin the SYMMETRY rather than either direction alone. A per-direction
 passes happily while the pair is broken; only driving a block out and back catches it.
 
 Fixture provenance (Boundary Fixture Fidelity): ``REASONING_SUMMARY_WIRE`` replays an
-event sequence CAPTURED from the live OpenAI Responses endpoint on 2026-09-13 (probe in
-the branch RunDir), not authored from memory of the API. It is the shape that actually
-produced the defect: several reasoning ITEMS per turn, several summary PARTS per item,
-one delta per part carrying a bold heading, and ``reasoning_summary_text.done``
-interleaved before each ``part.done``.
+event sequence CAPTURED from the live OpenAI Responses endpoint on 2026-09-13, not
+authored from memory of the API. Regenerate it with
+``scripts/capture_reasoning_summary_wire.py``, which prints the untranslated upstream
+stream; rebuild this fixture from that output rather than from recollection, since a
+boundary fixture written from a mental model of the wire tests the code against its own
+assumptions and can never falsify them. It is the shape that actually produced the
+defect: several reasoning ITEMS per turn, several summary PARTS per item, one delta per
+part carrying a bold heading, and ``reasoning_summary_text.done`` interleaved before
+each ``part.done``.
 """
 
 from __future__ import annotations
@@ -388,6 +392,92 @@ class TestThinkingRoundTrip:
         assert events[-1]["event"] == "content_block_stop", (
             "the close must be the last thing the client sees before the error"
         )
+
+    @pytest.mark.parametrize("make_provider, _translate_request", PROVIDER_CASES)
+    def test_reasoning_split_by_text_yields_two_framed_blocks(
+        self, make_provider, _translate_request
+    ):
+        """Coalescing merges a contiguous reasoning phase -- not across an intervening block.
+
+        Oracle: Anthropic's own contract, which documents interleaved thinking as several
+        thinking blocks inside ONE assistant turn ("the budget spans all thinking blocks
+        within one assistant turn"). So two blocks here is the documented shape, not a
+        miss. It is also the only shape the streaming protocol can express: blocks are
+        sequential, a closed block cannot reopen, and holding one open across the text
+        would nest two at once. Merging across the gap would reorder content the model
+        emitted between the phases. Recorded as D-THINK-006.
+
+        What must hold is FRAMING, which is what a client actually depends on: every
+        start paired with its own stop, no index reopened while live, none left open.
+        """
+        import asyncio
+
+        interleaved = b"".join(
+            [
+                _sse(
+                    "response.created",
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_x", "model": "gpt-6-astra", "usage": {}},
+                    },
+                ),
+                _summary_part(0, 0, "First phase."),
+                _sse(
+                    "response.content_part.added",
+                    {
+                        "type": "response.content_part.added",
+                        "output_index": 1,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    },
+                ),
+                _sse(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "output_index": 1,
+                        "content_index": 0,
+                        "delta": "Partial answer.",
+                    },
+                ),
+                _sse(
+                    "response.output_text.done",
+                    {"type": "response.output_text.done", "output_index": 1, "content_index": 0},
+                ),
+                _summary_part(2, 0, "Second phase."),
+                _sse(
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_x",
+                            "model": "gpt-6-astra",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {"input_tokens": 5, "output_tokens": 9},
+                        },
+                    },
+                ),
+            ]
+        )
+
+        events = asyncio.run(_collect_stream(make_provider(), interleaved))
+
+        live: list[int] = []
+        opened: list[str] = []
+        for event in events:
+            index = event.get("data", {}).get("index")
+            if event.get("event") == "content_block_start":
+                opened.append(event["data"].get("content_block", {}).get("type"))
+                assert index not in live, f"index {index} reopened while still open"
+                live.append(index)
+            elif event.get("event") == "content_block_stop":
+                assert index in live, f"index {index} closed but never opened"
+                live.remove(index)
+
+        assert opened == ["thinking", "text", "thinking"]
+        assert live == [], f"blocks left unclosed at stream end: {live}"
+        assert events[-1]["event"] == "message_stop"
 
     @pytest.mark.parametrize("make_provider, translate_module, mode_attr", REASONING_MODE_CASES)
     def test_drop_mode_surfaces_no_thinking_block(
