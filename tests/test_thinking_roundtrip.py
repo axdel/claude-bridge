@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 import claude_bridge.providers.openai.translate as openai_translate
@@ -335,6 +336,58 @@ class TestThinkingRoundTrip:
         assert len(starts) == 1, "the truncated stream should open exactly one block"
         assert [e["data"]["index"] for e in stops] == [starts[0]["data"]["index"]]
         assert events[-1]["event"] == "message_stop", "the turn must still terminate"
+
+    @pytest.mark.parametrize(
+        "failure_type",
+        [httpx.TransportError, RuntimeError],
+        ids=["transport-drop", "buffer-overflow"],
+    )
+    @pytest.mark.parametrize("make_provider, _translate_request", PROVIDER_CASES)
+    def test_upstream_failing_mid_reasoning_still_closes_the_block(
+        self, make_provider, _translate_request, failure_type
+    ):
+        """A RAISING upstream must close the merged block too, not just a truncated one.
+
+        Oracle: the same Anthropic contract as the truncation case above — every
+        ``content_block_start`` is paired with a ``content_block_stop``. The two differ
+        in how the stream ends, and only one of them runs code placed after the read
+        loop: truncation ends the iterator cleanly, while a failure unwinds past
+        everything below it. Nothing downstream repairs that. The pump catches the
+        exception OUTSIDE ``translate_stream`` and answers with a bare ``error`` event
+        built without the coalescer (``proxy_streaming._emit_stream_error``), so a stop
+        not emitted here is never emitted at all and the client waits on an open block.
+
+        Both parametrized failures are real paths, not hypotheticals: a dropped upstream
+        socket surfaces as ``httpx.TransportError`` through ``response.aiter_bytes()``,
+        and ``iter_sse_event_blobs`` itself raises ``RuntimeError`` when a terminator-less
+        stream passes the 4 MiB buffer cap.
+        """
+        import asyncio
+
+        truncated = REASONING_SUMMARY_WIRE.split(b"event: response.reasoning_summary_part.done")[0]
+
+        async def _failing_chunks():
+            yield truncated
+            raise failure_type("upstream failed mid-reasoning")
+
+        async def _drive() -> list[dict]:
+            collected: list[dict] = []
+            with pytest.raises(failure_type):
+                async for event in make_provider().translate_stream(_failing_chunks()):
+                    collected.append(event)
+            return collected
+
+        events = asyncio.run(_drive())
+
+        starts = [e for e in events if e.get("event") == "content_block_start"]
+        stops = [e for e in events if e.get("event") == "content_block_stop"]
+        assert len(starts) == 1, "the failing stream should open exactly one block"
+        assert [e["data"]["index"] for e in stops] == [starts[0]["data"]["index"]], (
+            "the open thinking block must be closed before the failure propagates"
+        )
+        assert events[-1]["event"] == "content_block_stop", (
+            "the close must be the last thing the client sees before the error"
+        )
 
     @pytest.mark.parametrize("make_provider, translate_module, mode_attr", REASONING_MODE_CASES)
     def test_drop_mode_surfaces_no_thinking_block(

@@ -282,13 +282,28 @@ class XAIProvider:
                     coalesced.extend(coalescer.feed(translated))
             return _renumber(coalesced)
 
-        async for event_bytes in iter_sse_event_blobs(raw_chunks, max_buffer=_MAX_SSE_BUFFER):
-            for translated in _emit(event_bytes):
-                yield translated
+        def _close_open_thinking() -> list[dict]:
+            """Close a thinking block the stream left open, on whichever path ends it.
 
-        # An upstream that drops mid-reasoning leaves the merged block open; close it
-        # before the synthetic terminator so no block outlives the stream.
-        for translated in _renumber(coalescer.flush()):
+            Coalescing holds one block open across every summary part, so both exits owe
+            the close. The failing exit matters more than it looks: an exception unwinds
+            past everything after the read loop, and the pump catches it outside this
+            generator and answers with a bare ``error`` event built without the coalescer
+            -- so a stop not emitted here is never emitted at all, and the client waits
+            on a block that never closes. Idempotent, since ``flush`` clears the index.
+            """
+            return _renumber(coalescer.flush())
+
+        try:
+            async for event_bytes in iter_sse_event_blobs(raw_chunks, max_buffer=_MAX_SSE_BUFFER):
+                for translated in _emit(event_bytes):
+                    yield translated
+        except Exception:  # GeneratorExit is a BaseException, so aclose() stays quiet
+            for translated in _close_open_thinking():
+                yield translated
+            raise
+
+        for translated in _close_open_thinking():
             yield translated
 
         if started and not terminated:
