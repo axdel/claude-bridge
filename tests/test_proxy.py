@@ -22,10 +22,10 @@ from claude_bridge.http_client import create_client
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities, StreamRequestMode
 from claude_bridge.proxy import _route_request, start_proxy
 from claude_bridge.request_view import (
-    _approx_decoded_bytes,
     _OVERSIZED_MEDIA_BYTES,
-    _oversized_media,
     _WARNED_OVERSIZED_MEDIA_MAX,
+    _approx_decoded_bytes,
+    _oversized_media,
     _warn_oversized_media,
     _warned_oversized_media,
     estimate_input_tokens,
@@ -1292,6 +1292,29 @@ class TestMediaAwareTokenEstimation:
         warnings = [r for r in records if r.levelno == logging.WARNING]
         assert len(warnings) == 2, f"two distinct items should both warn, got {len(warnings)}"
 
+    def test_oversized_media_with_an_unhashable_media_type_does_not_crash(self, capture_logger):
+        # Oracle: estimate_input_tokens serves /v1/messages/count_tokens, whose contract
+        # is a token count -- a malformed block degrades, it does not take the handler
+        # down. media_type is unvalidated client JSON, and the warn-once identity is a
+        # tuple containing it, so a dict value makes that tuple unhashable and the
+        # membership test raises TypeError. Reachable only above the 5 MiB oversize
+        # threshold, which is exactly where the key gets built.
+        records = capture_logger("claude_bridge.request_view", level=logging.WARNING)
+        # Built inline, not via _image_block: that helper promises a str media_type, and
+        # the point here is the value a real client can put on the wire regardless.
+        hostile = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": {"not": "a string"},
+                "data": _b64_of_size(6 * 1024 * 1024),
+            },
+        }
+        estimate_input_tokens({"messages": [_user([hostile])]})
+        assert any(r.levelno == logging.WARNING and "image" in r.getMessage() for r in records), (
+            "the oversized item must still warn after its media type degrades"
+        )
+
     def test_warn_log_is_bounded_and_evicts_oldest_first(self):
         # Oracle: the bound is the DECLARED constant _WARNED_OVERSIZED_MEDIA_MAX, so feeding
         # one more than that many distinct items must leave exactly that many remembered.
@@ -1315,7 +1338,11 @@ class TestMediaAwareTokenEstimation:
 
         assert len(_warned_oversized_media) == _WARNED_OVERSIZED_MEDIA_MAX
         assert ("image", "image/png", over) not in _warned_oversized_media
-        assert ("image", "image/png", over + _WARNED_OVERSIZED_MEDIA_MAX) in _warned_oversized_media
+        assert (
+            "image",
+            "image/png",
+            over + _WARNED_OVERSIZED_MEDIA_MAX,
+        ) in _warned_oversized_media
 
     def test_approx_decoded_bytes_recovers_payload_size(self):
         # Oracle: base64 of N bytes decodes back to N; the approximation recovers N

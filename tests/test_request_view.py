@@ -222,6 +222,6 @@ class TestRealTranslatorNoFlood:
         produced = set(openai_warnings) | set(xai_warnings)
 
         # Both translators together, because the effort clamp is a grok-only notice.
-        assert _ROUTINE_TRANSLATION_MESSAGES <= produced
+        assert produced >= _ROUTINE_TRANSLATION_MESSAGES
         for prefix in _ROUTINE_TRANSLATION_PREFIXES:
             assert any(notice.startswith(prefix) for notice in produced), prefix
