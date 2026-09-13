@@ -23,7 +23,11 @@ from claude_bridge.provider import PROVIDERS, ProviderCapabilities, StreamReques
 from claude_bridge.proxy import _route_request, start_proxy
 from claude_bridge.request_view import (
     _approx_decoded_bytes,
+    _OVERSIZED_MEDIA_BYTES,
     _oversized_media,
+    _WARNED_OVERSIZED_MEDIA_MAX,
+    _warn_oversized_media,
+    _warned_oversized_media,
     estimate_input_tokens,
 )
 from claude_bridge.router import Router, RouterState
@@ -1287,6 +1291,31 @@ class TestMediaAwareTokenEstimation:
         estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(9 * 1024 * 1024))])]})
         warnings = [r for r in records if r.levelno == logging.WARNING]
         assert len(warnings) == 2, f"two distinct items should both warn, got {len(warnings)}"
+
+    def test_warn_log_is_bounded_and_evicts_oldest_first(self):
+        # Oracle: the bound is the DECLARED constant _WARNED_OVERSIZED_MEDIA_MAX, so feeding
+        # one more than that many distinct items must leave exactly that many remembered.
+        # The value is derived from the declaration, never from running the function. This
+        # cap is the whole reason a process-global dict is safe in a long-lived proxy;
+        # without it the warn-once memory grows for the life of the process.
+        #
+        # Eviction order is insertion order — guaranteed by dict since Python 3.7 — so the
+        # FIRST signature inserted is the first evicted and the last is retained.
+        #
+        # Driven through _warn_oversized_media rather than estimate_input_tokens because the
+        # oversize threshold is 5 MiB DECODED: pushing 65 distinct items through the public
+        # entry point would allocate >325 MiB of base64 to prove a bound that this call
+        # exercises identically. Same eviction code, same key shape, no memory cliff.
+        over = _OVERSIZED_MEDIA_BYTES + 1
+        descriptors = [
+            {"kind": "image", "media_type": "image/png", "approx_bytes": over + i}
+            for i in range(_WARNED_OVERSIZED_MEDIA_MAX + 1)
+        ]
+        _warn_oversized_media(descriptors)
+
+        assert len(_warned_oversized_media) == _WARNED_OVERSIZED_MEDIA_MAX
+        assert ("image", "image/png", over) not in _warned_oversized_media
+        assert ("image", "image/png", over + _WARNED_OVERSIZED_MEDIA_MAX) in _warned_oversized_media
 
     def test_approx_decoded_bytes_recovers_payload_size(self):
         # Oracle: base64 of N bytes decodes back to N; the approximation recovers N
