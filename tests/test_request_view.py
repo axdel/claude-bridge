@@ -21,7 +21,11 @@ import logging
 
 from claude_bridge.providers.openai import anthropic_to_openai
 from claude_bridge.providers.xai import anthropic_to_xai
-from claude_bridge.request_view import emit_translation_warnings
+from claude_bridge.request_view import (
+    _ROUTINE_TRANSLATION_MESSAGES,
+    _ROUTINE_TRANSLATION_PREFIXES,
+    emit_translation_warnings,
+)
 
 _LOGGER_NAME = "claude_bridge.request_view"
 
@@ -147,14 +151,19 @@ class TestRealTranslatorNoFlood:
     def _claude_code_request(self) -> dict:
         # A normal Claude Code request as seen on the wire: output_config carries BOTH
         # effort=max AND format (a structured-output request, full {type, schema} shape)
-        # alongside adaptive thinking. `format` is proven from live TUI traffic — the
-        # "Dropped unsupported output_config.format" WARNING flood this branch fixes. The
-        # combined effort+format+thinking shape is a deliberate superset: the emitter
-        # classifies each notice independently, so one request exercising all three routine
-        # notices is a stronger coupling probe than three separate ones. Every notice it
-        # produces — thinking passthrough, effort handling, AND the format subkey drop —
-        # must stay below WARNING so the shared TUI is not flooded. Omitting `format` here
-        # is what let the flood slip past this very coupling test before.
+        # alongside adaptive thinking, and the history carries a prior assistant turn whose
+        # content opens with a `thinking` block. `format` is proven from live TUI traffic —
+        # the "Dropped unsupported output_config.format" WARNING flood this branch fixes;
+        # the thinking block is the shape Claude Code replays from turn 2 onward, captured
+        # from a real session via `--output-format stream-json` (signature stored as "" when
+        # the wire carries none).
+        #
+        # The combined shape is a deliberate superset: the emitter classifies each notice
+        # independently, so one request exercising every routine notice is a stronger
+        # coupling probe than several narrow ones. Omitting a field here is the recurring
+        # way the flood slips past this very test — first `format`, then the thinking
+        # block — which is why `test_fixture_exercises_every_routine_notice` now asserts the
+        # coverage instead of trusting this comment to stay true.
         return {
             "model": "claude-opus-4-6",
             "max_tokens": 100,
@@ -166,7 +175,17 @@ class TestRealTranslatorNoFlood:
                 },
             },
             "thinking": {"type": "adaptive"},
-            "messages": [{"role": "user", "content": "Hi"}],
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Prior reasoning.", "signature": ""},
+                        {"type": "text", "text": "Hello."},
+                    ],
+                },
+                {"role": "user", "content": "And again"},
+            ],
         }
 
     def test_openai_normal_request_emits_no_warning(self, capture_logger):
@@ -182,3 +201,27 @@ class TestRealTranslatorNoFlood:
         _, warnings = anthropic_to_xai(self._claude_code_request())
         emit_translation_warnings(warnings, {})
         assert not [r for r in records if r.levelno >= logging.WARNING]
+
+    def test_fixture_exercises_every_routine_notice(self, monkeypatch):
+        """Every allowlisted notice must actually be PRODUCED by the fixture above.
+
+        The zero-WARNING assertions are vacuous for any notice the fixture never emits:
+        nothing was logged, so nothing was logged loudly. That hole let the flood through
+        twice — first with ``output_config.format`` absent from the fixture, then with the
+        replayed ``thinking`` block absent — and both times these coupling tests stayed
+        green while the notice they were meant to cover went unexercised.
+
+        Asserting the coverage is what makes the allowlist's reword guard real: a notice
+        renamed in a translator now fails the subset assertion here instead of silently
+        dropping out of the allowlist and re-flooding the shared TUI.
+        """
+        monkeypatch.delenv("XAI_MODEL", raising=False)
+        monkeypatch.delenv("XAI_REASONING_EFFORT", raising=False)
+        _, openai_warnings = anthropic_to_openai(self._claude_code_request())
+        _, xai_warnings = anthropic_to_xai(self._claude_code_request())
+        produced = set(openai_warnings) | set(xai_warnings)
+
+        # Both translators together, because the effort clamp is a grok-only notice.
+        assert _ROUTINE_TRANSLATION_MESSAGES <= produced
+        for prefix in _ROUTINE_TRANSLATION_PREFIXES:
+            assert any(notice.startswith(prefix) for notice in produced), prefix
