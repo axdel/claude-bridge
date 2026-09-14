@@ -4,6 +4,9 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-09-14
 
+### v0.11.0 — Reasoning Round Trip, Stream Resilience
+Release v0.11.0.
+
 ### fix: make the thinking round trip symmetric in both providers ([PR #25](https://github.com/axdel/claude-bridge/pull/25))
 Returned thinking blocks were rendered into the upstream prompt as literal [thinking] text, which grew without bound, taught the model to emit the tag, and ended turns on the bare fragment. They are now omitted — the Responses API has no input slot for one, and continuity rides on reasoning.encrypted_content. Also closes a coalesced block when the stream fails mid-reasoning, stops a non-string media_type from crashing count_tokens, and quiets two per-block notices plus an oversized-media re-walk that flooded the shared TUI stderr.
 
