@@ -40,6 +40,13 @@ _MEDIA_TOKEN_ESTIMATES = {"image": _IMAGE_TOKEN_ESTIMATE, "document": _DOCUMENT_
 # _MAX_REQUEST_BODY already bounds the whole request body.
 _OVERSIZED_MEDIA_BYTES = 5 * 1024 * 1024  # 5 MiB decoded
 
+# Oversized media already warned about, keyed on (kind, media_type, approx_bytes) — see
+# _warn_oversized_media. Bounded like the reasoning cache (D-CACHE-001): the keys derive
+# from client-supplied sizes, so an unbounded dict would be client-growable state.
+# Insertion-ordered, evicted oldest-first.
+_WARNED_OVERSIZED_MEDIA_MAX = 64
+_warned_oversized_media: dict[tuple[str, str, int], None] = {}
+
 
 def _approx_decoded_bytes(data: str) -> int:
     """Approximate the decoded size of a base64 string without decoding it.
@@ -91,6 +98,38 @@ def _iter_media_blocks(content: object) -> Iterator[dict]:
 def _oversized_media(descriptors: list[dict]) -> list[dict]:
     """Descriptors whose decoded payload exceeds ``_OVERSIZED_MEDIA_BYTES``."""
     return [d for d in descriptors if d["approx_bytes"] > _OVERSIZED_MEDIA_BYTES]
+
+
+def _warn_oversized_media(descriptors: list[dict]) -> None:
+    """Warn once per distinct oversized media item — not once per token estimate.
+
+    Claude Code calls ``/v1/messages/count_tokens`` repeatedly against the SAME history
+    and each call re-walks it, so one pasted 6 MiB image emitted a WARNING per call for
+    the rest of the session. The launchers share the bridge's stderr with the TUI, so
+    that is a flood — and unlike a routine notice it must stay at WARNING, because an
+    oversized item is genuinely worth seeing. The fix is frequency, not level.
+
+    Keyed on ``(kind, media_type, approx_bytes)``: stable across the re-walks of one
+    item, and distinct enough to separate two different ones. Two oversized items
+    agreeing on all three would warn once; the trace still records both.
+
+    No lock — ``estimate_input_tokens`` runs synchronously inside the asyncio handler
+    with no ``await``, so concurrent requests cannot interleave within it. (``stats``
+    needs one because urllib touches it from ``asyncio.to_thread``; this never leaves
+    the event-loop thread.)
+    """
+    for descriptor in _oversized_media(descriptors):
+        signature = (descriptor["kind"], descriptor["media_type"], descriptor["approx_bytes"])
+        if signature in _warned_oversized_media:
+            continue
+        _warned_oversized_media[signature] = None
+        while len(_warned_oversized_media) > _WARNED_OVERSIZED_MEDIA_MAX:
+            del _warned_oversized_media[next(iter(_warned_oversized_media))]
+        logger.warning(
+            "Oversized %s media (~%d bytes) forwarded without a hard cap",
+            descriptor["kind"],
+            descriptor["approx_bytes"],
+        )
 
 
 def _content_token_units(content: object) -> tuple[int, int, list[dict]]:
@@ -166,12 +205,7 @@ def estimate_input_tokens(request: dict) -> int:
     tools = request.get("tools")
     if tools:
         text_bytes += len(json.dumps(tools).encode())
-    for descriptor in _oversized_media(media_descriptors):
-        logger.warning(
-            "Oversized %s media (~%d bytes) forwarded without a hard cap",
-            descriptor["kind"],
-            descriptor["approx_bytes"],
-        )
+    _warn_oversized_media(media_descriptors)
     if text_bytes == 0 and media_tokens == 0:
         return 0
     return int(text_bytes / _BYTES_PER_TOKEN + 0.5) + media_tokens
@@ -346,16 +380,11 @@ def _trace_provider_request(translated: dict, warnings: list[str]) -> None:
 
 # Routine, expected-every-request translation notices — logged at DEBUG, not WARNING, because
 # the launchers share the bridge's stderr with the Claude Code TUI and these fire on normal
-# traffic: thinking is on essentially every request, and grok clamps the caller's max on every
-# request. These have a variable tail (a reasoning_mode suffix, an effort value), so they are
-# matched by ANCHORED PREFIX: each prefix is FIXED text and the client-controlled tail appears
-# only AFTER it, so startswith tests the fixed part alone and a crafted value cannot forge or
-# escape a classification.
-_ROUTINE_TRANSLATION_PREFIXES = (
-    "Thinking config passed through",  # thinking passed through — every request
-    "Stripped 'thinking' config",  # thinking dropped — every request in drop mode
-    "output_config.effort '",  # grok effort clamp (max/xhigh -> high) — every request
-)
+# traffic: grok clamps the caller's max on every request. This notice has a variable tail (the
+# effort value), so it is matched by ANCHORED PREFIX: the prefix is FIXED text and the
+# client-controlled tail appears only AFTER it, so startswith tests the fixed part alone and a
+# crafted value cannot forge or escape a classification.
+_ROUTINE_TRANSLATION_PREFIXES = ("output_config.effort '",)
 
 # Routine notices matched in FULL, not by prefix — the notice text is fixed end-to-end, so we
 # demote EXACTLY it and nothing else. Claude Code sends output_config.format (a structured-output
@@ -368,7 +397,18 @@ _ROUTINE_TRANSLATION_PREFIXES = (
 # present and future subkey sight-unseen, which is exactly what this emitter's allowlist contract
 # forbids: an unforeseen lossy notice MUST stay loud. The trace still records every dropped
 # subkey regardless of level, so diagnosability is preserved.
-_ROUTINE_TRANSLATION_MESSAGES = frozenset({"Dropped unsupported output_config.format"})
+#
+# The two thinking notices are fixed end-to-end for the same reason: a returned thinking block
+# is omitted and the thinking config is stripped under EVERY reasoning mode, so neither carries
+# a variable tail. Both fire on every request whose history holds prior reasoning — once per
+# block — which is precisely the per-block volume that floods a TUI at WARNING.
+_ROUTINE_TRANSLATION_MESSAGES = frozenset(
+    {
+        "Dropped unsupported output_config.format",
+        "Omitted thinking block (no Responses input slot for prior reasoning)",
+        "Stripped 'thinking' config (no Responses equivalent)",
+    }
+)
 
 
 def _is_routine_translation(message: str) -> bool:

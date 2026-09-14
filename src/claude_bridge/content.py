@@ -42,10 +42,18 @@ def parse_media_source(block: dict) -> MediaSource:
     whose ``type`` is not base64/url/file — or a missing source — normalizes to
     ``source_kind="unknown"`` so callers can degrade observably rather than
     forwarding corrupt bytes.
+
+    ``media_type`` is unvalidated client JSON, so a non-string one normalizes to the
+    default rather than reaching a caller that trusts the ``str`` annotation — the
+    oversized-media warn log keys on a tuple holding it, where an unhashable value
+    would raise inside the count_tokens handler. A bad label never discards payload.
     """
     kind: Literal["image", "document"] = "document" if block.get("type") == "document" else "image"
     source = block.get("source") or {}
-    media_type = source.get("media_type", _DEFAULT_MEDIA_TYPE)
+    declared_media_type = source.get("media_type")
+    media_type = (
+        declared_media_type if isinstance(declared_media_type, str) else _DEFAULT_MEDIA_TYPE
+    )
     filename = block.get("title")
 
     source_type = source.get("type")

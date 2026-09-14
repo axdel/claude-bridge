@@ -2,6 +2,19 @@
 
 Reverse-chronological log of all branches, fixes, and hotfixes.
 
+## 2026-09-14
+
+### fix: make the thinking round trip symmetric in both providers ([PR #25](https://github.com/axdel/claude-bridge/pull/25))
+Returned thinking blocks were rendered into the upstream prompt as literal [thinking] text, which grew without bound, taught the model to emit the tag, and ended turns on the bare fragment. They are now omitted — the Responses API has no input slot for one, and continuity rides on reasoning.encrypted_content. Also closes a coalesced block when the stream fails mid-reasoning, stops a non-string media_type from crashing count_tokens, and quiets two per-block notices plus an oversized-media re-walk that flooded the shared TUI stderr.
+
+- [`8ba8544`](https://github.com/axdel/claude-bridge/commit/8ba8544) Bring the wire-capture script under the complexity ceiling
+- [`5d079b7`](https://github.com/axdel/claude-bridge/commit/5d079b7) Make the wire fixture's provenance durable and pin the interleaved shape
+- [`8101cba`](https://github.com/axdel/claude-bridge/commit/8101cba) Normalize a non-string media_type instead of crashing count_tokens
+- [`41dd24d`](https://github.com/axdel/claude-bridge/commit/41dd24d) Close the coalesced thinking block when the upstream stream fails
+- [`706a231`](https://github.com/axdel/claude-bridge/commit/706a231) Cover the bound on the oversized-media warn-once log
+- [`431eff9`](https://github.com/axdel/claude-bridge/commit/431eff9) Stop the no-flood coupling probe from passing vacuously
+- [`be95898`](https://github.com/axdel/claude-bridge/commit/be95898) Make the thinking round trip symmetric in both providers
+
 ## 2026-09-06
 
 ### fix: surface provider reasoning while it happens instead of streaming silence ([PR #24](https://github.com/axdel/claude-bridge/pull/24))

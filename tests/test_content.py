@@ -133,6 +133,31 @@ class TestParseDegradedSource:
         result = parse_media_source(block)
         assert result.media_type == "application/octet-stream"
 
+    @pytest.mark.parametrize(
+        "hostile_media_type",
+        [{"a": 1}, ["image/png"], 42, None],
+        ids=["dict", "list", "int", "null"],
+    )
+    def test_non_string_media_type_degrades_to_the_default(self, hostile_media_type):
+        """``media_type`` is declared ``str``; a client sending anything else gets the default.
+
+        Oracle: ``MediaSource.media_type`` is annotated ``str`` and this module's whole
+        job is normalization -- so honoring that annotation is the declared contract,
+        and the default is the one this parser already uses for a media_type it cannot
+        read. The value is unvalidated client JSON, and downstream consumers rely on the
+        annotation: the oversized-media warn log keys on a tuple containing it, so an
+        unhashable dict or list reaching that key raises TypeError inside the
+        count_tokens handler rather than degrading observably.
+        """
+        block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": hostile_media_type, "data": "AAAA"},
+        }
+        result = parse_media_source(block)
+        assert isinstance(result.media_type, str)
+        assert result.media_type == "application/octet-stream"
+        assert result.data == "AAAA", "a bad media type must not discard the payload"
+
 
 class TestMediaSourceInvariants:
     """MediaSource is an immutable value object."""

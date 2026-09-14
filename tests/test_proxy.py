@@ -22,8 +22,12 @@ from claude_bridge.http_client import create_client
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities, StreamRequestMode
 from claude_bridge.proxy import _route_request, start_proxy
 from claude_bridge.request_view import (
+    _OVERSIZED_MEDIA_BYTES,
+    _WARNED_OVERSIZED_MEDIA_MAX,
     _approx_decoded_bytes,
     _oversized_media,
+    _warn_oversized_media,
+    _warned_oversized_media,
     estimate_input_tokens,
 )
 from claude_bridge.router import Router, RouterState
@@ -1265,6 +1269,80 @@ class TestMediaAwareTokenEstimation:
         records = capture_logger("claude_bridge.request_view", level=logging.WARNING)
         estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]})
         assert any(r.levelno == logging.WARNING and "image" in r.getMessage() for r in records)
+
+    def test_oversized_media_warns_once_across_repeated_estimates(self, capture_logger):
+        # Oracle: Claude Code calls /v1/messages/count_tokens repeatedly against the
+        # SAME history, so the count of warnings must track the count of distinct
+        # oversized ITEMS (1), not the count of estimates (5). The old code re-walked
+        # the history per call and warned every time, flooding the shared TUI stderr.
+        records = capture_logger("claude_bridge.request_view", level=logging.WARNING)
+        request = {"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]}
+        for _ in range(5):
+            estimate_input_tokens(request)
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f"one item, five estimates, {len(warnings)} warnings"
+
+    def test_a_second_distinct_oversized_item_still_warns(self, capture_logger):
+        # Oracle: warn-once is per ITEM, not a global latch. Suppressing the second,
+        # genuinely different oversized item would hide the signal the warning exists
+        # for. The two differ in decoded size, which is part of the identity key.
+        records = capture_logger("claude_bridge.request_view", level=logging.WARNING)
+        estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(6 * 1024 * 1024))])]})
+        estimate_input_tokens({"messages": [_user([_image_block(_b64_of_size(9 * 1024 * 1024))])]})
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2, f"two distinct items should both warn, got {len(warnings)}"
+
+    def test_oversized_media_with_an_unhashable_media_type_does_not_crash(self, capture_logger):
+        # Oracle: estimate_input_tokens serves /v1/messages/count_tokens, whose contract
+        # is a token count -- a malformed block degrades, it does not take the handler
+        # down. media_type is unvalidated client JSON, and the warn-once identity is a
+        # tuple containing it, so a dict value makes that tuple unhashable and the
+        # membership test raises TypeError. Reachable only above the 5 MiB oversize
+        # threshold, which is exactly where the key gets built.
+        records = capture_logger("claude_bridge.request_view", level=logging.WARNING)
+        # Built inline, not via _image_block: that helper promises a str media_type, and
+        # the point here is the value a real client can put on the wire regardless.
+        hostile = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": {"not": "a string"},
+                "data": _b64_of_size(6 * 1024 * 1024),
+            },
+        }
+        estimate_input_tokens({"messages": [_user([hostile])]})
+        assert any(r.levelno == logging.WARNING and "image" in r.getMessage() for r in records), (
+            "the oversized item must still warn after its media type degrades"
+        )
+
+    def test_warn_log_is_bounded_and_evicts_oldest_first(self):
+        # Oracle: the bound is the DECLARED constant _WARNED_OVERSIZED_MEDIA_MAX, so feeding
+        # one more than that many distinct items must leave exactly that many remembered.
+        # The value is derived from the declaration, never from running the function. This
+        # cap is the whole reason a process-global dict is safe in a long-lived proxy;
+        # without it the warn-once memory grows for the life of the process.
+        #
+        # Eviction order is insertion order — guaranteed by dict since Python 3.7 — so the
+        # FIRST signature inserted is the first evicted and the last is retained.
+        #
+        # Driven through _warn_oversized_media rather than estimate_input_tokens because the
+        # oversize threshold is 5 MiB DECODED: pushing 65 distinct items through the public
+        # entry point would allocate >325 MiB of base64 to prove a bound that this call
+        # exercises identically. Same eviction code, same key shape, no memory cliff.
+        over = _OVERSIZED_MEDIA_BYTES + 1
+        descriptors = [
+            {"kind": "image", "media_type": "image/png", "approx_bytes": over + i}
+            for i in range(_WARNED_OVERSIZED_MEDIA_MAX + 1)
+        ]
+        _warn_oversized_media(descriptors)
+
+        assert len(_warned_oversized_media) == _WARNED_OVERSIZED_MEDIA_MAX
+        assert ("image", "image/png", over) not in _warned_oversized_media
+        assert (
+            "image",
+            "image/png",
+            over + _WARNED_OVERSIZED_MEDIA_MAX,
+        ) in _warned_oversized_media
 
     def test_approx_decoded_bytes_recovers_payload_size(self):
         # Oracle: base64 of N bytes decodes back to N; the approximation recovers N

@@ -15,6 +15,7 @@ from pathlib import Path
 from claude_bridge.provider import PROVIDERS, ProviderCapabilities
 from claude_bridge.providers.openai.auth import _validated_bearer, get_bearer_token
 from claude_bridge.providers.openai.stream import (
+    ThinkingCoalescer,
     _remap_block_index,
     _sse_synthetic_termination,
     translate_openai_sse_event,
@@ -205,31 +206,59 @@ class OpenAIProvider:
         has_tool_calls = False
         started = False
         terminated = False
+        coalescer = ThinkingCoalescer()
 
-        def _emit(event_bytes: bytes) -> list[dict]:
-            """Translate one SSE blob, threading block-index and lifecycle state."""
+        def _renumber(events: list[dict]) -> list[dict]:
+            """Remap raw provider indices to Anthropic ones, tracking stream lifecycle."""
             nonlocal block_index, has_tool_calls, started, terminated
             out: list[dict] = []
+            for event in events:
+                event, block_index, has_tool_calls = _remap_block_index(
+                    event, index_map, block_index, has_tool_calls
+                )
+                name = event.get("event")
+                if name == "message_start":
+                    started = True
+                elif name in ("message_stop", "error"):
+                    terminated = True
+                out.append(event)
+            return out
+
+        def _emit(event_bytes: bytes) -> list[dict]:
+            """Translate one SSE blob, then coalesce thinking parts and renumber blocks."""
+            coalesced: list[dict] = []
             for parsed_event in parse_sse_events(event_bytes):
                 self._capture_stream_reasoning(parsed_event)
                 for translated in translate_openai_sse_event(
                     parsed_event,
                     token_count_multiplier=self.capabilities.token_count_multiplier,
                 ):
-                    translated, block_index, has_tool_calls = _remap_block_index(
-                        translated, index_map, block_index, has_tool_calls
-                    )
-                    name = translated.get("event")
-                    if name == "message_start":
-                        started = True
-                    elif name in ("message_stop", "error"):
-                        terminated = True
-                    out.append(translated)
-            return out
+                    coalesced.extend(coalescer.feed(translated))
+            return _renumber(coalesced)
 
-        async for event_bytes in iter_sse_event_blobs(raw_chunks, max_buffer=_MAX_SSE_BUFFER):
-            for translated in _emit(event_bytes):
+        def _close_open_thinking() -> list[dict]:
+            """Close a thinking block the stream left open, on whichever path ends it.
+
+            Coalescing holds one block open across every summary part, so both exits owe
+            the close. The failing exit matters more than it looks: an exception unwinds
+            past everything after the read loop, and the pump catches it outside this
+            generator and answers with a bare ``error`` event built without the coalescer
+            -- so a stop not emitted here is never emitted at all, and the client waits
+            on a block that never closes. Idempotent, since ``flush`` clears the index.
+            """
+            return _renumber(coalescer.flush())
+
+        try:
+            async for event_bytes in iter_sse_event_blobs(raw_chunks, max_buffer=_MAX_SSE_BUFFER):
+                for translated in _emit(event_bytes):
+                    yield translated
+        except Exception:  # GeneratorExit is a BaseException, so aclose() stays quiet
+            for translated in _close_open_thinking():
                 yield translated
+            raise
+
+        for translated in _close_open_thinking():
+            yield translated
 
         if started and not terminated:
             for translated in _sse_synthetic_termination(has_tool_calls):
