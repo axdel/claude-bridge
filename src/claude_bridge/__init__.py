@@ -22,4 +22,19 @@ Adding a new provider: create a ``providers/<name>/`` sub-package (see
 ``--provider <name>``.
 """
 
-__version__ = "0.10.0"
+import importlib.metadata
+
+# Derived from the distribution metadata, which the build takes from pyproject.toml --
+# the single owner of the version. Restating the literal here made this a second writer:
+# releases bump pyproject and nothing bumped this file, so each one needed a manual
+# re-sync commit, and the release that missed it shipped a launcher banner naming the
+# previous version while running the new one. The banner is the operator's only
+# in-terminal statement of which bridge is on the wire, so a stale one is a lie.
+#
+# The fallback is a sentinel, not a version: importing from a source tree with no install
+# has no version to report, and inventing a plausible number there would reintroduce the
+# very drift this removes. stdlib only -- httpx stays the one runtime dependency.
+try:
+    __version__ = importlib.metadata.version("claude-bridge")
+except importlib.metadata.PackageNotFoundError:  # source tree, not installed
+    __version__ = "0.0.0+unknown"

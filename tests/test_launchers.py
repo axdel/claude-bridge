@@ -10,11 +10,14 @@ dir) can execute ahead of the real bridge with access to the provider ``auth.jso
 
 from __future__ import annotations
 
+import importlib.metadata
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import claude_bridge
 
 # Prints the resolved httpx module and whether the hostile sitecustomize marker is set.
 _PROBE = (
@@ -113,6 +116,55 @@ def test_launcher_banners_derive_model_from_config_owner():
         assert '"$BRIDGE_PY" -I -c' in text, (
             f"{name} must resolve the banner model through the isolated venv python"
         )
+
+
+def test_package_version_derives_from_the_distribution_metadata():
+    """``__version__`` must equal the installed distribution version, not restate it.
+
+    The banner prints this string as the operator's only in-terminal statement of which
+    bridge is running, so a stale one is a lie in exactly the way a stale model id is
+    (the sibling assertion above, D-XAI-008) -- and this one drifted for real. Releases
+    bump ``pyproject.toml`` and nothing bumps ``__init__.py``, so every release needed a
+    manual follow-up commit to re-sync it: ``chore: sync launcher __version__ to 0.10.0``,
+    ``chore: sync runtime version with 0.7.0 release``, and -- after the sync was
+    forgotten -- ``fix: sync __init__.py version with pyproject.toml (0.6.3)``. Cutting
+    v0.11.0 drifted it again, to 0.10.0.
+
+    The expected value comes from the packaging metadata, which the build derives from
+    ``pyproject.toml``; nothing here consults the attribute under test to decide what it
+    should be.
+    """
+    assert claude_bridge.__version__ == importlib.metadata.version("claude-bridge"), (
+        "__version__ is a second writer for a fact pyproject.toml owns -- derive it from "
+        "importlib.metadata instead of restating the literal"
+    )
+
+
+def test_package_version_falls_back_to_a_sentinel_when_not_installed(monkeypatch):
+    """Importing from a source tree with no install must yield a sentinel, not a crash.
+
+    ``importlib.metadata.version`` raises ``PackageNotFoundError`` when no distribution is
+    registered -- which would otherwise propagate out of ``import claude_bridge`` and take
+    down every consumer, including the launchers' own banner probe. The sentinel is
+    deliberately not a plausible version: a real-looking number here would be a second
+    writer again, silently wrong instead of visibly unknown.
+    """
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        _raise_package_not_found,
+    )
+    reloaded = importlib.reload(claude_bridge)
+    try:
+        assert reloaded.__version__ == "0.0.0+unknown"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(claude_bridge)
+
+
+def _raise_package_not_found(_name: str) -> str:
+    """Stand in for ``importlib.metadata.version`` on an unregistered distribution."""
+    raise importlib.metadata.PackageNotFoundError(_name)
 
 
 # Skill-recipe argv that /plan and /review actually dispatch (flags, then wrapper --, then prompt).

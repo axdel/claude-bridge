@@ -4,6 +4,11 @@ Reverse-chronological log of all branches, fixes, and hotfixes.
 
 ## 2026-09-14
 
+### fix: derive __version__ from the distribution metadata instead of restating it ([PR #26](https://github.com/axdel/claude-bridge/pull/26))
+pyproject.toml owns the version but __init__.py restated it as a literal, so every release needed a manual re-sync commit and v0.11.0 drifted again to 0.10.0 — which both launcher banners print, telling users the wrong version. It now derives from importlib.metadata, with a non-version sentinel when no distribution is installed.
+
+- [`7034bad`](https://github.com/axdel/claude-bridge/commit/7034bad) Derive __version__ from the distribution metadata instead of restating it
+
 ### v0.11.0 — Reasoning Round Trip, Stream Resilience
 Release v0.11.0.
 
