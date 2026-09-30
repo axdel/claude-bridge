@@ -32,9 +32,9 @@ def _detect_openai_auth_mode() -> tuple[str, str | None]:
 def _build_provider_kwargs(provider_name: str | None) -> dict:
     """Return the direct-mode constructor kwargs for the selected provider.
 
-    xAI resolves its subscription OAuth from ``~/.grok`` through a no-arg constructor,
-    so it takes no kwargs. OpenAI (and the default/auto path) carries its detected auth
-    mode and, in api_key mode, the key.
+    xAI resolves its subscription OAuth from the grok home (``config.grok_home()``) through a
+    no-arg constructor, so it takes no kwargs. OpenAI (and the default/auto path) carries its
+    detected auth mode and, in api_key mode, the key.
     """
     if provider_name == "xai":
         return {}
@@ -48,7 +48,7 @@ def _build_provider_kwargs(provider_name: str | None) -> dict:
 def _auth_mode_log_message(provider_name: str | None, provider_kwargs: dict) -> str:
     """Return the auth-mode log line, naming the mode only — never the credential."""
     if provider_name == "xai":
-        return "Auth mode: grok_oauth (xAI subscription via ~/.grok)"
+        return f"Auth mode: grok_oauth (xAI subscription via {config.grok_home()})"
     if provider_kwargs.get("auth_mode") == "api_key":
         return "Auth mode: api_key (OPENAI_API_KEY detected)"
     return "Auth mode: codex_oauth (no OPENAI_API_KEY — falling back to Codex OAuth)"

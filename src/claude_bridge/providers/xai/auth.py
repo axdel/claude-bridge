@@ -1,9 +1,10 @@
-"""xAI Grok subscription OAuth — read ~/.grok/auth.json, validate + refresh the bearer.
+"""xAI Grok subscription OAuth — read the grok CLI's auth.json, validate + refresh the bearer.
 
-Reads the grok CLI's own credential file: a single ``https://auth.x.ai::<client_id>``
-keyed entry whose bearer JWT lives in ``key`` (not ``access_token``). No API-key mode —
-the only credential source is the grok subscription login. The refresh endpoint is
-pinned to the issuer (SSRF defense, D-XAI-007). Stdlib only; self-contained leaf.
+Reads the grok CLI's own credential file, ``auth.json`` in the grok home
+(``config.grok_home()``: ``GROK_HOME``, default ``~/.grok``): a single
+``https://auth.x.ai::<client_id>`` keyed entry whose bearer JWT lives in ``key`` (not
+``access_token``). No API-key mode — the only credential source is the grok subscription
+login. The refresh endpoint is pinned to the issuer (SSRF defense, D-XAI-007). Stdlib only.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX (Windows); flock is POSIX-only
     fcntl = None  # type: ignore[assignment]
 
+import claude_bridge.config as config
 from claude_bridge.auth import decode_jwt_exp
 
 # The grok CLI's OAuth client is a *public* OIDC client identifier (like Codex's),
@@ -37,7 +39,8 @@ _XAI_AUTH_KEY_PREFIX = "https://auth.x.ai::"
 _XAI_TOKEN_PATH = "/oauth2/token"  # noqa: S105  # nosec B105  # URL path, not a secret
 # The one host the refresh_token may ever be POSTed to (derived from the pinned issuer).
 _TRUSTED_ISSUER_HOST = urllib.parse.urlsplit(_XAI_ISSUER).hostname
-_DEFAULT_XAI_AUTH_PATH = Path.home() / ".grok" / "auth.json"
+# The grok CLI's credential file name inside its home (config.grok_home()).
+_XAI_AUTH_FILENAME = "auth.json"
 # A dedicated sibling lock file — never auth.json itself, whose inode os.replace swaps out
 # from under any lock held on it. Its own inode is stable, so an flock on it is honored by
 # every process that opens the same path.
@@ -85,8 +88,17 @@ def _timestamp_to_iso(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _resolve_xai_auth_path(path: Path | None) -> Path:
+    """Return *path*, else the grok CLI's ``auth.json`` inside the configured grok home.
+
+    Resolved per call rather than frozen at import, so the ``GROK_HOME`` the bridge was
+    launched with selects which Grok account's login is read and refreshed (D-XAI-015).
+    """
+    return path or config.grok_home() / _XAI_AUTH_FILENAME
+
+
 def read_xai_auth(path: Path | None = None) -> tuple[str, dict]:
-    """Read ``~/.grok/auth.json`` and return the single xAI OIDC entry.
+    """Read the grok CLI's ``auth.json`` and return the single xAI OIDC entry.
 
     Returns:
         A ``(entry_key, entry)`` tuple where ``entry_key`` is the
@@ -96,7 +108,7 @@ def read_xai_auth(path: Path | None = None) -> tuple[str, dict]:
         FileNotFoundError: If the auth file does not exist (hint: run ``grok``).
         ValueError: If no xAI entry is present, or more than one is (ambiguous).
     """
-    auth_path = path or _DEFAULT_XAI_AUTH_PATH
+    auth_path = _resolve_xai_auth_path(path)
     if not auth_path.exists():
         msg = (
             f"Grok auth file not found at {auth_path}. "
@@ -278,7 +290,7 @@ async def refresh_xai_token(
     """Exchange a refresh token for a new bearer and persist it atomically.
 
     POSTs ``grant_type=refresh_token`` to ``<issuer>/oauth2/token`` (RFC 6749
-    §6), then rewrites ``~/.grok/auth.json`` updating ONLY the selected entry's
+    §6), then rewrites the grok ``auth.json`` updating ONLY the selected entry's
     ``key`` / ``refresh_token`` / ``expires_at`` — preserving every sibling
     entry, profile field, and unknown field, and rewriting at owner-only ``0600``
     perms (D-XAI-003), never the source file's possibly-broad bits.
@@ -304,7 +316,7 @@ async def refresh_xai_token(
         ValueError: On network failure or a response missing ``access_token``.
             The on-disk file is left byte-for-byte unchanged on any failure.
     """
-    resolved_path = auth_path or _DEFAULT_XAI_AUTH_PATH
+    resolved_path = _resolve_xai_auth_path(auth_path)
     token_url = f"{issuer.rstrip('/')}{_XAI_TOKEN_PATH}"
     # Defense in depth: callers already pin the issuer, but refuse outright to POST the
     # refresh_token anywhere but HTTPS on the trusted xAI host — a standing guard against
@@ -397,7 +409,7 @@ async def refresh_xai_token(
             os.replace(tmp_path, resolved_path)
         finally:
             # os.replace consumes tmp_path on success; on any failure before it, drop
-            # the partial file rather than leaking a token-bearing temp into ~/.grok.
+            # the partial file rather than leaking a token-bearing temp into the grok home.
             tmp_path.unlink(missing_ok=True)
 
         return new_key

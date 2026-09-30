@@ -23,7 +23,7 @@
 | Space ID | Name | Location | Owner | Writers | Readers | Trust Tier | Authority Tier | Retention | Injection Policy | Status | Superseded By |
 |-|-|-|-|-|-|-|-|-|-|-|-|
 | MS-CACHEKEY | Prompt-cache identity key | Process memory | Each provider instance | The provider instance at construction | The same instance, per upstream request | T3 | A5 | Process lifetime | Sent upstream each request as a cache-stickiness id (xAI x-grok-conv-id header, OpenAI prompt_cache_key body field); by our own handling never logged or returned to the client. Accepted residual (D-SEC-001): a compromised first-party provider echoing the key into an error body relays only a bounded prefix (<= _PROVIDER_MESSAGE_LIMIT) to the request's own owner and operator log, never to a third party. | active |  |
-| MS-CRED | Grok credential | ~/.grok/auth.json | The xAI provider | The xAI provider on refresh | The xAI provider | T3 | A5 | Until refresh or expiry | Never injected into context; never logged | active |  |
+| MS-CRED | Grok credential | $GROK_HOME/auth.json (default ~/.grok) | The xAI provider | The xAI provider on refresh | The xAI provider | T3 | A5 | Until refresh or expiry | Never injected into context; never logged | active |  |
 | MS-CRED-CODEX | Codex credential | ~/.codex/auth.json | The OpenAI/Codex provider | The OpenAI/Codex provider on refresh | The OpenAI/Codex provider | T3 | A5 | Until refresh or expiry | Never injected into context; never logged | active |  |
 | MS-CRED-OPENAI | OpenAI API key | OPENAI_API_KEY environment variable | The OpenAI/Codex provider | Set in the operator environment before launch; never written by the provider | The OpenAI/Codex provider | T3 | A5 | Process lifetime — read once at construction, never refreshed | Never injected into context; never logged | active |  |
 | MS-PEER | Peer consultation files | The RunDir peers/ subdirectory | The orchestrator | Dispatched peers | The orchestrator | T3 | A4 | Deleted at finish | Advisory only, after verification | active |  |
@@ -38,7 +38,7 @@
 | Class ID | Name | Examples | Producer | Required Metadata | Freshness Check | Trust Tier | Authority Tier | May Instruct | Consumers | Status | Superseded By |
 |-|-|-|-|-|-|-|-|-|-|-|-|
 | AC-CODE | Source module | providers/xai/provider.py | The author | Docstring and tests | Tests pass at HEAD | T1 | A2 | no | The runtime, the tests | active |  |
-| AC-CRED | Credential blob | The bearer inside ~/.grok/auth.json | The grok CLI and OIDC refresh | none | JWT exp not passed | T3 | A5 | no | The xAI provider only | active |  |
+| AC-CRED | Credential blob | The bearer inside $GROK_HOME/auth.json | The grok CLI and OIDC refresh | none | JWT exp not passed | T3 | A5 | no | The xAI provider only | active |  |
 | AC-CRED-CODEX | Credential blob | The bearer inside ~/.codex/auth.json | The codex CLI and OIDC refresh | none | JWT exp not passed | T3 | A5 | no | The OpenAI/Codex provider only | active |  |
 | AC-CRED-OPENAI | Static API key | The OpenAI API key in the OPENAI_API_KEY environment variable | The operator's environment; no CLI or OIDC refresh | none | none — static key, no JWT exp | T3 | A5 | no | The OpenAI/Codex provider only | active |  |
 | AC-DEC | Decision record | A DECISIONS.md block | Any track that records a decision — plan, implement, review, hotfix, audit | id, status, date, context | Matches current code | T1 | A2 | yes | Future sessions, audit | active |  |

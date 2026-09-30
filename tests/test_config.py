@@ -273,6 +273,55 @@ def test_xai_client_version_blank_env_falls_through_to_bundle(monkeypatch, tmp_p
     assert config.xai_client_version(downloads_dir=tmp_path) == "0.2.93"
 
 
+def test_xai_client_version_no_dir_scans_the_selected_grok_home(monkeypatch, tmp_path):
+    """With no explicit dir the scan reads ``$GROK_HOME/downloads``, not ``~/.grok``'s."""
+    import claude_bridge.config as config
+
+    (tmp_path / "home" / ".grok" / "downloads" / "grok-0.9.99-macos-aarch64").mkdir(parents=True)
+    (tmp_path / "grok-2" / "downloads" / "grok-0.2.93-macos-aarch64").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "grok-2"))
+    monkeypatch.delenv(config.XAI_CLIENT_VERSION_ENV, raising=False)
+    assert config.xai_client_version() == "0.2.93"
+
+
+def test_grok_home_unset_defaults_to_home_dot_grok(monkeypatch, tmp_path):
+    """Without ``GROK_HOME`` the grok home is the grok CLI's own default, ``~/.grok``."""
+    import claude_bridge.config as config
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    assert config.grok_home() == tmp_path / ".grok"
+
+
+def test_grok_home_env_selects_another_home(monkeypatch, tmp_path):
+    """``GROK_HOME`` — the grok CLI's own variable, so the literal name is the contract —
+    relocates the home the way it does for the CLI (D-XAI-015)."""
+    import claude_bridge.config as config
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "grok-2"))
+    assert config.grok_home() == tmp_path / "grok-2"
+
+
+def test_grok_home_literal_tilde_expands_under_home(monkeypatch, tmp_path):
+    """A quoted ``~/.grok-2`` reaches the bridge unexpanded by the shell; it resolves in HOME."""
+    import claude_bridge.config as config
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GROK_HOME", "~/.grok-2")
+    assert config.grok_home() == tmp_path / ".grok-2"
+
+
+def test_grok_home_blank_env_falls_back_to_default(monkeypatch, tmp_path):
+    """A blank ``GROK_HOME`` is unset — never the current directory."""
+    import claude_bridge.config as config
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GROK_HOME", "   ")
+    assert config.grok_home() == tmp_path / ".grok"
+
+
 def test_validate_upstream_url_accepts_https_and_loopback_rejects_cleartext_and_userinfo():
     """The passthrough upstream carries the prompt and x-api-key, so cleartext http to a
     non-loopback host (CWE-319 exfiltration) and embedded userinfo credentials are refused;

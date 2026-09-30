@@ -263,6 +263,14 @@ class TestReadXaiAuth:
         entry_key, _entry = read_xai_auth(auth_file)
         assert entry_key == _ENTRY_KEY
 
+    def test_no_path_without_grok_home_reads_home_dot_grok(self, monkeypatch, tmp_path: Path):
+        # The default every single-account user relies on: no GROK_HOME → ~/.grok/auth.json.
+        _write_grok_auth(tmp_path, _grok_auth({"refresh_token": "refresh-account-1"}))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("GROK_HOME", raising=False)
+        _key, entry = read_xai_auth()
+        assert entry["refresh_token"] == "refresh-account-1"
+
 
 # --- _xai_token_expired ---
 
@@ -345,6 +353,30 @@ class TestGetXaiBearerToken:
         )
         result = await get_xai_bearer_token(auth_file)
         assert result == new_token
+
+    @pytest.mark.asyncio
+    async def test_no_path_refresh_rewrites_only_the_selected_grok_home(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """An expired login under ``$GROK_HOME`` refreshes into that home's ``auth.json``; the
+        default ``~/.grok`` login beside it — another Grok account — stays byte-identical."""
+        new_token = _make_jwt({"exp": time.time() + 3600})
+        default_file = _write_grok_auth(tmp_path / "home", _grok_auth())
+        default_bytes = default_file.read_bytes()
+        expired = {
+            "key": _make_jwt({"exp": time.time() - 100}),
+            "expires_at": _iso(time.time() - 100),
+        }
+        selected_file = _write_grok_auth(tmp_path / "second", _grok_auth(expired))
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GROK_HOME", str(selected_file.parent))
+        monkeypatch.setattr(
+            "claude_bridge.providers.xai.auth._TOKEN_OPENER.open",
+            lambda *a, **kw: _FakeTokenResp({"access_token": new_token, "expires_in": 3600}),
+        )
+        assert await get_xai_bearer_token() == new_token
+        assert json.loads(selected_file.read_text())[_ENTRY_KEY]["key"] == new_token
+        assert default_file.read_bytes() == default_bytes
 
     @pytest.mark.asyncio
     async def test_force_refresh_refreshes_even_a_proactively_valid_token(
@@ -2979,6 +3011,22 @@ class TestAuthenticate:
         headers = await XAIProvider(auth_path=auth_file).authenticate()
 
         assert headers["Authorization"] == f"Bearer {data[_ENTRY_KEY]['key']}"
+
+    @pytest.mark.asyncio
+    async def test_no_arg_provider_bills_the_grok_home_env_selects(self, tmp_path, monkeypatch):
+        """The proxy builds xAI with no arguments, so ``GROK_HOME`` alone decides which Grok
+        account's bearer goes on the wire — the second home's, never ``~/.grok``'s beside it."""
+        monkeypatch.setenv("XAI_CLIENT_VERSION", "9.9.9")
+        account_1 = _grok_auth({"key": _make_jwt({"exp": time.time() + 3600, "sub": "acct-1"})})
+        account_2 = _grok_auth({"key": _make_jwt({"exp": time.time() + 3600, "sub": "acct-2"})})
+        _write_grok_auth(tmp_path / "home", account_1)
+        selected_file = _write_grok_auth(tmp_path / "second", account_2)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GROK_HOME", str(selected_file.parent))
+
+        headers = await XAIProvider().authenticate()
+
+        assert headers["Authorization"] == f"Bearer {account_2[_ENTRY_KEY]['key']}"
 
     @pytest.mark.asyncio
     async def test_client_identifier_is_grok_cli(self, tmp_path, monkeypatch):

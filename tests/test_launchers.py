@@ -118,6 +118,33 @@ def test_launcher_banners_derive_model_from_config_owner():
         )
 
 
+def test_grok_banner_prints_the_grok_home_the_bridge_reads(tmp_path):
+    """The ``claude-grok`` banner names the grok home — which Grok account the session bills
+    — as ``config.grok_home`` resolves it (D-XAI-015). Runs the launcher's own resolve and
+    banner lines: a literal ``~/.grok-2`` must print expanded, which re-reading ``$GROK_HOME``
+    in bash (a second owner of the rule) would not."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lines = (repo_root / "claude-grok").read_text().splitlines()
+    resolve = next(line for line in lines if line.startswith("BRIDGE_GROK_HOME=$("))
+    banner = next(line for line in lines if " model:" in line)
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(
+        [bash, "-c", f"{resolve}\n{banner}"],
+        env={
+            **os.environ,
+            "BRIDGE_PY": sys.executable,
+            "HOME": str(tmp_path),
+            "GROK_HOME": "~/.grok-2",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"grok_home:{tmp_path / '.grok-2'}" in result.stdout
+
+
 def test_package_version_derives_from_the_distribution_metadata():
     """``__version__`` must equal the installed distribution version, not restate it.
 

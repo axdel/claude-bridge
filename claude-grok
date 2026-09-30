@@ -92,7 +92,10 @@ BRIDGE_VERSION=$("$BRIDGE_PY" -I -c "from claude_bridge import __version__; prin
 # Derive the model from the config owner (config.xai_model) rather than hardcoding it,
 # so the banner tracks DEFAULT_XAI_MODEL and any XAI_MODEL override instead of drifting.
 BRIDGE_MODEL=$("$BRIDGE_PY" -I -c "from claude_bridge import config; print(config.xai_model())" 2>/dev/null || echo "?")
-echo " port:${PORT}  pid:${BRIDGE_PID}  model:${BRIDGE_MODEL}  version:${BRIDGE_VERSION}"
+# The grok home (config.grok_home — GROK_HOME, default ~/.grok) whose auth.json login the
+# bridge reads: which Grok account this session bills against.
+BRIDGE_GROK_HOME=$("$BRIDGE_PY" -I -c "from claude_bridge import config; print(config.grok_home())" 2>/dev/null || echo "?")
+echo " port:${PORT}  pid:${BRIDGE_PID}  model:${BRIDGE_MODEL}  version:${BRIDGE_VERSION}  grok_home:${BRIDGE_GROK_HOME}"
 echo " by axdel  github.com/axdel/claude-bridge"
 echo ""
 

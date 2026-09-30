@@ -98,9 +98,10 @@ class XAIProvider:
     encrypted-reasoning continuity: the reasoning item preceding each tool call is captured
     (from a response or a streamed terminal) and echoed back before its function_call on the
     next request, so Grok can resume its own chain of thought across tool turns. ``authenticate``
-    resolves the grok subscription bearer from ``~/.grok/auth.json`` (refreshing via OIDC when
-    expired) and pairs it with the ``x-grok-client-version`` / ``x-grok-client-identifier``
-    headers the proxy gates on. Registered as ``PROVIDERS["xai"]`` at module import.
+    resolves the grok subscription bearer from the grok home's ``auth.json`` (``GROK_HOME``,
+    default ``~/.grok``; refreshing via OIDC when expired) and pairs it with the
+    ``x-grok-client-version`` / ``x-grok-client-identifier`` headers the proxy gates on.
+    Registered as ``PROVIDERS["xai"]`` at module import.
     """
 
     name = "xai"
@@ -108,8 +109,8 @@ class XAIProvider:
     capabilities = _XAI_CAPABILITIES
 
     def __init__(self, *, auth_path: Path | None = None) -> None:
-        # Optional override of ~/.grok/auth.json for testing; the no-arg default resolves the
-        # real subscription file, so the fallback path's ``provider_cls()`` construction works.
+        # Optional override of the grok home's auth.json for testing; the no-arg default resolves
+        # the real subscription file, so the fallback path's ``provider_cls()`` construction works.
         self._auth_path = auth_path
         # Sticky prompt cache identity: a process-stable UUID (the proxy holds one provider per
         # process), invariant across this instance's requests yet distinct across launchers. Random

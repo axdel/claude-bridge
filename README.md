@@ -162,7 +162,7 @@ or
 | (__| | (_| | |_| | (_| |  __/_____| (_| | | | (_) |   <
  \___|_|\__,_|\__,_|\__,_|\___|      \__, |_|  \___/|_|\_\
                                      |___/
- port:9738  pid:59952  model:grok-4.6  version:0.9.0
+ port:9738  pid:59952  model:grok-4.6  version:0.9.0  grok_home:/Users/you/.grok
  by axdel  github.com/axdel/claude-bridge
 ```
 
@@ -186,6 +186,13 @@ claude-codex -- -p opus   # pass flags through to claude
 Override the Grok model:
 ```bash
 XAI_MODEL=grok-4.6 claude-grok   # default; set to any model your Grok subscription exposes (e.g. grok-build)
+```
+
+Use a second Grok subscription — the bridge reads the grok CLI's own `GROK_HOME`, so point it at
+the home that account signed in to (the banner's `grok_home:` shows which one is in use):
+```bash
+GROK_HOME=~/.grok-2 grok login    # once: sign the second account in to its own home
+GROK_HOME=~/.grok-2 claude-grok   # bill this session against that account
 ```
 
 ### Verify it works
@@ -259,8 +266,9 @@ curl -s localhost:9999/stats | python3 -m json.tool
 | Env Var | Default | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key — direct OpenAI mode uses the standard Responses API when set; otherwise it uses Codex OAuth |
+| `GROK_HOME` | `~/.grok` | The grok CLI's own home variable — the `xai` provider reads (and refreshes) its login in `$GROK_HOME/auth.json` and resolves its client version from `$GROK_HOME/downloads`. Point it at another home to bill a second Grok subscription (`GROK_HOME=~/.grok-2 claude-grok`); the `claude-grok` banner shows the home in use |
 | `XAI_MODEL` | `grok-4.6` | xAI Grok model id used by the `xai` provider (pinned; set `grok-build` for the rolling latest-coding alias) |
-| `XAI_CLIENT_VERSION` | highest installed grok CLI bundle (floor `0.1.202`) | Override for the `x-grok-client-version` header the cli-chat-proxy gates on; when unset, resolved from the newest `~/.grok/downloads/grok-<ver>-*` bundle |
+| `XAI_CLIENT_VERSION` | highest installed grok CLI bundle (floor `0.1.202`) | Override for the `x-grok-client-version` header the cli-chat-proxy gates on; when unset, resolved from the newest `$GROK_HOME/downloads/grok-<ver>-*` bundle |
 | `XAI_REASONING_EFFORT` | _(caller effort; else `low`)_ | Operator override for xAI `reasoning.effort` on grok-4.6+ (`low` / `medium` / `high`). When set it wins over the caller's per-request effort; when unset or invalid the caller's `output_config.effort` is honored (clamped `max`/`xhigh` → `high`), falling back to `low` only if the caller sends none. Omitted for pre-4.6 models that 400 on it |
 | `REASONING_MODE` | `passthrough` | Thinking-block handling for OpenAI and xAI: `passthrough` preserves tagged thinking text, `drop` strips it |
 | `LOG_LEVEL` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. The `claude-grok` / `claude-codex` launchers default to `WARNING` — upstream timeouts, transport errors, and failovers reach the terminal without `--debug`; raw `python -m claude_bridge` defaults to `INFO`. |
@@ -340,7 +348,7 @@ translation rather than importing OpenAI's, because cross-provider imports are f
 | Aspect | xAI Grok |
 |---|---|
 | Endpoint | `https://cli-chat-proxy.grok.com/v1/responses` (subscription-metered) |
-| Auth | `~/.grok/auth.json` OIDC bearer + refresh (`grok login`); no API key |
+| Auth | `$GROK_HOME/auth.json` (default `~/.grok`) OIDC bearer + refresh (`grok login`); no API key |
 | Client gate | `x-grok-client-version` (auto-resolved from the installed grok CLI, floor `0.1.202`) + `grok-cli` client identifier |
 | Reasoning continuity | encrypted reasoning cached in memory, keyed by `call_id`, echoed across tool turns (never persisted or logged) |
 | Reasoning effort | `reasoning.effort` derived from the caller's `output_config.effort`, clamped `max`/`xhigh` → `high` (grok's max), sent to grok-4.6+; `XAI_REASONING_EFFORT` overrides it, `low` when the caller sends none; omitted for pre-4.6 models that 400 on it |

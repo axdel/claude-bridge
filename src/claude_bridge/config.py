@@ -24,6 +24,7 @@ CLAUDE_BRIDGE_TRACE_PATH_ENV = "CLAUDE_BRIDGE_TRACE_PATH"
 XAI_MODEL_ENV = "XAI_MODEL"
 XAI_CLIENT_VERSION_ENV = "XAI_CLIENT_VERSION"
 XAI_REASONING_EFFORT_ENV = "XAI_REASONING_EFFORT"
+GROK_HOME_ENV = "GROK_HOME"
 CONNECT_TIMEOUT_ENV = "CONNECT_TIMEOUT"
 STREAM_IDLE_TIMEOUT_ENV = "STREAM_IDLE_TIMEOUT"
 POOL_IDLE_ENV = "POOL_IDLE"
@@ -69,10 +70,9 @@ DEFAULT_KEEPALIVE_PING_INTERVAL = 15.0
 
 # cli-chat-proxy.grok.com answers HTTP 426 below this x-grok-client-version; the
 # resolver never sends a header older than this floor. Bundle dir layout:
-# ``~/.grok/downloads/grok-<ver>-<platform>`` (the unversioned symlink target
+# ``$GROK_HOME/downloads/grok-<ver>-<platform>`` (the unversioned symlink target
 # ``grok-<platform>`` must not parse as a version).
 _XAI_CLIENT_VERSION_FLOOR = "0.1.202"
-_GROK_DOWNLOADS_DIR = Path.home() / ".grok" / "downloads"
 _GROK_BUNDLE_VERSION_RE = re.compile(r"^grok-(\d+\.\d+\.\d+)-")
 
 
@@ -279,13 +279,26 @@ def xai_reasoning_effort_override(
     return normalized
 
 
+def grok_home() -> Path:
+    """Return the grok CLI home: ``GROK_HOME`` (``~``-expanded), else the CLI's ``~/.grok``.
+
+    The grok CLI relocates its whole home — the ``auth.json`` login and the ``downloads/``
+    bundles included — through this one variable, which is how a second Grok account lives
+    in its own home beside the first. The xAI credential and the client-version bundle dir
+    both derive from here, so the bridge bills whichever account the variable selects
+    (D-XAI-015).
+    """
+    override = _non_empty_stripped_env(GROK_HOME_ENV)
+    return Path(override).expanduser() if override else Path.home() / ".grok"
+
+
 def _version_tuple(version: str) -> tuple[int, ...]:
     """Split a dotted numeric version into an int tuple for correct ordering."""
     return tuple(int(part) for part in version.split("."))
 
 
 def _installed_grok_versions(downloads_dir: Path) -> list[str]:
-    """Return version strings parsed from ``~/.grok/downloads/grok-<ver>-*`` bundles."""
+    """Return version strings parsed from the ``grok-<ver>-*`` bundles in *downloads_dir*."""
     if not downloads_dir.is_dir():
         return []
     versions: list[str] = []
@@ -300,15 +313,16 @@ def xai_client_version(downloads_dir: Path | None = None) -> str:
     """Resolve the ``x-grok-client-version`` header value.
 
     Precedence: an explicit ``XAI_CLIENT_VERSION`` override wins (verbatim);
-    otherwise the highest installed grok CLI bundle version, floored at the
-    proxy's minimum (below which cli-chat-proxy answers HTTP 426); otherwise the
-    floor itself. Self-healing: a newer grok CLI bumps the header automatically.
+    otherwise the highest grok CLI bundle installed in the grok home's
+    ``downloads/`` (see ``grok_home``), floored at the proxy's minimum (below which
+    cli-chat-proxy answers HTTP 426); otherwise the floor itself. Self-healing: a
+    newer grok CLI bumps the header automatically.
     """
     override = _non_empty_stripped_env(XAI_CLIENT_VERSION_ENV)
     if override:
         return override
     resolved = _XAI_CLIENT_VERSION_FLOOR
-    for version in _installed_grok_versions(downloads_dir or _GROK_DOWNLOADS_DIR):
+    for version in _installed_grok_versions(downloads_dir or grok_home() / "downloads"):
         if _version_tuple(version) > _version_tuple(resolved):
             resolved = version
     return resolved

@@ -37,7 +37,7 @@ class TestBuildProviderKwargs:
         import claude_bridge.__main__ as main_mod
 
         # Even with an OpenAI key present, xAI resolves its own subscription OAuth
-        # from ~/.grok via a no-arg constructor — it must not inherit OpenAI kwargs.
+        # from the grok home via a no-arg constructor — it must not inherit OpenAI kwargs.
         monkeypatch.setenv("OPENAI_API_KEY", "sk-live-placeholder")
         assert main_mod._build_provider_kwargs("xai") == {}
 
@@ -69,6 +69,15 @@ class TestAuthModeLogMessage:
 
         msg = main_mod._auth_mode_log_message("xai", {})
         assert "grok_oauth" in msg
+
+    def test_xai_names_the_grok_home_in_use(self, monkeypatch, tmp_path):
+        import claude_bridge.__main__ as main_mod
+
+        # With two Grok subscriptions side by side, the log line names which home's login —
+        # which account — the bridge reads; a path is not a credential.
+        monkeypatch.setenv("GROK_HOME", str(tmp_path / ".grok-2"))
+        msg = main_mod._auth_mode_log_message("xai", {})
+        assert str(tmp_path / ".grok-2") in msg
 
     def test_openai_api_key_names_api_key(self):
         import claude_bridge.__main__ as main_mod
