@@ -1,2 +1,2 @@
 [peers]
-enabled = ["codex", "grok"]  # claude is always implicit
+enabled = ["grok"]  # claude is always implicit
